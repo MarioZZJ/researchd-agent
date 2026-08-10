@@ -499,3 +499,16 @@ def test_create_project_rejects_symlinked_workspace_root(api_env):
     r = c.post("/v1/projects", json={"project_id": "p-symlink", "name": "x", "actor": "ou_pi"})
     assert r.status_code == 400
     assert "symlink" in r.json()["detail"]
+
+
+def test_create_project_rejects_dotdot_workspace_root(api_env):
+    """'..' components are rejected lexically BEFORE any filesystem op."""
+    c = api_env["client"]
+    # create a sibling project first so the traversal target exists
+    assert c.post("/v1/projects", json={"project_id": "p-target", "name": "x", "actor": "ou_pi"}).status_code == 200
+    r = c.post("/v1/projects", json={
+        "project_id": "p-new", "name": "x", "actor": "ou_pi",
+        "workspace_root": str(Path(api_env["settings"].data_dir) / "workspaces/p-new/../p-target"),
+    })
+    assert r.status_code == 400
+    assert ".." in r.json()["detail"] or "must" in r.json()["detail"]

@@ -3,6 +3,7 @@ decision answer, commands, sync, reconcile."""
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -68,30 +69,56 @@ def create_project(req: ProjectCreateRequest, request: Request, uow: UnitOfWork 
         raise HTTPException(status_code=409, detail=f"project {project_id!r} already exists")
     # workspace_root is service-derived: ALWAYS <data_dir>/workspaces/<project_id>
     allowed_root = (Path(request.app.state.settings.data_dir) / "workspaces").resolve()
+    allowed_root.mkdir(parents=True, exist_ok=True)
 
     def _no_symlink_components(path: Path) -> bool:
         """Every component under allowed_root must be a real directory (lstat,
         BEFORE any resolve() that would follow a symlink)."""
+        try:
+            rel = path.relative_to(allowed_root)
+        except ValueError:
+            return False
         cur = allowed_root
-        for part in path.relative_to(allowed_root).parts:
+        for part in rel.parts:
             cur = cur / part
             if cur.is_symlink():
                 return False
         return True
 
     candidate = allowed_root / project_id  # un-resolved: symlink check is meaningful
-    workspace_root = str(candidate)
     if req.workspace_root:
         requested = Path(req.workspace_root)
-        if not requested.is_absolute() or not requested.is_relative_to(candidate):
+        # lexical checks FIRST: no '..' components, absolute, under candidate
+        if not requested.is_absolute() or ".." in requested.parts:
+            raise HTTPException(status_code=400, detail="workspace_root must be an absolute path without '..'")
+        # symlink check on the un-resolved path (before resolve follows links)
+        if not _no_symlink_components(requested):
+            raise HTTPException(status_code=400, detail="workspace_root path must not traverse symlinks")
+        normalized = requested.resolve()  # canonicalize (no symlinks remain)
+        if not normalized.is_relative_to(candidate.resolve()):
             raise HTTPException(status_code=400, detail="workspace_root must be under <data_dir>/workspaces/<project_id>")
-        workspace_root = str(requested)
+        workspace_root = str(normalized)
+    else:
+        if not _no_symlink_components(candidate):
+            raise HTTPException(status_code=400, detail="workspace_root path must not traverse symlinks")
+        workspace_root = str(candidate.resolve())
+    # create the root with a no-follow guard: every component is created with
+    # mkdir (never following an existing symlink) and then verified with
+    # O_DIRECTORY|O_NOFOLLOW. The remaining check-to-use window is a same-uid
+    # race that only OS-level isolation can close (blocker B-08).
     root = Path(workspace_root)
-    if not _no_symlink_components(root):
-        raise HTTPException(status_code=400, detail="workspace_root path must not traverse symlinks")
-    root.mkdir(parents=True, exist_ok=True)
-    # post-mkdir re-anchor: after creating, the canonical resolved path must
-    # still sit under the allowed root (guards against race-replaced parents)
+    cur = allowed_root
+    for part in root.relative_to(allowed_root).parts:
+        cur = cur / part
+        try:
+            os.mkdir(cur)
+        except FileExistsError:
+            pass
+        try:
+            fd = os.open(cur, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            os.close(fd)
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail=f"workspace_root component not a real directory: {exc}") from exc
     resolved_root = root.resolve()
     if not resolved_root.is_relative_to(allowed_root):
         raise HTTPException(status_code=400, detail="workspace_root escaped the allowed root")
