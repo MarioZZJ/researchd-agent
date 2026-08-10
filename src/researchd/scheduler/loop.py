@@ -17,6 +17,11 @@ from .dispatch import RunDispatcher, reconcile_orphans, task_dispatch_decision
 from .leases import LeaseRepo
 from .outbox_sender import OutboxSender, DeliveryPort
 
+try:  # noqa: PLC2701  circular-safe import
+    from ..projections.feishu_doc import DocPlatform
+except ImportError:  # pragma: no cover
+    DocPlatform = object  # type: ignore[assignment, misc]
+
 logger = logging.getLogger("researchd.scheduler")
 
 TICK_SECONDS = 2.0
@@ -58,11 +63,13 @@ class SchedulerLoop:
         self.settings = settings
         self.session_factory = session_factory
         self.executor = executor
-        self.sender = OutboxSender(session_factory, delivery_port)
+        doc_platform = delivery_port if isinstance(delivery_port, DocPlatform) else None
+        self.sender = OutboxSender(session_factory, delivery_port, doc_platform=doc_platform)
         self.max_parallel = max_parallel
         self.active: dict[str, ActiveRun] = {}
         self._stop = asyncio.Event()
         self._dispatch_sem = asyncio.Semaphore(max_parallel)
+        self._doc_platform_instance = None
         self.last_tick_stats: dict = {}
 
     async def run(self) -> None:
@@ -81,7 +88,7 @@ class SchedulerLoop:
 
     # ------------------------------------------------------------ tick
     async def tick(self) -> dict:
-        stats: dict = {"orphans": 0, "dispatched": 0, "heartbeats": 0, "outbox": {}, "decisions": 0, "reports": 0}
+        stats: dict = {"orphans": 0, "dispatched": 0, "heartbeats": 0, "outbox": {}, "decisions": 0, "reports": 0, "projection": 0}
         # 1. recovery: any stale run (restart/crash) -> ORPHANED, task -> READY
         with self.session_factory() as session:
             stats["orphans"] = len(reconcile_orphans(session))
@@ -90,11 +97,13 @@ class SchedulerLoop:
         stats["decisions"] = await self._evaluate_decision_candidates()
         # 3. reporting: emit queued reports for active projects
         stats["reports"] = await self._report_projects()
-        # 4. outbox delivery (deduplicated, lease-protected)
+        # 4. project document projection (incremental, PI Notes protected)
+        stats["projection"] = await self._project_projection()
+        # 5. outbox delivery (deduplicated, lease-protected)
         stats["outbox"] = await self.sender.send_pending()
-        # 5. dispatch ready tasks (bounded by max_parallel)
+        # 6. dispatch ready tasks (bounded by max_parallel)
         stats["dispatched"] = await self._dispatch_ready()
-        # 6. heartbeats for active runs
+        # 7. heartbeats for active runs
         stats["heartbeats"] = await self._heartbeat_active()
         return stats
 
@@ -257,6 +266,50 @@ class SchedulerLoop:
             if result.sent:
                 emitted += 1
         return emitted
+
+    async def _project_projection(self) -> int:
+        """Enqueue doc_block outbox rows for changed sections (incremental,
+        PI Notes protected). Requires a configured doc platform: without one
+        NOTHING is written and no projection state is claimed (the default
+        FakeDocPlatform is never used in production)."""
+        from ..persistence.repositories import ProjectRepo
+        from ..projections.feishu_doc import sync_document
+
+        platform = self._doc_platform()
+        if platform is None:
+            return 0  # no doc platform configured; projection disabled
+        self.sender.doc_platform = platform  # share the instance with the sender
+        updated = 0
+        with self.session_factory() as session:
+            projects = ProjectRepo(session).list_all()
+        for project in projects:
+            if project.status.value != "ACTIVE":
+                continue
+            document_id = (project.metadata or {}).get("feishu_document_id")
+            if not document_id:
+                continue  # no document configured
+            try:
+                with self.session_factory() as session:
+                    result = await sync_document(
+                        session, platform, project_id=project.project_id, document_id=document_id
+                    )
+                    updated += len(result.updated)
+            except Exception:  # noqa: BLE001  one bad project must not starve the tick
+                logger.exception("projection failed for project %s", project.project_id)
+        return updated
+
+    def _doc_platform(self):
+        """Document platform: None unless a real platform is configured
+        (feishu + credentials). FakeDocPlatform is ONLY injected by tests —
+        production never projects into a fake and never claims state."""
+        if self._doc_platform_instance is None:
+            if getattr(self.settings, "doc_platform", "none") == "feishu":
+                from ..projections.feishu_client import FeishuDocClient
+
+                self._doc_platform_instance = FeishuDocClient()
+            else:
+                return None
+        return self._doc_platform_instance
 
     async def _dispatch_ready(self) -> int:
         dispatched = 0

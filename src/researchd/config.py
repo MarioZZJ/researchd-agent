@@ -86,6 +86,7 @@ class Settings(BaseSettings):
     data_dir: str = Field(default=DEFAULT_DATA_DIR, validation_alias=AliasChoices("RESEARCHD_DATA_DIR", "data_dir"))
     db_path: str = Field(default=".data/researchd.db", validation_alias=AliasChoices("RESEARCHD_DB", "db_path"))
     log_level: str = "info"
+    doc_platform: str = "none"  # none | feishu (feishu is PENDING/B-01 gated)
     api: ApiConfig = Field(default_factory=ApiConfig)
     interaction: InteractionConfig = Field(default_factory=InteractionConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
