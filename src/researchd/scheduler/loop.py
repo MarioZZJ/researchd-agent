@@ -143,7 +143,8 @@ class SchedulerLoop:
             name = (project.policy.role_overrides or {}).get(role) if project else None
             source = "project_role_override" if name else "default"
         if not name:
-            name = f"reasonix_{ROLE_TO_PROFILE[role]}" if self.executor.name == "reasonix" else f"fake_{ROLE_TO_PROFILE[role]}"
+            prefix = {"reasonix": "reasonix", "codex": "codex", "fake": "fake"}.get(self.executor.name, "fake")
+            name = f"{prefix}_{ROLE_TO_PROFILE[role]}"
         profile_cfg = getattr(self.settings, "profiles", {}).get(name)
         if profile_cfg is None:
             raise ValueError(

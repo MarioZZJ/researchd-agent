@@ -9,7 +9,7 @@
 | 1 | 空库可执行全部 Alembic migration | DONE | `RESEARCHD_DB=/tmp/mig-check/fresh.db uv run alembic upgrade head` 成功；autogenerate 一致性检查零 diff（26 表） |
 | 2 | 单元、集成、conformance、recovery、e2e 测试通过 | PARTIAL | 单元 52 + 集成 14 + recovery 9 passed（Phase 1–3）；conformance/e2e 待做 |
 | 3 | Reasonix Adapter 真实 capability tests 通过 | PARTIAL | 真实握手（native 二进制+最小 overlay）initialize/session/new 通过；付费 prompt conformance GATED（B-03） |
-| 4 | Codex Adapter 真实验证或明确 BLOCKED | PENDING | Phase 5（B-02） |
+| 4 | Codex Adapter 真实验证或明确 BLOCKED | PARTIAL | 非付费握手（CODEX_HOME 隔离）通过；付费 turn conformance BLOCKED（B-02） |
 | 5 | interaction model 和 project role profiles 可配置 | PENDING | Phase 2 |
 | 6 | cc-connect 补丁实际安装验证或可应用 patch + blocker | PENDING | Phase 6（B-01） |
 | 7 | 飞书决策卡可发送/点击/幂等/原地更新，或准确 blocker | PENDING | Phase 6（B-01） |
@@ -31,8 +31,8 @@
 | 1 | 领域模型、迁移、持久层 | DONE | `94fe79f` |
 | 2 | Service、API、CLI、ACP shim | DONE | `58888c7` |
 | 3 | 调度、租约、锁、恢复 | DONE | `40ffa7f` |
-| 4 | Reasonix ACP Adapter | IN_PROGRESS | 待提交 |
-| 5 | Codex App Server Adapter | PENDING | — |
+| 4 | Reasonix ACP Adapter | DONE | `1f91623` |
+| 5 | Codex App Server Adapter | IN_PROGRESS | 待提交 |
 | 6 | Decision Gate、Reporter、DeliveryPort | PENDING | — |
 | 7 | 飞书文档投影 | PENDING | — |
 | 8 | 黄金路径与 Pilot | PENDING | — |

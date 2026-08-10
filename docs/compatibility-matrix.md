@@ -41,7 +41,8 @@
 | turn/start（input+threadId，可选 model/effort/outputSchema/sandboxPolicy） | v2 schema | TurnStartParams | VERIFIED（schema 级） |
 | turn/steer（expectedTurnId）/ interrupt（threadId+turnId） | v2 schema | TurnSteerParams/TurnInterruptParams | VERIFIED（schema 级） |
 | 事件流 | ThreadStarted/TurnStarted/TurnCompleted/TurnPlanUpdated/TurnDiffUpdated 等 notifications | v2 schema | VERIFIED（schema 级） |
-| 真实进程 conformance | 未执行（需授权/模型调用） | — | BLOCKED（门禁后执行） |
+| 真实进程 conformance | 非付费握手 VERIFIED：隔离 CODEX_HOME（~/.codex 只读）下 initialize + thread/start + thread/archive 全通；config.toml 复制导致 thread/start 失败（已记录），仅复制 auth 文件 | 真实进程握手 | VERIFIED（非付费部分） |
+| 付费 turn/start + outputSchema wire | 未执行（需授权/模型调用） | — | BLOCKED（B-02 门禁后执行） |
 
 ## 4. cc-connect（v1.4.1）
 
