@@ -142,7 +142,8 @@ class Task(DomainModel):
         return self.transition(TaskStatus.FAILED)
 
     def requeue(self, reason: str = "") -> TaskStatus:
-        """REVIEW -> READY (modify or rerun)."""
+        """REVIEW -> READY (modify or rerun) or RUNNING -> READY (interrupted/
+        orphaned run: safe to redispatch)."""
         self.error_message = reason or None
         return self.transition(TaskStatus.READY)
 

@@ -7,7 +7,7 @@
 | # | 判据 | 状态 | 证据 / 备注 |
 |---|---|---|---|
 | 1 | 空库可执行全部 Alembic migration | DONE | `RESEARCHD_DB=/tmp/mig-check/fresh.db uv run alembic upgrade head` 成功；autogenerate 一致性检查零 diff（26 表） |
-| 2 | 单元、集成、conformance、recovery、e2e 测试通过 | PARTIAL | 单元 52 + 集成 14 passed（Phase 1–2）；conformance/recovery/e2e 待做 |
+| 2 | 单元、集成、conformance、recovery、e2e 测试通过 | PARTIAL | 单元 52 + 集成 14 + recovery 9 passed（Phase 1–3）；conformance/e2e 待做 |
 | 3 | Reasonix Adapter 真实 capability tests 通过 | PENDING | Phase 4（B-03） |
 | 4 | Codex Adapter 真实验证或明确 BLOCKED | PENDING | Phase 5（B-02） |
 | 5 | interaction model 和 project role profiles 可配置 | PENDING | Phase 2 |
@@ -29,8 +29,8 @@
 |---|---|---|---|
 | 0 | 环境审计与骨架 | DONE | `4a316c7` |
 | 1 | 领域模型、迁移、持久层 | DONE | `94fe79f` |
-| 2 | Service、API、CLI、ACP shim | IN_PROGRESS | 待提交 |
-| 3 | 调度、租约、锁、恢复 | PENDING | — |
+| 2 | Service、API、CLI、ACP shim | DONE | `58888c7` |
+| 3 | 调度、租约、锁、恢复 | IN_PROGRESS | 待提交 |
 | 4 | Reasonix ACP Adapter | PENDING | — |
 | 5 | Codex App Server Adapter | PENDING | — |
 | 6 | Decision Gate、Reporter、DeliveryPort | PENDING | — |

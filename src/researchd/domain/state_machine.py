@@ -61,7 +61,7 @@ class TaskStateMachine(StateMachine):
     transitions: dict[TaskStatus, set[TaskStatus]] = {
         TaskStatus.PROPOSED: {TaskStatus.READY, TaskStatus.CANCELLED},
         TaskStatus.READY: {TaskStatus.RUNNING, TaskStatus.BLOCKED, TaskStatus.CANCELLED},
-        TaskStatus.RUNNING: {TaskStatus.REVIEW, TaskStatus.BLOCKED, TaskStatus.FAILED, TaskStatus.CANCELLED},
+        TaskStatus.RUNNING: {TaskStatus.REVIEW, TaskStatus.BLOCKED, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.READY},
         TaskStatus.BLOCKED: {TaskStatus.READY, TaskStatus.REVIEW, TaskStatus.CANCELLED},
         TaskStatus.REVIEW: {TaskStatus.COMPLETED, TaskStatus.READY, TaskStatus.FAILED, TaskStatus.CANCELLED},
         TaskStatus.COMPLETED: set(),

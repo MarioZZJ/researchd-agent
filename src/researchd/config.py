@@ -41,6 +41,15 @@ class InteractionConfig(BaseModel):
     intent_confidence_threshold: float = 0.85
 
 
+class SchedulerConfig(BaseModel):
+    """Scheduler tuning (IMPLEMENTATION.md §14)."""
+
+    executor: str = "fake"  # fake | reasonix | codex
+    delivery: str = "fake"  # fake | cc_connect
+    max_parallel: int = 4
+    tick_seconds: float = 2.0
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="RESEARCHD_",
@@ -54,6 +63,7 @@ class Settings(BaseSettings):
     log_level: str = "info"
     api: ApiConfig = Field(default_factory=ApiConfig)
     interaction: InteractionConfig = Field(default_factory=InteractionConfig)
+    scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     service_name: str = "researchd"
 
     def resolve(self, repo_root: Path | None = None) -> "Settings":

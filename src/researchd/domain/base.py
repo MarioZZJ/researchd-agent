@@ -32,7 +32,13 @@ def new_id(kind: str) -> str:
 
 
 def utcnow() -> datetime:
-    return datetime.now(UTC)
+    """Current UTC time, timezone-naive.
+
+    Internal convention: ALL timestamps are UTC stored without a tz suffix
+    (SQLite returns naive datetimes), so domain logic compares naive values
+    consistently. Serializers add the UTC marker when needed.
+    """
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 class DomainModel(BaseModel):
