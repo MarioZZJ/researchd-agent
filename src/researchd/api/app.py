@@ -59,9 +59,8 @@ def create_app(settings: Settings) -> FastAPI:
             session.execute(text("SELECT 1"))
         return {"status": "ready"}
 
-    # every state-changing route requires a valid bearer token UNLESS serving
-    # over UDS (local socket permissions are the boundary).
-    auth_deps = [Depends(require_token)]
-    app.include_router(inbound.router, dependencies=auth_deps)
-    app.include_router(projects.router, dependencies=auth_deps)
+    # every state-changing route carries its own Depends(require_token);
+    # read-only routes (healthz/readyz/GET) stay unauthenticated.
+    app.include_router(inbound.router)
+    app.include_router(projects.router)
     return app

@@ -115,7 +115,13 @@ async def _submit(settings: Settings, session: InteractionSession, text: str, *,
         "platform": "feishu",
         "cc_project": session.cc_project,
         "cc_session_key": session.cc_session_key,
-        "actor": {"type": "human", "display_name": "PI"},
+        "actor": {
+            "type": "human",
+            "display_name": "PI",
+            # identity declared by the gateway (cc-connect); 'pi' is the
+            # single-PI default matching the pilot-provisioned owner
+            "platform_user_id": session.cc_user_id or "pi",
+        },
         "text": text,
         "attachments": [],
     }

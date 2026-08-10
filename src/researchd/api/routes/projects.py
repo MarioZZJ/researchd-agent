@@ -98,8 +98,9 @@ def project_status(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
 
 
 @router.post("/projects/{project_id}/pause", dependencies=[Depends(require_token)])
-def pause_project(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
+def pause_project(project_id: str, actor: str = "pi", uow: UnitOfWork = Depends(get_uow)) -> dict:
     project = _get_project(uow, project_id)
+    _require_actor_authorized(uow.session, project_id, Actor(type="human", platform_user_id=actor))
     project.set_status(ProjectStatus.PAUSED, reason="api")
     ProjectRepo(uow.session).save(project)
     EventRepo(uow.session).append(
@@ -115,8 +116,9 @@ def pause_project(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
 
 
 @router.post("/projects/{project_id}/resume", dependencies=[Depends(require_token)])
-def resume_project(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
+def resume_project(project_id: str, actor: str = "pi", uow: UnitOfWork = Depends(get_uow)) -> dict:
     project = _get_project(uow, project_id)
+    _require_actor_authorized(uow.session, project_id, Actor(type="human", platform_user_id=actor))
     project.set_status(ProjectStatus.ACTIVE)
     ProjectRepo(uow.session).save(project)
     EventRepo(uow.session).append(
@@ -132,8 +134,9 @@ def resume_project(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
 
 
 @router.post("/projects/{project_id}/cancel", dependencies=[Depends(require_token)])
-def cancel_project(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
+def cancel_project(project_id: str, actor: str = "pi", uow: UnitOfWork = Depends(get_uow)) -> dict:
     project = _get_project(uow, project_id)
+    _require_actor_authorized(uow.session, project_id, Actor(type="human", platform_user_id=actor))
     project.set_status(ProjectStatus.CANCELLED, reason="api")
     ProjectRepo(uow.session).save(project)
     EventRepo(uow.session).append(
@@ -247,8 +250,9 @@ def run_command(project_id: str, req: CommandRequest, uow: UnitOfWork = Depends(
 
 
 @router.post("/projects/{project_id}/sync", dependencies=[Depends(require_token)])
-def sync_project(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
-    _get_project(uow, project_id)
+def sync_project(project_id: str, actor: str = "pi", uow: UnitOfWork = Depends(get_uow)) -> dict:
+    project = _get_project(uow, project_id)
+    _require_actor_authorized(uow.session, project_id, Actor(type="human", platform_user_id=actor))
     from ...persistence.outbox import OutboxRepo
     from ...domain.base import utcnow
 

@@ -139,7 +139,25 @@ def pilot(ctx: click.Context, project_id: str, question: str, import_decision: s
             )
             print(f"project {project_id} created (owner member provisioned)")
         else:
-            print(f"project {project_id} already exists (no-op)")
+            # idempotently provision the owner member on existing projects
+            from .persistence.models import ProjectMemberRow
+
+            members = uow.session.execute(
+                ProjectMemberRow.__table__.select().where(
+                    ProjectMemberRow.project_id == project_id,
+                    ProjectMemberRow.platform_user_id == "pi",
+                )
+            ).first()
+            if members is None:
+                uow.session.add(
+                    ProjectMemberRow(
+                        id=f"M-{project_id}", member_id=f"M-{project_id}", project_id=project_id,
+                        platform_user_id="pi", role="owner", can_approve_decisions=True,
+                    )
+                )
+                print(f"project {project_id} exists (owner member provisioned)")
+            else:
+                print(f"project {project_id} already exists (no-op)")
         if import_decision:
             decision_id, _, answer = import_decision.partition("=")
             if DecisionRepo(uow.session).get_by_decision_id(decision_id) is None:

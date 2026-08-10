@@ -17,6 +17,7 @@ class InteractionSession:
     interaction_profile: str = "fast"  # fast | deep | deterministic
     cc_project: str | None = None
     cc_session_key: str | None = None
+    cc_user_id: str | None = None  # platform user id declared by the gateway
     _requests: int = field(default=0, init=False)
 
     def request_counter(self) -> int:

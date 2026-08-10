@@ -78,15 +78,38 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
         if not path:
             raise ValueError(f"artifact {artifact_id!r} has an empty path; rejected")
         if existing_artifact is not None:
-            # idempotent replay: the SAME artifact (project+path) is fine;
-            # a different project/path reusing the id is a conflict
-            if (
-                existing_artifact.project_id != project_id
-                or existing_artifact.path != path
-            ):
+            if existing_artifact.project_id != project_id or existing_artifact.path != path:
                 raise ValueError(
                     f"artifact id {artifact_id!r} reused with different project/path; rejected"
                 )
+            if project is not None:
+                # re-run the FULL file gate (real file + size + hash) even on
+                # replay: the artifact must still exist and be unmodified
+                from .evidence_validation import register_artifact
+
+                rechecked = register_artifact(
+                    session,
+                    project=project,
+                    workspace_root=project.workspace_root,
+                    rel_path=path,
+                    artifact=Artifact(
+                        artifact_id=artifact_id,
+                        project_id=project_id,
+                        task_id=run.task_id,
+                        run_id=run.run_id,
+                        kind=art.kind,
+                        path=path,
+                        description=art.description,
+                    ),
+                )
+                if (
+                    existing_artifact.sha256 is not None
+                    and getattr(rechecked, "sha256", None) is not None
+                    and existing_artifact.sha256 != rechecked.sha256
+                ):
+                    raise ValueError(
+                        f"artifact {artifact_id!r} content changed since registration; rejected"
+                    )
             continue
         if project is not None:
             # registration gate: project-root boundary + '..' / symlink

@@ -105,6 +105,7 @@ class AcpServer:
             interaction_profile=profile or "fast",
             cc_project=config.get("cc_project"),
             cc_session_key=config.get("cc_session_key"),
+            cc_user_id=config.get("cc_user_id"),
         )
         self.sessions[session.session_id] = session
         return {"sessionId": session.session_id, "sessionConfig": config}

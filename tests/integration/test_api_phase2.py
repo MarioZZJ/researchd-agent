@@ -80,6 +80,7 @@ def test_create_and_list_project(api_env):
 def test_project_status_pause_resume(api_env):
     c = api_env["client"]
     c.post("/v1/projects", json={"project_id": "p1", "name": "one"})
+    _provision_owner(api_env["factory"], "p1", owner="pi")
     r = c.get("/v1/projects/p1/status")
     assert r.json()["status"] == "ACTIVE"
     assert c.post("/v1/projects/p1/pause").json()["status"] == "PAUSED"
@@ -131,15 +132,16 @@ def test_inbound_decision_flow_and_idempotency(api_env):
 def test_commands_route(api_env):
     c = api_env["client"]
     c.post("/v1/projects", json={"project_id": "p3", "name": "three"})
-    r = c.post("/v1/projects/p3/commands", json={"text": "/research status"})
+    _provision_owner(api_env["factory"], "p3", owner="pi")
+    r = c.post("/v1/projects/p3/commands", json={"text": "/research status", "actor": {"type": "human", "platform_user_id": "pi"}})
     assert r.status_code == 200
     assert r.json()["command"] == "status"
 
-    r = c.post("/v1/projects/p3/commands", json={"text": "/research config set role.analysis_worker reasonix_worker"})
+    r = c.post("/v1/projects/p3/commands", json={"text": "/research config set role.analysis_worker reasonix_worker", "actor": {"type": "human", "platform_user_id": "pi"}})
     assert r.status_code == 200
     assert "affects future runs only" in r.json()["reply"]
 
-    r = c.post("/v1/projects/p3/commands", json={"text": "garbage text"})
+    r = c.post("/v1/projects/p3/commands", json={"text": "garbage text", "actor": {"type": "human", "platform_user_id": "pi"}})
     assert r.status_code == 400
 
 
@@ -259,11 +261,20 @@ def test_tcp_transport_requires_token(tmp_path):
         r = httpx.get(f"{base}/healthz", timeout=5)
         assert r.status_code == 200  # health is public
         r = httpx.get(f"{base}/v1/projects", timeout=5)
-        assert r.status_code == 401  # no token
-        r = httpx.get(f"{base}/v1/projects", headers={"Authorization": "Bearer wrong"}, timeout=5)
-        assert r.status_code == 401
-        r = httpx.get(f"{base}/v1/projects", headers={"Authorization": f"Bearer {settings.api.token}"}, timeout=5)
-        assert r.status_code == 200
+        assert r.status_code == 200  # GET stays public (read-only)
+        # mutating endpoints need the token on TCP too
+        r = httpx.post(f"{base}/v1/projects", json={"project_id": "p-tcp", "name": "x"}, timeout=5)
+        assert r.status_code == 401  # missing token
+        r = httpx.post(
+            f"{base}/v1/projects", json={"project_id": "p-tcp", "name": "x"},
+            headers={"Authorization": "Bearer wrong"}, timeout=5,
+        )
+        assert r.status_code == 401  # wrong token
+        r = httpx.post(
+            f"{base}/v1/projects", json={"project_id": "p-tcp", "name": "x"},
+            headers={"Authorization": f"Bearer {settings.api.token}"}, timeout=5,
+        )
+        assert r.status_code == 200  # valid token
     finally:
         server.should_exit = True
         thread.join(timeout=5)

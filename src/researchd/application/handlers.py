@@ -234,6 +234,7 @@ class CommandHandler:
 
     def cmd_digest(self, cmd: ParsedCommand) -> CommandReply:
         project = self._require_project()
+        _require_actor_authorized(self.session, project.project_id, self.actor)
         # Digest content is compiled by the reporter (Phase 6); here we only
         # schedule the digest outbox notification.
         OutboxRepo(self.session).enqueue(
@@ -246,6 +247,7 @@ class CommandHandler:
 
     def cmd_sync(self, cmd: ParsedCommand) -> CommandReply:
         project = self._require_project()
+        _require_actor_authorized(self.session, project.project_id, self.actor)
         OutboxRepo(self.session).enqueue(
             destination="delivery",
             idempotency_key=f"sync:{project.project_id}:{utcnow().isoformat()}",
@@ -277,6 +279,7 @@ class CommandHandler:
                 f"role_overrides={json.dumps(project.policy.role_overrides)} "
                 f"(execution policy; interaction profile is session-level)"
             )
+        _require_actor_authorized(self.session, project.project_id, self.actor)
         if cmd.args[0] == "set":
             if len(cmd.args) != 3 or not cmd.args[1].startswith("role."):
                 raise HandlerError("usage: /research config set role.<role> <profile>")
