@@ -734,6 +734,11 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+feishu = [
+    { name = "lark-oapi" },
+]
+
+[package.dev-dependencies]
 dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -752,16 +757,21 @@ requires-dist = [
     { name = "lark-oapi", marker = "extra == 'feishu'", specifier = ">=1.7" },
     { name = "pydantic", specifier = ">=2.7,<3" },
     { name = "pydantic-settings", specifier = ">=2.2" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.2" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
-    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
     { name = "python-multipart", specifier = ">=0.0.9" },
     { name = "sqlalchemy", specifier = ">=2.0.30,<2.1" },
     { name = "structlog", specifier = ">=24.1" },
     { name = "ulid-py", specifier = ">=1.1" },
     { name = "uvicorn", specifier = ">=0.30" },
 ]
-provides-extras = ["feishu", "dev"]
+provides-extras = ["feishu"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=8.2" },
+    { name = "pytest-asyncio", specifier = ">=0.23" },
+    { name = "pytest-cov", specifier = ">=5.0" },
+]
+feishu = [{ name = "lark-oapi", specifier = ">=1.7" }]
 
 [[package]]
 name = "sqlalchemy"

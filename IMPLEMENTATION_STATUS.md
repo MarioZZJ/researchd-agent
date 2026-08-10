@@ -6,8 +6,8 @@
 
 | # | 判据 | 状态 | 证据 / 备注 |
 |---|---|---|---|
-| 1 | 空库可执行全部 Alembic migration | PENDING | Phase 1 |
-| 2 | 单元、集成、conformance、recovery、e2e 测试通过 | PENDING | Phase 1–8 |
+| 1 | 空库可执行全部 Alembic migration | DONE | `RESEARCHD_DB=/tmp/mig-check/fresh.db uv run alembic upgrade head` 成功；autogenerate 一致性检查零 diff（26 表） |
+| 2 | 单元、集成、conformance、recovery、e2e 测试通过 | PARTIAL | 单元 52 passed（Phase 1）；其余 Phase 2–8 |
 | 3 | Reasonix Adapter 真实 capability tests 通过 | PENDING | Phase 4（B-03） |
 | 4 | Codex Adapter 真实验证或明确 BLOCKED | PENDING | Phase 5（B-02） |
 | 5 | interaction model 和 project role profiles 可配置 | PENDING | Phase 2 |
@@ -21,14 +21,14 @@
 | 13 | 不存在原始 Executor 输出直达飞书的代码路径 | PENDING | Phase 6 审查 |
 | 14 | threat model、运维、恢复、回滚、模型配置文档齐全 | PENDING | Phase 6/9/10 |
 | 15 | requirements-traceability 映射每项冻结要求 | PENDING | Phase 10 |
-| 16 | 所有改动有 Git commit，工作树状态明确 | IN_PROGRESS | 见 commit 列表 |
+| 16 | 所有改动有 Git commit，工作树状态明确 | IN_PROGRESS | Phase 1 提交后更新 |
 
 ## 阶段状态
 
 | Phase | 内容 | 状态 | commit |
 |---|---|---|---|
-| 0 | 环境审计与骨架 | IN_PROGRESS | — |
-| 1 | 领域模型、迁移、持久层 | PENDING | — |
+| 0 | 环境审计与骨架 | DONE | `4a316c7` |
+| 1 | 领域模型、迁移、持久层 | IN_PROGRESS | 待提交 |
 | 2 | Service、API、CLI、ACP shim | PENDING | — |
 | 3 | 调度、租约、锁、恢复 | PENDING | — |
 | 4 | Reasonix ACP Adapter | PENDING | — |

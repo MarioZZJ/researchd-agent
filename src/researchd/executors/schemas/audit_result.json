@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "researchd.audit_result.v1",
+  "title": "AuditResult",
+  "description": "Auditor output (IMPLEMENTATION.md §12.3). verdict: ACCEPT | REVISE | BLOCK | REJECT.",
+  "type": "object",
+  "required": ["schema", "task_id", "verdict", "checks"],
+  "properties": {
+    "schema": { "const": "researchd.audit_result.v1" },
+    "task_id": { "type": "string" },
+    "verdict": { "enum": ["ACCEPT", "REVISE", "BLOCK", "REJECT"] },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["check_id", "status", "summary"],
+        "properties": {
+          "check_id": { "type": "string" },
+          "status": { "enum": ["PASS", "FAIL", "WARN"] },
+          "summary": { "type": "string" },
+          "refs": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "evidence_status_changes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["evidence_id", "to_status"],
+        "properties": {
+          "evidence_id": { "type": "string" },
+          "to_status": { "enum": ["VERIFIED", "CONTESTED", "INVALID", "SUPERSEDED"] },
+          "reason": { "type": "string" }
+        }
+      }
+    },
+    "claim_status_suggestions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["claim_id", "evidence_state"],
+        "properties": {
+          "claim_id": { "type": "string" },
+          "evidence_state": { "enum": ["UNTESTED", "SUPPORTED", "MIXED", "UNSUPPORTED", "CONTRADICTED"] },
+          "reason": { "type": "string" }
+        }
+      }
+    },
+    "issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["title"],
+        "properties": {
+          "title": { "type": "string" },
+          "description": { "type": "string" },
+          "severity": { "enum": ["info", "warning", "critical"] }
+        }
+      }
+    },
+    "decision_candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["question", "why_material", "options"],
+        "properties": {
+          "question": { "type": "string" },
+          "trigger": { "type": "string" },
+          "why_material": { "type": "string" },
+          "category": { "type": "string" },
+          "affected_object": { "type": ["string", "null"] },
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["option_id", "label", "scientific_consequence"],
+              "properties": {
+                "option_id": { "type": "string" },
+                "label": { "type": "string" },
+                "description": { "type": "string" },
+                "scientific_consequence": { "type": "string" }
+              }
+            }
+          },
+          "recommendation": { "type": ["string", "null"] },
+          "recommendation_basis": { "type": ["string", "null"] },
+          "evidence_refs": { "type": "array", "items": { "type": "string" } },
+          "unresolved_uncertainty": { "type": ["string", "null"] },
+          "reversibility": { "type": ["string", "null"] },
+          "blocking_scope": { "type": "array", "items": { "type": "string" } },
+          "continue_scope": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "revision_request": {
+      "type": ["object", "null"],
+      "properties": {
+        "message": { "type": "string" },
+        "max_repairs": { "type": "integer" }
+      }
+    }
+  }
+}

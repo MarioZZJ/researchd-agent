@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "researchd.work_result.v1",
+  "title": "WorkResult",
+  "description": "Worker output (IMPLEMENTATION.md §12.2). outcome is one of SUBMIT_FOR_REVIEW | BLOCKED | FAILED.",
+  "type": "object",
+  "required": ["schema", "task_id", "outcome", "criteria_results", "artifacts", "evidence_candidates", "claim_changes", "issues", "decision_candidates", "next_task_proposals"],
+  "properties": {
+    "schema": { "const": "researchd.work_result.v1" },
+    "task_id": { "type": "string" },
+    "outcome": { "enum": ["SUBMIT_FOR_REVIEW", "BLOCKED", "FAILED"] },
+    "criteria_results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["criterion_id", "status"],
+        "properties": {
+          "criterion_id": { "type": "string" },
+          "status": { "enum": ["PASS", "FAIL", "NOT_APPLICABLE"] },
+          "refs": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["local_ref", "kind", "path", "description"],
+        "properties": {
+          "local_ref": { "type": "string" },
+          "kind": { "type": "string" },
+          "path": { "type": "string" },
+          "description": { "type": "string" }
+        }
+      }
+    },
+    "evidence_candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["local_ref", "type", "statement"],
+        "properties": {
+          "local_ref": { "type": "string" },
+          "type": { "enum": ["literature", "computational", "model_annotation", "human", "other"] },
+          "statement": { "type": "string" },
+          "artifact_refs": { "type": "array", "items": { "type": "string" } },
+          "limitations": { "type": "array", "items": { "type": "string" } },
+          "literature": {
+            "type": "object",
+            "properties": {
+              "source_id": { "type": "string" },
+              "locator": { "type": ["string", "null"] },
+              "snapshot_artifact_id": { "type": ["string", "null"] },
+              "fetched_at": { "type": ["string", "null"] }
+            }
+          }
+        }
+      }
+    },
+    "claim_changes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["claim_id", "operation"],
+        "properties": {
+          "claim_id": { "type": ["string", "null"] },
+          "operation": { "enum": ["create", "update", "retire"] },
+          "text": { "type": ["string", "null"] },
+          "is_core": { "type": ["boolean", "null"] },
+          "evidence_relations": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["evidence_ref", "relation"],
+              "properties": {
+                "evidence_ref": { "type": "string" },
+                "relation": { "enum": ["supports", "challenges", "qualifies", "defines_scope", "provides_context", "invalidates"] }
+              }
+            }
+          }
+        }
+      }
+    },
+    "issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["title"],
+        "properties": {
+          "title": { "type": "string" },
+          "description": { "type": "string" },
+          "severity": { "enum": ["info", "warning", "critical"] }
+        }
+      }
+    },
+    "decision_candidates": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/decision_candidate" }
+    },
+    "next_task_proposals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["task_id", "role", "objective"],
+        "properties": {
+          "task_id": { "type": "string" },
+          "role": { "type": "string" },
+          "objective": { "type": "string" },
+          "why_now": { "type": "string" },
+          "depends_on": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "decision_candidate": {
+      "type": "object",
+      "required": ["question", "why_material", "options"],
+      "properties": {
+        "question": { "type": "string" },
+        "trigger": { "type": "string" },
+        "why_material": { "type": "string" },
+        "category": { "type": "string" },
+        "affected_object": { "type": ["string", "null"] },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["option_id", "label", "scientific_consequence"],
+            "properties": {
+              "option_id": { "type": "string" },
+              "label": { "type": "string" },
+              "description": { "type": "string" },
+              "scientific_consequence": { "type": "string" }
+            }
+          }
+        },
+        "recommendation": { "type": ["string", "null"] },
+        "recommendation_basis": { "type": ["string", "null"] },
+        "evidence_refs": { "type": "array", "items": { "type": "string" } },
+        "unresolved_uncertainty": { "type": ["string", "null"] },
+        "reversibility": { "type": ["string", "null"] },
+        "blocking_scope": { "type": "array", "items": { "type": "string" } },
+        "continue_scope": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}
