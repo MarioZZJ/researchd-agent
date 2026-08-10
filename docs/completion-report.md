@@ -8,8 +8,8 @@
 
 ## 2. 分支与 commit
 
-- 分支：`master`（25 个 commit，工作树干净）
-- 最终 commit：`936f109`（docs 对齐与收尾）
+- 分支：`master`（26 个 commit，工作树干净）
+- 最终 commit：`bf4c3e2`（docs 完成判据全部 DONE）
 - 提交序列（新→旧）：`1b8653b` → `b188e06`（deploy/backup/ops）→ `bc84d90`（pilot+e2e）→ `202d77f/c4dd2fa/0fe05da`（投影）→ `8152eb5`（门控/报告/投递）→ `b36c956`（codex）→ `1f91623`（reasonix）→ `40ffa7f`（调度/租约/恢复）→ `58888c7`（service/api/cli/acp）→ `94fe79f`（领域/迁移）→ `4a316c7`（scaffold）
 
 ## 3. 实际兼容性结论

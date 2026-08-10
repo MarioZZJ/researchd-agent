@@ -10,18 +10,18 @@
 | 2 | 单元、集成、conformance、recovery、e2e 测试通过 | PARTIAL | 144 passed + 2 门控跳过（含 8 轮安全加固回归）；真实平台 GATED |
 | 3 | Reasonix Adapter 真实 capability tests 通过 | PARTIAL | 真实握手（native 二进制+最小 overlay）initialize/session/new 通过；付费 prompt conformance GATED（B-03） |
 | 4 | Codex Adapter 真实验证或明确 BLOCKED | PARTIAL | 非付费握手（CODEX_HOME 隔离）通过；付费 turn conformance BLOCKED（B-02） |
-| 5 | interaction model 和 project role profiles 可配置 | PENDING | Phase 2 |
+| 5 | interaction model 和 project role profiles 可配置 | DONE | `/research model interaction` 会话级 + role_overrides 冻结到 run；`tests/integration/test_api_phase2.py`、`tests/conformance/test_reasonix_conformance.py` |
 | 6 | cc-connect 补丁实际安装验证或可应用 patch + blocker | PARTIAL | patch 可应用（373 行，write-ahead 幂等）；未安装验证（B-06 无 Go 工具链）；真实发送 GATED（B-01） |
 | 7 | 飞书决策卡可发送/点击/幂等/原地更新，或准确 blocker | PARTIAL | FakeDeliveryPort 全链路（幂等/按钮/恰好一次）；真实卡 GATED（B-01） |
-| 8 | 飞书项目文档可增量同步，或准确权限 blocker | PENDING | Phase 7（B-01） |
+| 8 | 飞书项目文档可增量同步，或准确权限 blocker | DONE | 15 项投影测试 + B-01（凭据未授权） |
 | 9 | systemd/user-systemd 启动、停止、自动恢复 | PARTIAL | unit 语法验证 + kill -9 自动恢复真实演练；持久安装 B-07（/home、/run/user 只读、无 sudo） |
 | 10 | deterministic 黄金路径完整通过 | DONE | `tests/e2e/test_golden_path.py`（22 步，含执行中重启恢复） |
 | 11 | 真实 pilot 已创建并至少开始首批任务 | PARTIAL | `researchd pilot` bootstrap 幂等验证；真实模型运行 GATED（B-01/B-03） |
-| 12 | 数据库和项目目录备份恢复演练通过 | PENDING | Phase 9 |
+| 12 | 数据库和项目目录备份恢复演练通过 | DONE | 在线备份/round-trip/恶意 tar 拒绝 + 真实 pilot DB 演练 |
 | 13 | 不存在原始 Executor 输出直达飞书的代码路径 | DONE | 报告 body 仅来自 ReportSpec 确定性编译 |
-| 14 | threat model、运维、恢复、回滚、模型配置文档齐全 | PENDING | Phase 6/9/10 |
-| 15 | requirements-traceability 映射每项冻结要求 | PENDING | Phase 10 |
-| 16 | 所有改动有 Git commit，工作树状态明确 | IN_PROGRESS | Phase 1 提交后更新 |
+| 14 | threat model、运维、恢复、回滚、模型配置文档齐全 | DONE | threat-model.md（security-review 10 轮审查）、operations.md、cc-connect README、env.example |
+| 15 | requirements-traceability 映射每项冻结要求 | DONE | docs/requirements-traceability.md（引用经核验修正） |
+| 16 | 所有改动有 Git commit，工作树状态明确 | DONE | 25 commits，`git status` 干净，HEAD 6282f2e |
 
 ## 阶段状态
 
@@ -36,7 +36,7 @@
 | 6 | Decision Gate、Reporter、DeliveryPort | DONE | `8152eb5` |
 | 7 | 飞书文档投影 | DONE | `202d77f` |
 | 8 | 黄金路径与 Pilot | DONE | `bc84d90` |
-| 9 | 部署、备份、运维 | PENDING | — |
+| 9 | 部署、备份、运维 | DONE | `b188e06`+`1b8653b`（backup/restore/export/doctor） |
 | 10 | 最终审查与收尾 | PENDING | — |
 
 ## 环境基线（Phase 0，2026-08-10）
