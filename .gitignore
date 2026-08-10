@@ -1,0 +1,36 @@
+# Host-owned dynamic state (never commit)
+.reasonix/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+
+# Secrets
+.env
+*.env
+!deploy/env.example
+
+# Runtime state (host data, not source)
+.data/
+/run/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+
+# Project workspaces managed by researchd (created at runtime)
+workspaces/
+projects/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
