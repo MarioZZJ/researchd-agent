@@ -50,6 +50,27 @@ class SchedulerConfig(BaseModel):
     tick_seconds: float = 2.0
 
 
+class ProfileConfig(BaseModel):
+    """Named executor profile (IMPLEMENTATION.md §15.1): resolved model and
+    reasoning effort. Profile names are referenced by Task contracts and by
+    project role overrides."""
+
+    model: str | None = None
+    reasoning_effort: str | None = None
+    process_instance_id: str | None = None
+
+
+DEFAULT_PROFILES: dict[str, ProfileConfig] = {
+    "reasonix_worker": ProfileConfig(model="gateway/deepseek-v4-flash", reasoning_effort="medium"),
+    "reasonix_planner": ProfileConfig(model="gateway/gpt-5.6-sol", reasoning_effort="high"),
+    "reasonix_auditor": ProfileConfig(model="gateway/gpt-5.6-sol", reasoning_effort="high"),
+    "reasonix_literature": ProfileConfig(model="gateway/deepseek-v4-flash", reasoning_effort="medium"),
+    "fake_worker": ProfileConfig(),
+    "fake_planner": ProfileConfig(),
+    "fake_auditor": ProfileConfig(),
+}
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="RESEARCHD_",
@@ -64,6 +85,7 @@ class Settings(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     interaction: InteractionConfig = Field(default_factory=InteractionConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
+    profiles: dict[str, ProfileConfig] = Field(default_factory=lambda: dict(DEFAULT_PROFILES))
     service_name: str = "researchd"
 
     def resolve(self, repo_root: Path | None = None) -> "Settings":

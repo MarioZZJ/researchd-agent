@@ -18,13 +18,13 @@
 | 能力 | 实测 | 证据 | 状态 |
 |---|---|---|---|
 | initialize 握手 | 返回完整 agentCapabilities | 亲自 stdio 探测 | VERIFIED |
-| session/new | 需可写 sessions 目录；REASONIX_HOME 隔离后可创建 | 隔离 home 探测 | VERIFIED（带 overlay 前提） |
+| session/new | 需可写 sessions 目录；REASONIX_HOME 隔离 overlay + 完整 config 复制后可创建 | 真实进程握手 | VERIFIED |
 | session/load | sessionCapabilities.loadSession=true | initialize 返回 | VERIFIED（能力声明） |
 | session/resume | resume={} | initialize 返回 | VERIFIED（能力声明） |
 | session/list | 返回 sessions[]（空列表） | 亲自探测 | VERIFIED |
 | session/close | 能力声明存在 | initialize 返回 | VERIFIED（能力声明） |
 | session/prompt | promptCapabilities.embeddedContext=true | initialize 返回 | VERIFIED（能力声明） |
-| 模型覆盖 | sessionConfig.model 传入 | 探测（隔离 home 报 not configured 属 overlay 配置问题，非协议问题） | PARTIAL（Phase 4 落地） |
+| 模型覆盖 | sessionConfig.model 传入；overlay 含完整 provider 配置 | 真实进程握手（model 参数接受） | VERIFIED |
 | structured output | 未在 ACP 层发现显式字段 | 待 Phase 4 深挖 | PARTIAL |
 | steering | `_reasonix.io/session/steer` 扩展声明 | initialize._meta.reasonix.io | VERIFIED（能力声明） |
 | cancel | session 生命周期含 close/delete；task cancel 另有 CLI | — | PARTIAL（Phase 4 落地） |

@@ -62,7 +62,8 @@ class RunDispatcher:
             executor=self.executor.name,
             executor_profile=(profile or {}).get("name"),
             resolved_model=(profile or {}).get("model"),
-            configuration_source="scheduler",
+            reasoning_effort=(profile or {}).get("reasoning_effort"),
+            configuration_source=(profile or {}).get("source") or "scheduler",
             process_instance_id=(profile or {}).get("process_instance_id"),
             lease_token=None,
         )

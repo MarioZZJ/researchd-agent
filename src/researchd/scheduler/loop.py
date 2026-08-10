@@ -22,6 +22,20 @@ logger = logging.getLogger("researchd.scheduler")
 TICK_SECONDS = 2.0
 HEARTBEAT_SECONDS = 10.0
 
+# TaskRole -> default profile suffix (IMPLEMENTATION.md §15.1). Every role
+# must map to an existing DEFAULT_PROFILES entry.
+ROLE_TO_PROFILE = {
+    "planner": "planner",
+    "interaction": "worker",
+    "worker_default": "worker",
+    "literature_worker": "literature",
+    "analysis_worker": "worker",
+    "auditor": "auditor",
+    "cross_model_reviewer": "auditor",
+    "report_compressor": "worker",
+    "manuscript_writer": "worker",
+}
+
 
 @dataclass
 class ActiveRun:
@@ -105,7 +119,8 @@ class SchedulerLoop:
                 if decision.action != "dispatch":
                     continue
                 dispatcher = RunDispatcher(session, self.executor)
-                run = dispatcher.dispatch_task(task)
+                profile = self._resolve_profile(session, task)
+                run = dispatcher.dispatch_task(task, profile=profile)
                 if run is None:
                     continue
                 session.commit()
@@ -114,6 +129,34 @@ class SchedulerLoop:
                 dispatched += 1
                 slots -= 1
         return dispatched
+
+    def _resolve_profile(self, session, task) -> dict:  # noqa: ANN001
+        """Resolve the executor profile for a task (IMPLEMENTATION.md §15.1):
+        explicit contract profile > project role override > role default."""
+        from ..persistence.repositories import ProjectRepo
+
+        name = task.contract.executor_profile
+        source = "contract"
+        role = task.contract.role.value if hasattr(task.contract.role, "value") else str(task.contract.role)
+        if not name:
+            project = ProjectRepo(session).get_by_project_id(task.project_id)
+            name = (project.policy.role_overrides or {}).get(role) if project else None
+            source = "project_role_override" if name else "default"
+        if not name:
+            name = f"reasonix_{ROLE_TO_PROFILE[role]}" if self.executor.name == "reasonix" else f"fake_{ROLE_TO_PROFILE[role]}"
+        profile_cfg = getattr(self.settings, "profiles", {}).get(name)
+        if profile_cfg is None:
+            raise ValueError(
+                f"unknown executor profile {name!r} for task {task.task_id} (role {role}, source {source}); "
+                "configure it in settings.profiles"
+            )
+        return {
+            "name": name,
+            "model": profile_cfg.model,
+            "reasoning_effort": profile_cfg.reasoning_effort,
+            "process_instance_id": profile_cfg.process_instance_id,
+            "source": source,
+        }
 
     async def _heartbeat_active(self) -> int:
         n = 0
@@ -128,6 +171,7 @@ class SchedulerLoop:
                     self.active.pop(task_id, None)
                     continue
                 run.heartbeat()
+                RunRepo(session).save(run)  # domain objects need an explicit save
                 if run.lease_token:
                     LeaseRepo(session).heartbeat(run.lease_token)
                 session.commit()
@@ -138,16 +182,31 @@ class SchedulerLoop:
     async def _drive_run(self, run_id: str, task_id: str) -> None:
         """Execute one run with budget enforcement; heartbeat + lease renewal."""
         async with self._dispatch_sem:
+            profile = await self._run_profile(run_id)
             budget = await self._run_budget(task_id)
             try:
                 async with asyncio.timeout(budget):
-                    await self._execute_with_heartbeat(run_id)
+                    await self._execute_with_heartbeat(run_id, profile)
             except TimeoutError:
                 await self._collect_interrupt(run_id, "budget exceeded")
             except asyncio.CancelledError:
                 await self._collect_interrupt(run_id, "cancelled")
             except Exception as exc:  # noqa: BLE001
                 await self._collect_failure(run_id, str(exc))
+
+    async def _run_profile(self, run_id: str) -> dict:
+        """Read the profile frozen on the run at dispatch time."""
+        with self.session_factory() as session:
+            run = RunRepo(session).get_by_run_id(run_id)
+            if run is None:
+                return {}
+            return {
+                "name": run.executor_profile,
+                "model": run.resolved_model,
+                "reasoning_effort": run.reasoning_effort,
+                "process_instance_id": run.process_instance_id,
+                "source": run.configuration_source,
+            }
 
     async def _run_budget(self, task_id: str) -> float:
         with self.session_factory() as session:
@@ -156,7 +215,7 @@ class SchedulerLoop:
                 return 300.0
             return float(task.contract.budget.max_wall_seconds or 300.0)
 
-    async def _execute_with_heartbeat(self, run_id: str) -> None:
+    async def _execute_with_heartbeat(self, run_id: str, profile: dict) -> None:
         """Run the executor turn, refreshing heartbeat every HEARTBEAT_SECONDS."""
         heartbeat_task = asyncio.create_task(self._heartbeat_loop(run_id))
         try:
@@ -164,7 +223,19 @@ class SchedulerLoop:
                 run = RunRepo(session).get_by_run_id(run_id)
                 task = TaskRepo(session).get_by_task_id(run.task_id)
                 context = {"task": task.model_dump(), "project_id": task.project_id}
-            result, session_info = await self.executor.run_worker(context, profile={})
+            # record the executor session id as soon as it exists (recovery)
+            def _on_session(sid: str) -> None:
+                with self.session_factory() as session:
+                    run = RunRepo(session).get_by_run_id(run_id)
+                    if run is not None:
+                        run.session_id = sid
+                        RunRepo(session).save(run)
+                        session.commit()
+
+            hook = getattr(self.executor, "on_session_started", None)
+            if hook is not None:
+                hook(_on_session)
+            result, session_info = await self.executor.run_worker(context, profile=profile)
             with self.session_factory() as session:
                 run = RunRepo(session).get_by_run_id(run_id)
                 RunDispatcher(session, self.executor).collect_success(run, result, session_info)
@@ -181,6 +252,7 @@ class SchedulerLoop:
                     if run is None:
                         return
                     run.heartbeat()
+                    RunRepo(session).save(run)
                     if run.lease_token:
                         LeaseRepo(session).heartbeat(run.lease_token)
                     session.commit()
