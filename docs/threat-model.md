@@ -33,7 +33,7 @@
 
 ### T4 Executor 会话越权（跨项目污染）
 - 缓解：每 run 独立会话（session/new 每 run）；最小 overlay（reasonix：仅复制 [[providers]]/default_model，环境白名单 + HOME 重定向，overlay 0600）；codex：独立 CODEX_HOME（0600，helper 拒绝 /tmp）；Executor env 白名单（PATH/HOME/REASONIX_HOME/TERM/LANG/LC_ALL/TZ），不注入飞书/cc-connect token；API socket 0600。
-- **局限（B-08）**：本机无 root/bwrap/landlock，Executor 与 service 同 uid 运行，**没有 OS 级进程隔离**——同 uid 的 Executor 在 OS 层面仍可读 `.data/`、连 UDS、读 0600 env 文件（含 API token）。当前认证边界（写 API token、成员门）在"同 uid 可信进程"层有效，但**可被同 uid 恶意 Executor 绕过**（token 文件可读）。缓解层级：协作式锁 + 最小暴露 + env 白名单 + 结构化输出门控；生产多租户环境必须加独立 uid 或 sandbox（bwrap/landlock/seccomp）。
+- **局限（B-08）**：本机无 root/bwrap/landlock，Executor 与 service 同 uid 运行，**没有 OS 级进程隔离**——同 uid 的 Executor 可读写 `.data/`（DB/workspace/socket）、rename/unlink 文件、读 0600 env（含 API token）、替换 symlink 绕过路径门控。当前"唯一写者/认证/路径门控"均为协作式约束，可被同 uid 恶意 Executor 绕过；缓解层级：协作式锁 + 最小暴露 + env 白名单 + 结构化输出 schema 门控。生产多租户环境必须加独立 uid 或 sandbox（bwrap/landlock/seccomp）。
 - 测试：`tests/conformance/test_overlay_isolation.py`（无 key 文件、cwd 隔离）、`tests/integration/test_api_phase2.py::test_uds_mutating_endpoints_require_token`。
 
 ### T5 路径逃逸（artifact/workspace/restore）

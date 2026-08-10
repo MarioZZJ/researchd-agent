@@ -74,14 +74,27 @@ def create_project(req: ProjectCreateRequest, request: Request, uow: UnitOfWork 
     import logging
 
     logger = logging.getLogger("researchd.api")
+
+    def _workspace_bad_request(context: str) -> None:
+        logger.warning("workspace_root rejected (%s) for project %s by actor %s", context, project_id, actor)
+
     allowed_anchor = Path(request.app.state.settings.data_dir) / "workspaces"
-    allowed_anchor.mkdir(parents=True, exist_ok=True)
+    try:
+        allowed_anchor.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        _workspace_bad_request("anchor mkdir failed")
+        raise HTTPException(status_code=400, detail="workspaces anchor unavailable") from None
     try:
         fd = os.open(allowed_anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         os.close(fd)
     except OSError:
+        _workspace_bad_request("anchor is not a real directory")
         raise HTTPException(status_code=400, detail="workspaces anchor is not a real directory") from None
-    allowed_root = allowed_anchor.resolve()
+    try:
+        allowed_root = allowed_anchor.resolve()
+    except OSError:
+        _workspace_bad_request("anchor resolve failed")
+        raise HTTPException(status_code=400, detail="workspaces anchor unavailable") from None
 
     def _no_symlink_components(path: Path) -> bool:
         """Every component under allowed_root must be a real directory (lstat,
