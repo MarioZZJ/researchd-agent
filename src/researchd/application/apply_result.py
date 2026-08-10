@@ -82,7 +82,12 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
                 raise ValueError(
                     f"artifact id {artifact_id!r} reused with different project/path; rejected"
                 )
-            if project is not None and project.workspace_root:
+            if project is None or not project.workspace_root:
+                raise ValueError(
+                    f"artifact {artifact_id!r} cannot be re-validated: "
+                    "project has no workspace_root (fail-closed)"
+                )
+            else:
                 # re-run the file gate as PURE validation: real file + size +
                 # hash, WITHOUT saving — an existing artifact's provenance
                 # (run/task/kind/description) must never be rewritten
@@ -94,11 +99,12 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
                     info = check_artifact_file(project.workspace_root, path)
                 except PathEscapeError as exc:
                     raise ValueError(f"artifact {path!r} rejected by registration gate: {exc}") from exc
-                if (
-                    existing_artifact.sha256 is not None
-                    and info.get("sha256") is not None
-                    and existing_artifact.sha256 != info["sha256"]
-                ):
+                if existing_artifact.sha256 is None:
+                    raise ValueError(
+                        f"artifact {artifact_id!r} has no stored hash; "
+                        "re-run `researchd migrate` hash backfill before replay (fail-closed)"
+                    )
+                if info.get("sha256") is not None and existing_artifact.sha256 != info["sha256"]:
                     raise ValueError(
                         f"artifact {artifact_id!r} content changed since registration; rejected"
                     )

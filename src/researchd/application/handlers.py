@@ -78,6 +78,8 @@ def normalize_inbound(
     actor_dict = None
     if actor is not None:
         actor_dict = actor.model_dump() if hasattr(actor, "model_dump") else dict(actor)
+    if actor is None or not (actor_dict or {}).get("platform_user_id"):
+        raise HandlerError("actor with platform_user_id is required (fail-closed)", 400)
     return {
         "schema": "researchd.inbound_message.v1",
         "message_id": message_id,
@@ -85,7 +87,7 @@ def normalize_inbound(
         "platform": platform,
         "cc_project": cc_project,
         "cc_session_key": cc_session_key,
-        "actor": actor_dict or {"type": "human", "platform_user_id": "unknown"},
+        "actor": actor_dict,
         "text": text,
         "attachments": attachments or [],
         "received_at": (received_at or utcnow()).isoformat(),

@@ -158,13 +158,21 @@ def test_apply_reuses_artifact_without_rewriting_provenance(factory, tmp_path):
     with UnitOfWork(factory) as uow:
         ProjectRepo(uow.session).save(Project(project_id="P-AR", name="ar", metadata={}, workspace_root=str(ws)))
         uow.commit()
-    # pre-registered artifact from run R-OLD (immutable provenance)
+    # pre-registered artifact from run R-OLD (immutable provenance) — registered
+    # through the gate so it carries a real sha256
     with UnitOfWork(factory) as uow:
-        ArtifactRepo(uow.session).save(
-            ArtifactDomain(
+        project = ProjectRepo(uow.session).get_by_project_id("P-AR")
+        from researchd.application.evidence_validation import register_artifact
+
+        register_artifact(
+            uow.session,
+            project=project,
+            workspace_root=str(ws),
+            rel_path="data.csv",
+            artifact=ArtifactDomain(
                 artifact_id="A-1", project_id="P-AR", task_id="T-OLD", run_id="R-OLD",
                 kind="dataset", path="data.csv", description="original",
-            )
+            ),
         )
         uow.commit()
     raw = {

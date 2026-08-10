@@ -67,19 +67,19 @@ def test_healthz_and_readyz(api_env):
 
 def test_create_and_list_project(api_env):
     c = api_env["client"]
-    r = c.post("/v1/projects", json={"project_id": "pilot-1", "name": "pilot"})
+    r = c.post("/v1/projects", json={"project_id": "pilot-1", "name": "pilot", "actor": "ou_pi"})
     assert r.status_code == 200
     pid = r.json()["project_id"]
     assert pid == "pilot-1"
     r = c.get("/v1/projects")
     assert any(p["project_id"] == "pilot-1" for p in r.json()["projects"])
     # duplicate create -> 409
-    assert c.post("/v1/projects", json={"project_id": "pilot-1", "name": "x"}).status_code == 409
+    assert c.post("/v1/projects", json={"project_id": "pilot-1", "name": "x", "actor": "ou_pi"}).status_code == 409
 
 
 def test_project_status_pause_resume(api_env):
     c = api_env["client"]
-    c.post("/v1/projects", json={"project_id": "p1", "name": "one"})
+    c.post("/v1/projects", json={"project_id": "p1", "name": "one", "actor": "ou_pi"})
     _provision_owner(api_env["factory"], "p1", owner="pi")
     r = c.get("/v1/projects/p1/status")
     assert r.json()["status"] == "ACTIVE"
@@ -89,7 +89,7 @@ def test_project_status_pause_resume(api_env):
 
 def test_inbound_decision_flow_and_idempotency(api_env):
     c = api_env["client"]
-    c.post("/v1/projects", json={"project_id": "p2", "name": "two"})
+    c.post("/v1/projects", json={"project_id": "p2", "name": "two", "actor": "ou_pi"})
     _provision_owner(api_env["factory"], "p2")
     # create an OPEN decision directly in the DB (decision gate lands Phase 6)
     from researchd.domain.decision import Decision, DecisionOption
@@ -131,7 +131,7 @@ def test_inbound_decision_flow_and_idempotency(api_env):
 
 def test_commands_route(api_env):
     c = api_env["client"]
-    c.post("/v1/projects", json={"project_id": "p3", "name": "three"})
+    c.post("/v1/projects", json={"project_id": "p3", "name": "three", "actor": "ou_pi"})
     _provision_owner(api_env["factory"], "p3", owner="pi")
     r = c.post("/v1/projects/p3/commands", json={"text": "/research status", "actor": {"type": "human", "platform_user_id": "pi"}})
     assert r.status_code == 200
@@ -148,13 +148,13 @@ def test_commands_route(api_env):
 def test_interaction_profile_does_not_change_policy(api_env):
     """Session-level interaction profile must never persist into project policy."""
     c = api_env["client"]
-    c.post("/v1/projects", json={"project_id": "p4", "name": "four"})
+    c.post("/v1/projects", json={"project_id": "p4", "name": "four", "actor": "ou_pi"})
     # the service handler only acknowledges; the shim applies it to the session
-    r = c.post("/v1/projects/p4/commands", json={"text": "/research model interaction deep"})
+    r = c.post("/v1/projects/p4/commands", json={"text": "/research model interaction deep", "actor": {"type": "human", "platform_user_id": "ou_pi"}})
     assert r.status_code == 200
     assert "session" in r.json()["reply"].lower()
     # role policy untouched
-    r = c.post("/v1/projects/p4/commands", json={"text": "/research config show"})
+    r = c.post("/v1/projects/p4/commands", json={"text": "/research config show", "actor": {"type": "human", "platform_user_id": "ou_pi"}})
     assert "role_overrides={}" in r.json()["reply"]
 
 
@@ -182,13 +182,13 @@ def test_acp_shim_handshake_and_prompt(api_env):
     assert "interaction_profile" in init["result"]["configOptions"]
 
     new = __import__("asyncio").run(
-        server.handle({"jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {"sessionConfig": {"interaction_profile": "fast"}}})
+        server.handle({"jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {"sessionConfig": {"interaction_profile": "fast", "cc_user_id": "ou_pi"}}})
     )
     sid = new["result"]["sessionId"]
     session = server.sessions[sid]
 
     c = api_env["client"]
-    c.post("/v1/projects", json={"project_id": "p5", "name": "five"})
+    c.post("/v1/projects", json={"project_id": "p5", "name": "five", "actor": "ou_pi"})
 
     # bind is a SESSION-level command handled by the shim (verified via service)
     bind = __import__("asyncio").run(
@@ -263,15 +263,15 @@ def test_tcp_transport_requires_token(tmp_path):
         r = httpx.get(f"{base}/v1/projects", timeout=5)
         assert r.status_code == 401  # project data requires the token
         # mutating endpoints need the token on TCP too
-        r = httpx.post(f"{base}/v1/projects", json={"project_id": "p-tcp", "name": "x"}, timeout=5)
+        r = httpx.post(f"{base}/v1/projects", json={"project_id": "p-tcp", "name": "x", "actor": "ou_pi"}, timeout=5)
         assert r.status_code == 401  # missing token
         r = httpx.post(
-            f"{base}/v1/projects", json={"project_id": "p-tcp", "name": "x"},
+            f"{base}/v1/projects", json={"project_id": "p-tcp", "name": "x", "actor": "ou_pi"},
             headers={"Authorization": "Bearer wrong"}, timeout=5,
         )
         assert r.status_code == 401  # wrong token
         r = httpx.post(
-            f"{base}/v1/projects", json={"project_id": "p-tcp", "name": "x"},
+            f"{base}/v1/projects", json={"project_id": "p-tcp", "name": "x", "actor": "ou_pi"},
             headers={"Authorization": f"Bearer {settings.api.token}"}, timeout=5,
         )
         assert r.status_code == 200  # valid token
@@ -286,7 +286,7 @@ def test_membership_gate_and_approval(api_env):
     from researchd.persistence.transaction import UnitOfWork as UoW2
 
     c = api_env["client"]
-    c.post("/v1/projects", json={"project_id": "p9", "name": "nine"})
+    c.post("/v1/projects", json={"project_id": "p9", "name": "nine", "actor": "ou_pi"})
     from researchd.domain.decision import Decision, DecisionOption
     from researchd.persistence.repositories import DecisionRepo
     from researchd.persistence.transaction import UnitOfWork
@@ -365,7 +365,7 @@ def test_decision_version_conflicts(api_env):
     from researchd.persistence.transaction import UnitOfWork
 
     c = api_env["client"]
-    c.post("/v1/projects", json={"project_id": "p10", "name": "ten"})
+    c.post("/v1/projects", json={"project_id": "p10", "name": "ten", "actor": "ou_pi"})
     _provision_owner(api_env["factory"], "p10")
     with UnitOfWork(api_env["factory"]) as uow:
         DecisionRepo(uow.session).save(
@@ -417,21 +417,46 @@ def test_uds_mutating_endpoints_require_token(api_env):
     # read-only stays open
     assert anon.get("/healthz").status_code == 200
     # mutating without token -> 401
-    r = anon.post("/v1/projects", json={"project_id": "p-token", "name": "x"})
+    r = anon.post("/v1/projects", json={"project_id": "p-token", "name": "x", "actor": "ou_pi"})
     assert r.status_code == 401
     r = anon.post("/v1/inbound/messages", json={"message_id": "m1", "platform": "feishu", "text": "hi"})
     assert r.status_code == 401
     # with token -> allowed
     c = api_env["client"]
-    assert c.post("/v1/projects", json={"project_id": "p-token", "name": "x"}).status_code == 200
+    assert c.post("/v1/projects", json={"project_id": "p-token", "name": "x", "actor": "ou_pi"}).status_code == 200
 
 
 def test_membership_gate_fail_closed(api_env):
     """A project with NO members rejects all mutating actions (§22 fail-closed)."""
     c = api_env["client"]
-    c.post("/v1/projects", json={"project_id": "p-nomembers", "name": "x"})
+    c.post("/v1/projects", json={"project_id": "p-nomembers", "name": "x", "actor": "ou_pi"})
     r = c.post("/v1/projects/p-nomembers/commands", json={
         "text": "/research pause", "actor": {"type": "human", "platform_user_id": "ou_anyone"},
     })
     assert r.status_code == 403
-    assert "no members provisioned" in r.json()["detail"]
+    assert "not a member" in r.json()["detail"]  # fail-closed: owner exists, stranger rejected
+
+
+def test_create_project_constraints(api_env):
+    """actor is required (400), workspace_root must stay under data_dir."""
+    c = api_env["client"]
+    # actor missing -> 422 (required field); empty actor -> 400 via normalize? creation gate:
+    r = c.post("/v1/projects", json={"project_id": "p-noactor", "name": "x"})
+    assert r.status_code == 422  # required field missing
+    # workspace_root outside the allowed root -> 400
+    r = c.post("/v1/projects", json={
+        "project_id": "p-escape", "name": "x", "actor": "ou_pi",
+        "workspace_root": "/etc",
+    })
+    assert r.status_code == 400
+    assert "workspace_root" in r.json()["detail"]
+    # default workspace_root is derived under <data_dir>/workspaces
+    r = c.post("/v1/projects", json={"project_id": "p-derived", "name": "x", "actor": "ou_pi"})
+    assert r.status_code == 200
+    from researchd.persistence.transaction import UnitOfWork
+
+    with UnitOfWork(api_env["factory"]) as uow:
+        from researchd.persistence.repositories import ProjectRepo
+
+        proj = ProjectRepo(uow.session).get_by_project_id("p-derived")
+        assert proj.workspace_root and "workspaces" in proj.workspace_root

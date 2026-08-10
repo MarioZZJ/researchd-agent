@@ -20,7 +20,7 @@ class InboundMessageRequest(BaseModel):
     platform: str = "feishu"
     cc_project: str | None = None
     cc_session_key: str | None = None
-    actor: dict = Field(default_factory=dict)
+    actor: dict  # gateway-declared identity; required (fail-closed)
     text: str = ""
     attachments: list | None = None
     received_at: str | None = None

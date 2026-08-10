@@ -3,7 +3,9 @@ decision answer, commands, sync, reconcile."""
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from ..dependencies import require_token
 from pydantic import BaseModel, Field
@@ -26,12 +28,13 @@ class ProjectCreateRequest(BaseModel):
     project_id: str | None = None
     name: str
     description: str = ""
-    workspace_root: str | None = None
+    workspace_root: str | None = None  # must resolve under <data_dir>/workspaces
+    actor: str  # gateway-declared platform user id of the creator (owner)
 
 
 class CommandRequest(BaseModel):
     text: str
-    actor: dict = Field(default_factory=dict)
+    actor: dict  # gateway-declared identity; required (fail-closed)
 
 
 class DecisionAnswerRequest(BaseModel):
@@ -49,18 +52,40 @@ def list_projects(uow: UnitOfWork = Depends(get_uow)) -> dict:
 
 
 @router.post("/projects", dependencies=[Depends(require_token)])
-def create_project(req: ProjectCreateRequest, uow: UnitOfWork = Depends(get_uow)) -> dict:
+def create_project(req: ProjectCreateRequest, request: Request, uow: UnitOfWork = Depends(get_uow)) -> dict:
     repo = ProjectRepo(uow.session)
     if req.project_id and repo.get_by_project_id(req.project_id) is not None:
         raise HTTPException(status_code=409, detail=f"project {req.project_id!r} already exists")
+    # workspace_root is service-derived: must resolve under <data_dir>/workspaces
+    allowed_root = Path(request.app.state.settings.data_dir) / "workspaces"
+    if req.workspace_root:
+        resolved = Path(req.workspace_root).resolve()
+        if not str(resolved).startswith(str(allowed_root.resolve()) + "/"):
+            raise HTTPException(status_code=400, detail="workspace_root must be under <data_dir>/workspaces")
+        workspace_root = str(resolved)
+    else:
+        workspace_root = str((allowed_root / (req.project_id or new_id("project"))).resolve())
     project = Project(
         project_id=req.project_id or new_id("project"),
         name=req.name,
         description=req.description,
-        workspace_root=req.workspace_root,
+        workspace_root=workspace_root,
         policy=ExecutorPolicy(),
     )
     repo.save(project)
+    # creator becomes the owner member (fail-closed membership gate §22)
+    from ...persistence.models import ProjectMemberRow
+
+    uow.session.add(
+        ProjectMemberRow(
+            id=f"PM-{project.project_id}-{req.actor}",
+            member_id=f"PM-{project.project_id}-{req.actor}",
+            project_id=project.project_id,
+            platform_user_id=req.actor,
+            role="owner",
+            can_approve_decisions=True,
+        )
+    )
     EventRepo(uow.session).append(
         make_event(
             event_type="project.created",

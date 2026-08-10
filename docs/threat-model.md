@@ -28,7 +28,7 @@
 - 测试：`test_profile_rejection`、`test_dispatch_respects_profile`。
 
 ### T3 飞书消息伪造 / 重复回调
-- 缓解：入站幂等键（inbound_messages 唯一约束，重复 no-op）；`/decision` 版本指纹必填（缺失 400、不匹配 409、重复点击恰好一次）+ 成员/审批门（fail-closed：无成员项目拒绝一切变更，owner 由 `researchd pilot` provision）；**写接口与项目数据 GET 要求 Bearer token（UDS 同样强制，token 存 0600 env 且不在 Executor env 白名单）；actor 必填、无默认值（缺失 400），身份由持 token 的网关声明**；消息解析仅提取受控字段（bind/model/id），不执行任意指令。
+- 缓解：入站幂等键（inbound_messages 唯一约束，重复 no-op）；`/decision` 版本指纹必填（缺失 400、不匹配 409、重复点击恰好一次）+ 成员/审批门（fail-closed：创建即 provision owner，非成员/缺身份一律 403/400）；**写接口与项目数据 GET 要求 Bearer token（UDS 同样强制，token 存 0600 env 且不在 Executor env 白名单）；actor 必填、无默认值，身份由持 token 的网关声明；项目创建时 workspace_root 由服务派生（限制在 data_dir/workspaces 下）**；消息解析仅提取受控字段（bind/model/id），不执行任意指令。
 - 测试：`tests/integration/test_api_phase2.py`（幂等/409/400/401/403、UDS 无 token 401、actor 缺失 400）。
 
 ### T4 Executor 会话越权（跨项目污染）
