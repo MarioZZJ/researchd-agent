@@ -28,16 +28,16 @@ class InboundMessageRequest(BaseModel):
 
 @router.post("/messages", dependencies=[Depends(require_token)])
 def post_message(req: InboundMessageRequest, uow: UnitOfWork = Depends(get_uow)) -> dict:
-    msg = normalize_inbound(
-        message_id=req.message_id,
-        platform=req.platform,
-        cc_project=req.cc_project,
-        cc_session_key=req.cc_session_key,
-        actor=req.actor,
-        text=req.text,
-        attachments=req.attachments,
-    )
     try:
+        msg = normalize_inbound(
+            message_id=req.message_id,
+            platform=req.platform,
+            cc_project=req.cc_project,
+            cc_session_key=req.cc_session_key,
+            actor=req.actor,
+            text=req.text,
+            attachments=req.attachments,
+        )
         reply = handle_inbound(uow.session, msg, fallback_project=req.cc_project)
         uow.commit()
     except HandlerError as exc:

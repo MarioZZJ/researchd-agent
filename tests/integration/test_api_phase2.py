@@ -90,7 +90,6 @@ def test_project_status_pause_resume(api_env):
 def test_inbound_decision_flow_and_idempotency(api_env):
     c = api_env["client"]
     c.post("/v1/projects", json={"project_id": "p2", "name": "two", "actor": "ou_pi"})
-    _provision_owner(api_env["factory"], "p2")
     # create an OPEN decision directly in the DB (decision gate lands Phase 6)
     from researchd.domain.decision import Decision, DecisionOption
     from researchd.persistence.repositories import DecisionRepo
@@ -286,7 +285,7 @@ def test_membership_gate_and_approval(api_env):
     from researchd.persistence.transaction import UnitOfWork as UoW2
 
     c = api_env["client"]
-    c.post("/v1/projects", json={"project_id": "p9", "name": "nine", "actor": "ou_pi"})
+    c.post("/v1/projects", json={"project_id": "p9", "name": "nine", "actor": "ou_creator"})
     from researchd.domain.decision import Decision, DecisionOption
     from researchd.persistence.repositories import DecisionRepo
     from researchd.persistence.transaction import UnitOfWork
@@ -366,7 +365,6 @@ def test_decision_version_conflicts(api_env):
 
     c = api_env["client"]
     c.post("/v1/projects", json={"project_id": "p10", "name": "ten", "actor": "ou_pi"})
-    _provision_owner(api_env["factory"], "p10")
     with UnitOfWork(api_env["factory"]) as uow:
         DecisionRepo(uow.session).save(
             Decision(
@@ -460,3 +458,27 @@ def test_create_project_constraints(api_env):
 
         proj = ProjectRepo(uow.session).get_by_project_id("p-derived")
         assert proj.workspace_root and "workspaces" in proj.workspace_root
+
+
+def test_create_project_identity_and_root_constraints(api_env, tmp_path):
+    """project_id escape, blank actor, symlink workspace roots are rejected."""
+    c = api_env["client"]
+    # path-traversal project_id -> 400
+    r = c.post("/v1/projects", json={"project_id": "../etc", "name": "x", "actor": "ou_pi"})
+    assert r.status_code == 400
+    r = c.post("/v1/projects", json={"project_id": "a/b", "name": "x", "actor": "ou_pi"})
+    assert r.status_code == 400
+    # blank actor -> 400
+    r = c.post("/v1/projects", json={"project_id": "p-blank", "name": "x", "actor": "   "})
+    assert r.status_code == 400
+    # workspace_root outside the project root -> 400
+    r = c.post("/v1/projects", json={
+        "project_id": "p-escape2", "name": "x", "actor": "ou_pi",
+        "workspace_root": str(tmp_path),
+    })
+    assert r.status_code == 400
+    # duplicate member provisioning is prevented by the unique constraint
+    r = c.post("/v1/projects", json={"project_id": "p-dup", "name": "x", "actor": "ou_pi"})
+    assert r.status_code == 200
+    with pytest.raises(Exception):  # unique (project_id, platform_user_id)
+        _provision_owner(api_env["factory"], "p-dup")

@@ -3,6 +3,7 @@ decision answer, commands, sync, reconcile."""
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -51,22 +52,34 @@ def list_projects(uow: UnitOfWork = Depends(get_uow)) -> dict:
     return {"projects": projects}
 
 
+_PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
 @router.post("/projects", dependencies=[Depends(require_token)])
 def create_project(req: ProjectCreateRequest, request: Request, uow: UnitOfWork = Depends(get_uow)) -> dict:
     repo = ProjectRepo(uow.session)
-    if req.project_id and repo.get_by_project_id(req.project_id) is not None:
-        raise HTTPException(status_code=409, detail=f"project {req.project_id!r} already exists")
-    # workspace_root is service-derived: must resolve under <data_dir>/workspaces
+    actor = (req.actor or "").strip()
+    if not actor or len(actor) > 128:
+        raise HTTPException(status_code=400, detail="actor is required (non-empty platform user id)")
+    project_id = req.project_id or new_id("project")
+    if not _PROJECT_ID_RE.match(project_id) or ".." in project_id.split("/"):
+        raise HTTPException(status_code=400, detail="project_id must be a single safe path segment")
+    if repo.get_by_project_id(project_id) is not None:
+        raise HTTPException(status_code=409, detail=f"project {project_id!r} already exists")
+    # workspace_root is service-derived: ALWAYS <data_dir>/workspaces/<project_id>
     allowed_root = Path(request.app.state.settings.data_dir) / "workspaces"
+    workspace_root = str((allowed_root / project_id).resolve())
     if req.workspace_root:
-        resolved = Path(req.workspace_root).resolve()
-        if not str(resolved).startswith(str(allowed_root.resolve()) + "/"):
-            raise HTTPException(status_code=400, detail="workspace_root must be under <data_dir>/workspaces")
-        workspace_root = str(resolved)
-    else:
-        workspace_root = str((allowed_root / (req.project_id or new_id("project"))).resolve())
+        requested = Path(req.workspace_root).resolve()
+        if not requested.is_relative_to(workspace_root) or not workspace_root.startswith(str(allowed_root.resolve()) + "/"):
+            raise HTTPException(status_code=400, detail="workspace_root must be under <data_dir>/workspaces/<project_id>")
+        workspace_root = str(requested)
+    root = Path(workspace_root)
+    if root.is_symlink() or any(p.is_symlink() for p in root.parents if p != allowed_root.parent):
+        raise HTTPException(status_code=400, detail="workspace_root path must not traverse symlinks")
+    root.mkdir(parents=True, exist_ok=True)
     project = Project(
-        project_id=req.project_id or new_id("project"),
+        project_id=project_id,
         name=req.name,
         description=req.description,
         workspace_root=workspace_root,
@@ -78,10 +91,10 @@ def create_project(req: ProjectCreateRequest, request: Request, uow: UnitOfWork 
 
     uow.session.add(
         ProjectMemberRow(
-            id=f"PM-{project.project_id}-{req.actor}",
-            member_id=f"PM-{project.project_id}-{req.actor}",
+            id=f"PM-{project.project_id}-{actor}",
+            member_id=f"PM-{project.project_id}-{actor}",
             project_id=project.project_id,
-            platform_user_id=req.actor,
+            platform_user_id=actor,
             role="owner",
             can_approve_decisions=True,
         )

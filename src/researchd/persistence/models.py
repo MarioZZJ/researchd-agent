@@ -73,6 +73,9 @@ class ProjectBindingRow(CommonFieldsMixin, Base):
 
 class ProjectMemberRow(CommonFieldsMixin, Base):
     __tablename__ = "project_members"
+    __table_args__ = (
+        UniqueConstraint("project_id", "platform_user_id", name="uq_project_member_user"),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     member_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
