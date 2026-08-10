@@ -16,6 +16,20 @@ from .enums import DecisionCategory, DecisionStatus
 from .state_machine import DecisionStateMachine
 
 
+class DecisionVersionMismatch(ValueError):
+    def __init__(self, decision_id: str, *, expected: int, got: int):
+        super().__init__(
+            f"decision {decision_id}: version mismatch (expected {expected}, got {got})"
+        )
+        self.decision_id = decision_id
+        self.expected = expected
+        self.got = got
+
+
+class UnknownOptionError(ValueError):
+    pass
+
+
 class DecisionOption(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -69,13 +83,13 @@ class Decision(DomainModel):
         self.updated_at = utcnow()
         return self.status
 
-    def answer(self, option_id: str, actor: str, *, version: int | None = None) -> DecisionStatus:
+    def apply_answer(self, option_id: str, actor: str, *, version: int | None = None) -> DecisionStatus:
         if version is not None and version != self.decision_version:
-            raise ValueError(
-                f"decision {self.decision_id}: version mismatch (expected {self.decision_version}, got {version})"
+            raise DecisionVersionMismatch(
+                self.decision_id, expected=self.decision_version, got=version
             )
         if not any(o.option_id == option_id for o in self.options):
-            raise ValueError(f"decision {self.decision_id}: unknown option {option_id!r}")
+            raise UnknownOptionError(f"decision {self.decision_id}: unknown option {option_id!r}")
         if self.status not in (DecisionStatus.OPEN,):
             raise ValueError(f"decision {self.decision_id}: not answerable in status {self.status}")
         self.answer = option_id

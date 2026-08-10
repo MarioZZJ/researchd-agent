@@ -22,6 +22,7 @@ EVENT_TYPES = {
     "project.created",
     "project.paused",
     "project.resumed",
+    "project.cancelled",
     "project.executor_policy_changed",
     "project.interaction_changed",
     "question.created",

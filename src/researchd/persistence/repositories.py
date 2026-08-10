@@ -122,6 +122,10 @@ class ProjectRepo(BaseRepo[Project]):
     def _to_domain(self, row: ProjectRow) -> Project:
         from ..domain.project import ExecutorPolicy
 
+        policy_data = dict(row.policy_json or {})
+        # backward-compat: interaction fields moved out of the policy in Phase 2
+        policy_data.pop("interaction_profile", None)
+        policy_data.pop("interaction_reasoning", None)
         return Project(
             id=row.id,
             project_id=row.project_id,
@@ -129,7 +133,7 @@ class ProjectRepo(BaseRepo[Project]):
             description=row.description,
             status=row.status,
             workspace_root=row.workspace_root,
-            policy=ExecutorPolicy(**row.policy_json) if row.policy_json else ExecutorPolicy(),
+            policy=ExecutorPolicy(**policy_data) if policy_data else ExecutorPolicy(),
             paused_reason=row.paused_reason,
             initial_brief_hash=row.initial_brief_hash,
             version=row.version,
@@ -144,6 +148,10 @@ class ProjectRepo(BaseRepo[Project]):
             select(ProjectRow).where(ProjectRow.project_id == project_id)
         ).scalar_one_or_none()
         return self._to_domain(row) if row else None
+
+    def list_all(self) -> list[Project]:
+        rows = self.session.execute(select(ProjectRow).order_by(ProjectRow.created_at)).scalars()
+        return [self._to_domain(r) for r in rows]
 
 
 # ---------------------------------------------------------------- Task
@@ -200,7 +208,9 @@ class TaskRepo(BaseRepo[Task]):
         stmt = select(TaskRow)
         if project_id:
             stmt = stmt.where(TaskRow.project_id == project_id)
-        stmt = stmt.where(TaskRow.status.in_(statuses)).order_by(TaskRow.created_at)
+        if statuses:
+            stmt = stmt.where(TaskRow.status.in_(statuses))
+        stmt = stmt.order_by(TaskRow.created_at)
         return [self._to_domain(r) for r in self.session.execute(stmt).scalars()]
 
 
@@ -549,7 +559,9 @@ class DecisionRepo(BaseRepo):
     def save(self, d) -> Decision:  # noqa: ANN001
         """Save decision + replace its options in the same transaction."""
         result = super().save(d)
-        # options: delete + reinsert (small fixed set)
+        # options: delete + reinsert (small fixed set); flush the decision row
+        # first so the FK target exists (autoflush is off in UoW sessions)
+        self.session.flush()
         self.session.execute(delete(DecisionOptionRow).where(DecisionOptionRow.decision_id == d.decision_id))
         for idx, opt in enumerate(d.options):
             self.session.add(

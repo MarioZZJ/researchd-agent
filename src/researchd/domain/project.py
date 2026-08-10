@@ -34,13 +34,13 @@ class ProjectMember(BaseModel):
 
 
 class ExecutorPolicy(BaseModel):
-    """Per-project role -> profile overrides; only affects FUTURE runs."""
+    """Per-project role -> profile overrides; only affects FUTURE runs.
+    Interaction profile (fast|deep|deterministic) is SESSION-level and never
+    stored here (IMPLEMENTATION.md §15.3)."""
 
     model_config = {"extra": "forbid"}
 
     role_overrides: dict[str, str] = Field(default_factory=dict)
-    interaction_profile: str = "frontdesk_fast"
-    interaction_reasoning: str | None = None
     default_budget: dict = Field(default_factory=dict)
 
 

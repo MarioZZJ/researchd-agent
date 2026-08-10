@@ -28,20 +28,35 @@ class OptimisticConcurrencyError(Exception):
     """Raised when an aggregate update touches a stale version."""
 
 
-def make_engine(db_path: str | Path, *, echo: bool = False) -> Engine:
+def make_engine(db_path: str | Path, *, echo: bool = False, read_only: bool = False) -> Engine:
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    engine = create_engine(
-        f"sqlite:///{db_path}",
-        echo=echo,
-        connect_args={"timeout": 10},
-    )
+    if read_only:
+        engine = create_engine(
+            f"sqlite:///file:{db_path}?mode=ro&uri=true",
+            echo=echo,
+            connect_args={"timeout": 10},
+        )
+    else:
+        engine = create_engine(
+            f"sqlite:///{db_path}",
+            echo=echo,
+            connect_args={"timeout": 10},
+        )
 
     @event.listens_for(engine, "connect")
     def _set_pragmas(dbapi_conn, _record):  # noqa: ANN001
         cur = dbapi_conn.cursor()
+        # journal_mode is persistent (set once by the writer); the rest are
+        # connection-level and are applied on every connection, including
+        # read-only diagnostic connections.
         for key, value in REQUIRED_PRAGMAS.items():
-            cur.execute(f"PRAGMA {key} = {value}")
+            if key == "journal_mode":
+                if read_only:
+                    continue  # cannot switch journal mode on a read-only conn
+                cur.execute(f"PRAGMA {key} = {value}")
+            else:
+                cur.execute(f"PRAGMA {key} = {value}")
         cur.close()
 
     return engine
@@ -51,12 +66,17 @@ def make_session_factory(engine: Engine) -> sessionmaker[Session]:
     return sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
 
 
-def verify_pragmas(engine: Engine) -> dict[str, str]:
-    """Read back actual PRAGMA values (used by researchctl doctor and tests)."""
+def verify_pragmas(engine: Engine, *, read_only: bool = False) -> dict[str, str]:
+    """Read back actual PRAGMA values (used by researchctl doctor and tests).
+
+    In read-only mode only the current values are read; journal_mode etc. are
+    never modified.
+    """
     out: dict[str, str] = {}
     with engine.connect() as conn:
         for key in REQUIRED_PRAGMAS:
-            row = conn.exec_driver_sql(f"PRAGMA {key}").fetchone()
+            stmt = f"PRAGMA {key}" if read_only else f"PRAGMA {key} = {REQUIRED_PRAGMAS[key]}"
+            row = conn.exec_driver_sql(stmt).fetchone()
             out[key] = str(row[0]) if row else "?"
     return out
 
