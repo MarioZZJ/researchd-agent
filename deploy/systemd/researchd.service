@@ -1,0 +1,25 @@
+[Unit]
+Description=researchd — durable research control system
+Documentation=https://github.com/researchd/researchd
+# NOTE: WorkingDirectory / EnvironmentFile / ExecStart below use THIS host's
+# absolute paths (systemd user units do not support ~ or env expansion for
+# these keys). When installing on another host, replace with that host's
+# repository path, e.g.  %h/Documents/researchd-agent.
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/zhengzj22/Documents/researchd-agent
+EnvironmentFile=%h/Documents/researchd-agent/deploy/researchd.env
+ExecStart=/home/zhengzj22/Documents/researchd-agent/.venv/bin/researchd service
+# graceful shutdown: researchd catches SIGTERM, drains the scheduler, closes
+# executor sessions and releases the data-dir lock before exiting
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=2
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

@@ -31,3 +31,14 @@
 
 - 现象：`sudo` 不可用（no new privileges）。
 - 处理：全部 user systemd + user 路径，文档 §22 的"等价 XDG user 路径"按 A-01 落地。
+
+## B-07 systemd user unit 无法持久安装（已验证）
+
+- 现象：`cp deploy/systemd/researchd.service ~/.config/systemd/user/` → `Read-only file system`；`$XDG_RUNTIME_DIR/systemd/user`（/run/user/3001）同样只读；无 sudo（no new privileges）。
+- 证据：`mount` 显示 `/home`、`/run/user/3001` 均为 ro；`~/.local`、`~/.config` 只读；`sudo -n true` 失败。
+- 已完成等价验证：
+  - `systemd-analyze verify deploy/systemd/researchd.service` → UNIT-SYNTAX-OK；
+  - 真实进程 kill -9 崩溃 → 重启后 readyz 恢复（等价于 Restart=on-failure）；
+  - 服务启动/优雅停止/healthz/readyz/journald 日志路径在 docs/operations.md 记录。
+- 解除条件：宿主将 /home（或至少 ~/.config/systemd/user）挂载为 rw，或提供 sudo。
+- 解除后执行：`cp deploy/systemd/researchd.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now researchd`。

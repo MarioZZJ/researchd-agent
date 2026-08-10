@@ -153,3 +153,68 @@ def pilot(ctx: click.Context, project_id: str, question: str, import_decision: s
                 print(f"decision {decision_id} already exists (no-op)")
         uow.commit()
     lock.release()
+
+
+@main.command("backup")
+@click.option("--backup-dir", default=None, help="backup destination (default: <data_dir>/backups)")
+@click.option("--no-workspaces", is_flag=True, help="skip the workspaces tarball")
+@click.pass_context
+def backup_cmd(ctx: click.Context, backup_dir: str | None, no_workspaces: bool) -> None:
+    """Online SQLite backup + workspaces tarball (safe while the service runs)."""
+    settings = ctx.obj["settings"]
+    settings.ensure_dirs()
+    from .ops.backup import backup
+
+    dest = backup_dir or str(Path(settings.data_dir) / "backups")
+    result = backup(
+        data_dir=settings.data_dir,
+        db_path=settings.db_path,
+        backup_dir=dest,
+        include_workspaces=not no_workspaces,
+    )
+    print(f"backup written: {result.db_backup}")
+    if result.workspaces_archive:
+        print(f"workspaces:     {result.workspaces_archive}")
+    print(f"manifest:       {result.manifest.get('manifest')}")
+
+
+@main.command("restore")
+@click.option("--db-backup", required=True, help="path to the .db backup file")
+@click.option("--workspaces", default=None, help="optional workspaces tarball")
+@click.option("--target-dir", required=True, help="FRESH target directory (never the live dir)")
+@click.option("--apply", is_flag=True, help="actually restore (default: validate only)")
+@click.pass_context
+def restore_cmd(ctx: click.Context, db_backup: str, workspaces: str | None, target_dir: str, apply: bool) -> None:
+    """Validate (or apply) a backup into a fresh directory."""
+    settings = ctx.obj["settings"]
+    from .ops.backup import restore
+
+    result = restore(
+        db_backup=db_backup,
+        target_dir=target_dir,
+        workspaces_archive=workspaces,
+        dry_run=not apply,
+        live_db=settings.db_path,
+        live_data_dir=settings.data_dir,
+    )
+    print(f"integrity: {result['integrity']}")
+    missing = result.get("missing_core") or []
+    print(f"tables ({len(result['tables'])}): {', '.join(result['tables'][:6])}{'…' if len(result['tables']) > 6 else ''}")
+    if missing:
+        print(f"missing core tables: {missing}")
+    if result.get("restored"):
+        print(f"restored to {result['target']}")
+
+
+@main.command("export")
+@click.option("--project-id", required=True, help="project to export")
+@click.option("--out", default=None, help="output file (default: <project_id>.export.json)")
+@click.pass_context
+def export_cmd(ctx: click.Context, project_id: str, out: str | None) -> None:
+    """Deterministic JSON export of one project's persisted state."""
+    settings = ctx.obj["settings"]
+    from .ops.backup import export_project_file
+
+    target = out or f"{project_id}.export.json"
+    path = export_project_file(settings.db_path, project_id, target)
+    print(f"exported {project_id} -> {path}")
