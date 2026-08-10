@@ -154,23 +154,24 @@ def doctor() -> None:
         from sqlalchemy import inspect
 
         tables = set(inspect(engine).get_table_names())
-        core = {"alembic_version", "projects", "tasks", "runs", "events", "outbox"}
+        core = {"alembic_version", "projects", "tasks", "runs", "evidence", "events", "outbox"}
         missing = sorted(core - tables)
         click.echo(f"schema   : {len(tables)} tables" + (f", MISSING {missing}" if missing else ", core tables present"))
         engine.dispose()
     except Exception as exc:  # noqa: BLE001
         click.echo(f"db       : ERROR {exc}")
-    # permissions: data root 0700, socket 0600, env file 0600
+    # permissions: data root 0700, socket 0600, lock 0600, db 0600
     for label, path, want in (
-        ("data_dir", settings.data_dir, "0700"),
-        ("socket", settings.api.socket_path, "0600"),
-        ("lock", str(Path(settings.data_dir) / "researchd.lock"), "0600"),
+        ("data_dir", settings.data_dir, 0o700),
+        ("socket", settings.api.socket_path, 0o600),
+        ("lock", str(Path(settings.data_dir) / "researchd.lock"), 0o600),
+        ("db", settings.db_path, 0o600),
     ):
         p = Path(path)
         if p.exists():
-            mode = oct(p.stat().st_mode & 0o777)[2:]
-            flag = "ok" if mode == want else f"EXPECTED {want}"
-            click.echo(f"perms    : {label} {mode} ({flag})")
+            mode = p.stat().st_mode & 0o777
+            flag = "ok" if mode == want else f"EXPECTED {oct(want)[2:]}"
+            click.echo(f"perms    : {label} {oct(mode)[2:]} ({flag})")
     try:
         data = _call("GET", "/healthz")
         click.echo(f"healthz  : {data}")

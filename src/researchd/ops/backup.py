@@ -100,8 +100,11 @@ def backup(
         src.close()
     # the snapshot must be structurally valid before we call it a backup
     info = validate_backup(db_backup)
-    if info["integrity"] != "ok":
-        raise RuntimeError("backup failed integrity check")
+    if info["integrity"] != "ok" or info["missing_core"]:
+        raise RuntimeError(
+            "backup failed validation: "
+            f"integrity={info['integrity']} missing={info['missing_core']}"
+        )
 
     manifest = {
         "created_at": stamp,
@@ -116,12 +119,17 @@ def backup(
         roots = _project_workspace_roots(db_path)
         if roots:
             workspaces_archive = backup_dir / f"workspaces-{stamp}.tar.gz"
+
+            def _no_links(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
+                # restore() refuses link members; exclude them at backup time
+                # so a backup always restores cleanly
+                return None if (member.issym() or member.islnk()) else member
+
             with tarfile.open(workspaces_archive, "w:gz") as tar:
-                for root in roots:
-                    tar.add(root, arcname=f"workspaces/{root.name}")
-                    manifest["workspaces"].append(
-                        {"name": root.name, "root": str(root)}
-                    )
+                for i, root in enumerate(roots):
+                    arc = f"workspaces/ws-{i:02d}-{root.name}"
+                    tar.add(root, arcname=arc, recursive=True, filter=_no_links)
+                    manifest["workspaces"].append({"name": root.name, "root": str(root), "arc": arc})
             manifest["workspaces_bytes"] = workspaces_archive.stat().st_size
 
     manifest_path = backup_dir / f"manifest-{stamp}.json"
@@ -154,12 +162,21 @@ def validate_backup(db_backup: str | Path) -> dict:
     return {"tables": sorted(tables), "integrity": integrity, "missing_core": missing}
 
 
-def _safe_extract_members(tar: tarfile.TarFile, staging: Path) -> None:
-    """Extract only safe members: no absolute paths, no '..', no links."""
-    staging = staging.resolve()
+def _check_tar_members(tar: tarfile.TarFile) -> None:
+    """Pure validation: no links, no absolute paths, no '..' escapes. No writes."""
     for member in tar.getmembers():
         if member.issym() or member.islnk():
             raise RuntimeError(f"tar member {member.name!r} is a link; refusing")
+        segments = member.name.replace("\\", "/").split("/")
+        if member.name.startswith("/") or ".." in segments:
+            raise RuntimeError(f"tar member {member.name!r} escapes the staging dir")
+
+
+def _extract_safe(tar: tarfile.TarFile, staging: Path) -> None:
+    """Pre-check every member, then extract into staging (both must be safe)."""
+    _check_tar_members(tar)
+    staging = staging.resolve()
+    for member in tar.getmembers():
         target = (staging / member.name).resolve()
         if not str(target).startswith(str(staging) + os.sep):
             raise RuntimeError(f"tar member {member.name!r} escapes the staging dir")
@@ -206,7 +223,7 @@ def restore(
             raise FileNotFoundError(f"workspaces archive {arc} does not exist")
         try:
             with tarfile.open(arc, "r:gz") as tar:
-                _safe_extract_members(tar, target)  # validation pass (no writes)
+                _check_tar_members(tar)  # validation pass (no writes)
         except tarfile.TarError as exc:
             raise RuntimeError(f"workspaces archive is corrupt: {exc}") from exc
 
@@ -226,13 +243,15 @@ def restore(
         shutil.copy2(db_backup, staging / "researchd.db")
         if workspaces_archive:
             with tarfile.open(workspaces_archive, "r:gz") as tar:
-                _safe_extract_members(tar, staging)
-        # atomic publish: staging -> target (target is an empty dir we own)
-        target.rmdir()
+                _extract_safe(tar, staging)
+        # atomic publish: rename staging -> target. target is the empty
+        # directory we created exclusively, so this replaces it atomically
+        # (POSIX rename of a directory onto an empty directory). On failure
+        # we only ever remove OUR staging dir; target stays as an empty
+        # placeholder so a later restore refuses to overwrite anything.
         os.rename(staging, target)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
-        shutil.rmtree(target, ignore_errors=True)
         raise
     return {**info, "restored": True, "dry_run": False, "target": str(target)}
 

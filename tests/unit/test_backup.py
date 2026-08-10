@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tarfile
 from pathlib import Path
@@ -36,6 +37,7 @@ def test_online_backup_while_writing(factory, db, tmp_path):
     from researchd.persistence.repositories import ProjectRepo
 
     db_path = _engine_path(factory)
+    _ensure_alembic_version(db_path)
     # simulate an in-flight write on a separate session (uncommitted)
     live_session = factory()
     ProjectRepo(live_session).save(Project(project_id="P-INFLIGHT", name="inflight", metadata={}))
@@ -61,6 +63,13 @@ def test_online_backup_while_writing(factory, db, tmp_path):
     assert "P-INFLIGHT" not in ids
     assert result.manifest["db_bytes"] > 0
 
+
+def _ensure_alembic_version(db_path):
+    """ORM test DBs have no alembic_version; the backup validator expects it."""
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)")
+    conn.commit()
+    conn.close()
 
 def _core_tables(conn):
     for t in ("alembic_version", "projects", "tasks", "runs", "evidence", "events", "outbox"):
@@ -146,6 +155,66 @@ def test_restore_rejects_escaping_tar(tmp_path):
         tar.addfile(info)
     with pytest.raises(RuntimeError, match="link"):
         restore(db_backup=src, target_dir=tmp_path / "out2", workspaces_archive=evil2, dry_run=True)
+
+
+def test_backup_restore_round_trip_with_workspaces(factory, db, tmp_path):
+    """backup() then dry-run (no writes) then apply() must round-trip:
+    DB core tables + workspace files present, target published atomically."""
+    import sqlite3
+
+    from researchd.domain.project import Project
+    from researchd.persistence.repositories import ProjectRepo
+
+    # a project whose workspace_root is a real directory (outside data_dir)
+    ws = tmp_path / "project-workspace"
+    ws.mkdir()
+    (ws / "notes.md").write_text("synthetic note")
+    (ws / "data.json").write_text('{"k": 1}')
+    os.symlink(ws / "data.json", ws / "link.json")  # backup must skip links
+    db_path = _engine_path(factory)
+    _ensure_alembic_version(db_path)
+    with UnitOfWork(factory) as uow:
+        ProjectRepo(uow.session).save(
+            Project(project_id="P-WS", name="ws", metadata={}, workspace_root=str(ws))
+        )
+        uow.commit()
+
+    result = backup(
+        data_dir=Path(db_path).parent,
+        db_path=db_path,
+        backup_dir=tmp_path / "backups",
+    )
+    assert result.workspaces_archive is not None
+
+    # dry-run: nothing written
+    target = tmp_path / "restored"
+    res = restore(
+        db_backup=result.db_backup,
+        target_dir=target,
+        workspaces_archive=result.workspaces_archive,
+        dry_run=True,
+        live_db=db_path,
+        live_data_dir=Path(db_path).parent,
+    )
+    assert res["dry_run"] and not target.exists()
+
+    # apply: DB + workspace restored
+    res = restore(
+        db_backup=result.db_backup,
+        target_dir=target,
+        workspaces_archive=result.workspaces_archive,
+        dry_run=False,
+        live_db=db_path,
+        live_data_dir=Path(db_path).parent,
+    )
+    assert res["restored"] and (target / "researchd.db").exists()
+    conn = sqlite3.connect(target / "researchd.db")
+    assert conn.execute("SELECT project_id FROM projects WHERE project_id='P-WS'").fetchone()
+    conn.close()
+    # workspace files restored (under workspaces/ws-00-project-workspace), no links
+    ws_files = sorted(str(p.relative_to(target)) for p in target.rglob("*") if p.is_file())
+    assert any(f.endswith("notes.md") for f in ws_files)
+    assert not any(f.endswith("link.json") for f in ws_files)
 
 
 def test_export_project_deterministic(db, tmp_path):
