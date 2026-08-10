@@ -133,7 +133,7 @@ def pilot(ctx: click.Context, project_id: str, question: str, import_decision: s
 
             uow.session.add(
                 ProjectMemberRow(
-                    id=f"M-{project_id}", member_id=f"M-{project_id}", project_id=project_id,
+                    id=f"PM-{project_id}-pi", member_id=f"PM-{project_id}-pi", project_id=project_id,
                     platform_user_id="pi", role="owner", can_approve_decisions=True,
                 )
             )
@@ -151,7 +151,7 @@ def pilot(ctx: click.Context, project_id: str, question: str, import_decision: s
             if members is None:
                 uow.session.add(
                     ProjectMemberRow(
-                        id=f"M-{project_id}", member_id=f"M-{project_id}", project_id=project_id,
+                        id=f"PM-{project_id}-pi", member_id=f"PM-{project_id}-pi", project_id=project_id,
                         platform_user_id="pi", role="owner", can_approve_decisions=True,
                     )
                 )

@@ -82,30 +82,22 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
                 raise ValueError(
                     f"artifact id {artifact_id!r} reused with different project/path; rejected"
                 )
-            if project is not None:
-                # re-run the FULL file gate (real file + size + hash) even on
-                # replay: the artifact must still exist and be unmodified
-                from .evidence_validation import register_artifact
+            if project is not None and project.workspace_root:
+                # re-run the file gate as PURE validation: real file + size +
+                # hash, WITHOUT saving — an existing artifact's provenance
+                # (run/task/kind/description) must never be rewritten
+                from .paths import PathEscapeError, check_artifact_file, check_symlink_escape, safe_resolve
 
-                rechecked = register_artifact(
-                    session,
-                    project=project,
-                    workspace_root=project.workspace_root,
-                    rel_path=path,
-                    artifact=Artifact(
-                        artifact_id=artifact_id,
-                        project_id=project_id,
-                        task_id=run.task_id,
-                        run_id=run.run_id,
-                        kind=art.kind,
-                        path=path,
-                        description=art.description,
-                    ),
-                )
+                try:
+                    check_symlink_escape(project.workspace_root, path)
+                    safe_resolve(project.workspace_root, path)
+                    info = check_artifact_file(project.workspace_root, path)
+                except PathEscapeError as exc:
+                    raise ValueError(f"artifact {path!r} rejected by registration gate: {exc}") from exc
                 if (
                     existing_artifact.sha256 is not None
-                    and getattr(rechecked, "sha256", None) is not None
-                    and existing_artifact.sha256 != rechecked.sha256
+                    and info.get("sha256") is not None
+                    and existing_artifact.sha256 != info["sha256"]
                 ):
                     raise ValueError(
                         f"artifact {artifact_id!r} content changed since registration; rejected"

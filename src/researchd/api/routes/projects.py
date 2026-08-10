@@ -37,10 +37,10 @@ class CommandRequest(BaseModel):
 class DecisionAnswerRequest(BaseModel):
     option_id: str
     version: int | None = None  # required; missing -> 400 (fingerprint guard)
-    actor: str = "pi"
+    actor: str  # gateway-declared platform user id; NO default (fail-closed)
 
 
-@router.get("/projects")
+@router.get("/projects", dependencies=[Depends(require_token)])
 def list_projects(uow: UnitOfWork = Depends(get_uow)) -> dict:
     projects = []
     for row in ProjectRepo(uow.session).list_all():
@@ -81,7 +81,7 @@ def _get_project(uow: UnitOfWork, project_id: str) -> Project:
     return project
 
 
-@router.get("/projects/{project_id}/status")
+@router.get("/projects/{project_id}/status", dependencies=[Depends(require_token)])
 def project_status(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
     project = _get_project(uow, project_id)
     tasks = TaskRepo(uow.session).list_by_status(project_id, [])
@@ -98,7 +98,7 @@ def project_status(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
 
 
 @router.post("/projects/{project_id}/pause", dependencies=[Depends(require_token)])
-def pause_project(project_id: str, actor: str = "pi", uow: UnitOfWork = Depends(get_uow)) -> dict:
+def pause_project(project_id: str, actor: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
     project = _get_project(uow, project_id)
     _require_actor_authorized(uow.session, project_id, Actor(type="human", platform_user_id=actor))
     project.set_status(ProjectStatus.PAUSED, reason="api")
@@ -116,7 +116,7 @@ def pause_project(project_id: str, actor: str = "pi", uow: UnitOfWork = Depends(
 
 
 @router.post("/projects/{project_id}/resume", dependencies=[Depends(require_token)])
-def resume_project(project_id: str, actor: str = "pi", uow: UnitOfWork = Depends(get_uow)) -> dict:
+def resume_project(project_id: str, actor: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
     project = _get_project(uow, project_id)
     _require_actor_authorized(uow.session, project_id, Actor(type="human", platform_user_id=actor))
     project.set_status(ProjectStatus.ACTIVE)
@@ -134,7 +134,7 @@ def resume_project(project_id: str, actor: str = "pi", uow: UnitOfWork = Depends
 
 
 @router.post("/projects/{project_id}/cancel", dependencies=[Depends(require_token)])
-def cancel_project(project_id: str, actor: str = "pi", uow: UnitOfWork = Depends(get_uow)) -> dict:
+def cancel_project(project_id: str, actor: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
     project = _get_project(uow, project_id)
     _require_actor_authorized(uow.session, project_id, Actor(type="human", platform_user_id=actor))
     project.set_status(ProjectStatus.CANCELLED, reason="api")
@@ -151,7 +151,7 @@ def cancel_project(project_id: str, actor: str = "pi", uow: UnitOfWork = Depends
     return {"project_id": project_id, "status": project.status.value}
 
 
-@router.get("/projects/{project_id}/tasks")
+@router.get("/projects/{project_id}/tasks", dependencies=[Depends(require_token)])
 def list_tasks(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
     _get_project(uow, project_id)
     tasks = TaskRepo(uow.session).list_by_status(project_id, [])
@@ -168,7 +168,7 @@ def list_tasks(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
     }
 
 
-@router.get("/projects/{project_id}/decisions")
+@router.get("/projects/{project_id}/decisions", dependencies=[Depends(require_token)])
 def list_decisions(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
     _get_project(uow, project_id)
     decisions = DecisionRepo(uow.session).list_open(project_id)
@@ -250,7 +250,7 @@ def run_command(project_id: str, req: CommandRequest, uow: UnitOfWork = Depends(
 
 
 @router.post("/projects/{project_id}/sync", dependencies=[Depends(require_token)])
-def sync_project(project_id: str, actor: str = "pi", uow: UnitOfWork = Depends(get_uow)) -> dict:
+def sync_project(project_id: str, actor: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
     project = _get_project(uow, project_id)
     _require_actor_authorized(uow.session, project_id, Actor(type="human", platform_user_id=actor))
     from ...persistence.outbox import OutboxRepo

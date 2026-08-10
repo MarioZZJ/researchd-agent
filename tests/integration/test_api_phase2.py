@@ -83,8 +83,8 @@ def test_project_status_pause_resume(api_env):
     _provision_owner(api_env["factory"], "p1", owner="pi")
     r = c.get("/v1/projects/p1/status")
     assert r.json()["status"] == "ACTIVE"
-    assert c.post("/v1/projects/p1/pause").json()["status"] == "PAUSED"
-    assert c.post("/v1/projects/p1/resume").json()["status"] == "ACTIVE"
+    assert c.post("/v1/projects/p1/pause", params={"actor": "pi"}).json()["status"] == "PAUSED"
+    assert c.post("/v1/projects/p1/resume", params={"actor": "pi"}).json()["status"] == "ACTIVE"
 
 
 def test_inbound_decision_flow_and_idempotency(api_env):
@@ -261,7 +261,7 @@ def test_tcp_transport_requires_token(tmp_path):
         r = httpx.get(f"{base}/healthz", timeout=5)
         assert r.status_code == 200  # health is public
         r = httpx.get(f"{base}/v1/projects", timeout=5)
-        assert r.status_code == 200  # GET stays public (read-only)
+        assert r.status_code == 401  # project data requires the token
         # mutating endpoints need the token on TCP too
         r = httpx.post(f"{base}/v1/projects", json={"project_id": "p-tcp", "name": "x"}, timeout=5)
         assert r.status_code == 401  # missing token

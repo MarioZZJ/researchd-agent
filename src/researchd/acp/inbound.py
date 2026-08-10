@@ -120,7 +120,7 @@ async def _submit(settings: Settings, session: InteractionSession, text: str, *,
             "display_name": "PI",
             # identity declared by the gateway (cc-connect); 'pi' is the
             # single-PI default matching the pilot-provisioned owner
-            "platform_user_id": session.cc_user_id or "pi",
+            "platform_user_id": session.cc_user_id,
         },
         "text": text,
         "attachments": [],

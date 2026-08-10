@@ -136,3 +136,53 @@ def test_artifact_hash_and_size(tmp_path):
 def test_missing_artifact_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         check_artifact_file(tmp_path, "nope.csv")
+
+
+def test_apply_reuses_artifact_without_rewriting_provenance(factory, tmp_path):
+    """Replaying the same artifact id re-validates the file WITHOUT rewriting
+    the existing artifact's run/task provenance (security review round 5)."""
+    import sqlite3
+
+    from researchd.application.apply_result import apply_work_result
+    from researchd.domain.evidence import Artifact as ArtifactDomain
+    from researchd.domain.project import Project
+    from researchd.domain.run import Run
+    from researchd.executors.base import validate_work_result
+    from researchd.persistence.models import ArtifactRow
+    from researchd.persistence.repositories import ArtifactRepo, ProjectRepo
+    from researchd.persistence.transaction import UnitOfWork
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "data.csv").write_text("a,b\n1,2\n")
+    with UnitOfWork(factory) as uow:
+        ProjectRepo(uow.session).save(Project(project_id="P-AR", name="ar", metadata={}, workspace_root=str(ws)))
+        uow.commit()
+    # pre-registered artifact from run R-OLD (immutable provenance)
+    with UnitOfWork(factory) as uow:
+        ArtifactRepo(uow.session).save(
+            ArtifactDomain(
+                artifact_id="A-1", project_id="P-AR", task_id="T-OLD", run_id="R-OLD",
+                kind="dataset", path="data.csv", description="original",
+            )
+        )
+        uow.commit()
+    raw = {
+        "schema": "researchd.work_result.v1",
+        "task_id": "T-NEW",
+        "outcome": "SUBMIT_FOR_REVIEW",
+        "criteria_results": [{"criterion_id": "c-1", "status": "PASS", "refs": []}],
+        "artifacts": [{"local_ref": "A-1", "kind": "dataset", "path": "data.csv", "description": "replayed"}],
+        "evidence_candidates": [], "claim_changes": [], "issues": [], "decision_candidates": [],
+        "next_task_proposals": [],
+    }
+    run = Run(run_id="R-NEW", task_id="T-NEW", project_id="P-AR")
+    with UnitOfWork(factory) as uow:
+        apply_work_result(uow.session, run, validate_work_result(raw))
+        uow.commit()
+    with UnitOfWork(factory) as uow:
+        row = uow.session.execute(
+            sqlite3 if False else __import__("sqlalchemy").select(ArtifactRow).where(ArtifactRow.artifact_id == "A-1")
+        ).scalars().first()
+        assert row.run_id == "R-OLD" and row.task_id == "T-OLD"  # provenance immutable
+        assert row.description == "original"
