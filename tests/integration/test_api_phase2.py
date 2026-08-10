@@ -29,7 +29,7 @@ def api_env(tmp_path):
     settings = Settings(
         data_dir=str(tmp_path),
         db_path=str(tmp_path / "test.db"),
-        api=ApiConfig(socket_path=str(tmp_path / "researchd.sock")),
+        api=ApiConfig(socket_path=str(tmp_path / "researchd.sock"), token="test-token"),
         interaction=InteractionConfig(),
     ).resolve()
     settings.ensure_dirs()
@@ -45,8 +45,14 @@ def api_env(tmp_path):
             break
         time.sleep(0.05)
     transport = httpx.HTTPTransport(uds=settings.api.socket_path)
-    client = httpx.Client(transport=transport, base_url="http://localhost", timeout=5.0)
-    yield {"client": client, "settings": settings, "server": server, "factory": make_session_factory(engine)}
+    client = httpx.Client(
+        transport=transport,
+        base_url="http://localhost",
+        timeout=5.0,
+        headers={"Authorization": "Bearer test-token"},
+    )
+    anon = httpx.Client(transport=transport, base_url="http://localhost", timeout=5.0)
+    yield {"client": client, "anon": anon, "settings": settings, "server": server, "factory": make_session_factory(engine)}
     client.close()
     server.should_exit = True
     thread.join(timeout=5)
@@ -83,6 +89,7 @@ def test_project_status_pause_resume(api_env):
 def test_inbound_decision_flow_and_idempotency(api_env):
     c = api_env["client"]
     c.post("/v1/projects", json={"project_id": "p2", "name": "two"})
+    _provision_owner(api_env["factory"], "p2")
     # create an OPEN decision directly in the DB (decision gate lands Phase 6)
     from researchd.domain.decision import Decision, DecisionOption
     from researchd.persistence.repositories import DecisionRepo
@@ -102,8 +109,8 @@ def test_inbound_decision_flow_and_idempotency(api_env):
         "message_id": "feishu-msg-1",
         "platform": "feishu",
         "cc_project": "p2",
-        "text": "/decision D-001 A --version 3",
-        "actor": {"type": "human", "platform_user_id": "ou_1"},
+        "text": "/decision D-001 A --version 3", "actor": {"type": "human", "platform_user_id": "ou_pi"},
+        "actor": {"type": "human", "platform_user_id": "ou_pi"},
     }
     r = c.post("/v1/inbound/messages", json=msg)
     assert r.status_code == 200, r.text
@@ -116,7 +123,7 @@ def test_inbound_decision_flow_and_idempotency(api_env):
     assert r2.json()["duplicate"] is True
 
     # button click on an already-answered decision -> no-op, current state returned
-    r3 = c.post("/v1/decisions/D-001/answer", json={"option_id": "A", "version": 3})
+    r3 = c.post("/v1/decisions/D-001/answer", json={"option_id": "A", "version": 3, "actor": "ou_pi"})
     assert r3.status_code == 200
     assert r3.json()["applied"] is False
 
@@ -323,7 +330,24 @@ def test_membership_gate_and_approval(api_env):
     assert r.status_code == 403
 
 
+
+def _provision_owner(factory, project_id: str, owner: str = "ou_pi") -> None:
+    """Provision the owner member (fail-closed membership gate, §22)."""
+    from researchd.persistence.models import ProjectMemberRow
+    from researchd.persistence.transaction import UnitOfWork
+
+    with UnitOfWork(factory) as uow:
+        uow.session.add(
+            ProjectMemberRow(
+                id=f"M-{project_id}", member_id=f"M-{project_id}", project_id=project_id,
+                platform_user_id=owner, role="owner", can_approve_decisions=True,
+            )
+        )
+        uow.commit()
+
+
 def test_decision_version_conflicts(api_env):
+
     """Bad --version forms: bare flag 400, mismatch 409, unknown option 400."""
     from researchd.domain.decision import Decision, DecisionOption
     from researchd.persistence.repositories import DecisionRepo
@@ -331,6 +355,7 @@ def test_decision_version_conflicts(api_env):
 
     c = api_env["client"]
     c.post("/v1/projects", json={"project_id": "p10", "name": "ten"})
+    _provision_owner(api_env["factory"], "p10")
     with UnitOfWork(api_env["factory"]) as uow:
         DecisionRepo(uow.session).save(
             Decision(
@@ -339,13 +364,13 @@ def test_decision_version_conflicts(api_env):
             )
         )
         uow.commit()
-    r = c.post("/v1/projects/p10/commands", json={"text": "/decision D-010 A --version"})
+    r = c.post("/v1/projects/p10/commands", json={"text": "/decision D-010 A --version", "actor": {"type": "human", "platform_user_id": "ou_pi"}})
     assert r.status_code == 400
-    r = c.post("/v1/projects/p10/commands", json={"text": "/decision D-010 A --version 99"})
+    r = c.post("/v1/projects/p10/commands", json={"text": "/decision D-010 A --version 99", "actor": {"type": "human", "platform_user_id": "ou_pi"}})
     assert r.status_code == 409
-    r = c.post("/v1/projects/p10/commands", json={"text": "/decision D-010 Z --version 2"})
+    r = c.post("/v1/projects/p10/commands", json={"text": "/decision D-010 Z --version 2", "actor": {"type": "human", "platform_user_id": "ou_pi"}})
     assert r.status_code == 400
-    r = c.post("/v1/projects/p10/commands", json={"text": "/decision D-010 A --version 2"})
+    r = c.post("/v1/projects/p10/commands", json={"text": "/decision D-010 A --version 2", "actor": {"type": "human", "platform_user_id": "ou_pi"}})
     assert r.status_code == 200
 
 
@@ -372,3 +397,30 @@ def test_acp_invalid_request_handling(api_env):
     # notification (no id) -> no response
     r = __import__("asyncio").run(server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}))
     assert r is None
+
+
+def test_uds_mutating_endpoints_require_token(api_env):
+    """Even on UDS, mutating endpoints reject anonymous callers (T4/B-08):
+    executors share the service uid, so the socket alone is not the boundary."""
+    anon = api_env["anon"]
+    # read-only stays open
+    assert anon.get("/healthz").status_code == 200
+    # mutating without token -> 401
+    r = anon.post("/v1/projects", json={"project_id": "p-token", "name": "x"})
+    assert r.status_code == 401
+    r = anon.post("/v1/inbound/messages", json={"message_id": "m1", "platform": "feishu", "text": "hi"})
+    assert r.status_code == 401
+    # with token -> allowed
+    c = api_env["client"]
+    assert c.post("/v1/projects", json={"project_id": "p-token", "name": "x"}).status_code == 200
+
+
+def test_membership_gate_fail_closed(api_env):
+    """A project with NO members rejects all mutating actions (§22 fail-closed)."""
+    c = api_env["client"]
+    c.post("/v1/projects", json={"project_id": "p-nomembers", "name": "x"})
+    r = c.post("/v1/projects/p-nomembers/commands", json={
+        "text": "/research pause", "actor": {"type": "human", "platform_user_id": "ou_anyone"},
+    })
+    assert r.status_code == 403
+    assert "no members provisioned" in r.json()["detail"]

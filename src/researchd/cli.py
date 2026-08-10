@@ -127,7 +127,17 @@ def pilot(ctx: click.Context, project_id: str, question: str, import_decision: s
             ProjectRepo(uow.session).save(
                 Project(project_id=project_id, name=project_id, description=question or "")
             )
-            print(f"project {project_id} created")
+            # provision the owner member (fail-closed membership gate §22);
+            # the pilot PI acts as 'pi' on the internal API
+            from .persistence.models import ProjectMemberRow
+
+            uow.session.add(
+                ProjectMemberRow(
+                    id=f"M-{project_id}", member_id=f"M-{project_id}", project_id=project_id,
+                    platform_user_id="pi", role="owner", can_approve_decisions=True,
+                )
+            )
+            print(f"project {project_id} created (owner member provisioned)")
         else:
             print(f"project {project_id} already exists (no-op)")
         if import_decision:

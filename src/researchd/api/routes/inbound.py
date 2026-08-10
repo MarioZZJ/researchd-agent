@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
+
+from ..dependencies import require_token
 from pydantic import BaseModel, Field
 
 from ...application.handlers import HandlerError, handle_inbound, normalize_inbound
@@ -24,7 +26,7 @@ class InboundMessageRequest(BaseModel):
     received_at: str | None = None
 
 
-@router.post("/messages")
+@router.post("/messages", dependencies=[Depends(require_token)])
 def post_message(req: InboundMessageRequest, uow: UnitOfWork = Depends(get_uow)) -> dict:
     msg = normalize_inbound(
         message_id=req.message_id,

@@ -131,6 +131,7 @@ async def _submit(settings: Settings, session: InteractionSession, text: str, *,
 
 
 def _auth_headers(settings: Settings) -> dict:
-    if settings.api.socket_path:
-        return {}
+    # mutating endpoints require the bearer token on EVERY transport
+    # (threat model T4 / B-08); the shim is a trusted gateway that reads
+    # the same 0600 env file
     return {"Authorization": f"Bearer {settings.api.token}"} if settings.api.token else {}

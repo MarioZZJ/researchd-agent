@@ -33,7 +33,9 @@ uv run researchd migrate                       # 空库跑全部 Alembic migrati
 ```bash
 curl --unix-socket .data/run/researchd.sock http://localhost/healthz
 curl --unix-socket .data/run/researchd.sock http://localhost/readyz
-# TCP 形态（transport=tcp + token）：curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/healthz
+# 所有写接口（POST/PATCH）无论 UDS/TCP 都要求 Bearer token（威胁模型 T4/B-08）：
+curl --unix-socket .data/run/researchd.sock -H "Authorization: Bearer $TOKEN" \
+  -X POST http://localhost/v1/projects -d '{"project_id":"p","name":"p"}'
 ```
 
 ## 4. 日志

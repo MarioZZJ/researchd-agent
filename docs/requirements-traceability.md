@@ -16,10 +16,10 @@
 | 重复输入 | 实现 | 测试 |
 |---|---|---|
 | 同一飞书消息 | inbound_messages.idempotency_key 唯一 | `tests/integration/test_api_phase2.py::test_inbound_*` |
-| 同一 Decision 按钮 | /decision 幂等键 + 版本指纹 | `test_decision_reapply_is_noop` |
+| 同一 Decision 按钮 | /decision 幂等键 + 版本指纹 | `tests/integration/test_api_phase2.py::test_inbound_decision_flow_and_idempotency` |
 | 同一 Executor 结果 | run-applied 事件唯一键 | `tests/e2e/test_golden_path.py`（重启不重复证据） |
 | 同一 Outbox delivery | outbox.idempotency_key + IN_FLIGHT 唯一 | `tests/unit/test_transactions.py::test_outbox_claim_and_backoff` |
-| 同一 Decision answer | decisions.answer 唯一 + 版本校验 | `test_decision_version_conflict` |
+| 同一 Decision answer | decisions.answer 唯一 + 版本校验 | `test_decision_version_conflicts` |
 | 重启后重复回调 | 上述全部持久化 | `tests/recovery/` |
 
 ## 3. 恢复（§25.3）

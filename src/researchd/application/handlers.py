@@ -125,14 +125,18 @@ def _require_actor_authorized(
     session: Session, project_id: str, actor: Actor, *, require_approval: bool = False
 ) -> None:
     """Gate project-mutating actions on project membership (IMPLEMENTATION.md
-    §22, §25.8). Degradation rule: when the project has NO member rows yet
-    (bootstrap), any actor is allowed; once members exist, the actor must be a
-    member (and have can_approve_decisions for decision answers)."""
+    §22, §25.8). FAIL-CLOSED: a project with no member rows yet rejects all
+    mutating actors until an owner is provisioned (e.g. `researchd pilot`
+    provisions the owner member)."""
     rows = session.execute(
         select(ProjectMemberRow).where(ProjectMemberRow.project_id == project_id)
     ).scalars().all()
     if not rows:
-        return  # bootstrap phase
+        raise HandlerError(
+            f"project {project_id} has no members provisioned; "
+            "an owner must be provisioned before mutating actions",
+            403,
+        )
     user_id = actor.platform_user_id
     for row in rows:
         if row.platform_user_id == user_id:

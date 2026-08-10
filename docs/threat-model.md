@@ -28,8 +28,8 @@
 - 测试：`test_profile_rejection`、`test_dispatch_respects_profile`。
 
 ### T3 飞书消息伪造 / 重复回调
-- 缓解：入站幂等键（inbound_messages 唯一约束，重复 no-op）；`/decision` 版本指纹校验（版本不匹配 409，重复点击恰好一次）；token 校验（TCP 形态）；消息解析仅提取受控字段（bind/model/id），不执行任意指令。
-- 测试：`tests/integration/test_api_phase2.py`（幂等/409/401/403）。
+- 缓解：入站幂等键（inbound_messages 唯一约束，重复 no-op）；`/decision` 版本指纹必填（缺失 400、不匹配 409、重复点击恰好一次）+ 成员/审批门（fail-closed：无成员项目拒绝一切变更，owner 由 `researchd pilot` provision）；**所有写接口要求 Bearer token（UDS 同样强制，token 存 0600 env 且不在 Executor env 白名单）**；消息解析仅提取受控字段（bind/model/id），不执行任意指令。
+- 测试：`tests/integration/test_api_phase2.py`（幂等/409/400/401/403、UDS 无 token 401）。
 
 ### T4 Executor 会话越权（跨项目污染）
 - 缓解：每 run 独立会话（session/new 每 run）；最小 overlay（reasonix：仅复制 [[providers]]/default_model，环境白名单 + HOME 重定向，overlay 0600）；codex：独立 CODEX_HOME（0600，helper 拒绝 /tmp）；Executor env 白名单（PATH/HOME/REASONIX_HOME/TERM/LANG/LC_ALL/TZ），不注入飞书/cc-connect token；API socket 0600。
@@ -44,7 +44,7 @@
 - 缓解：version 乐观并发（rowcount=0 → 409）；data-dir 排他锁（唯一写者 service）；outbox IN_FLIGHT 租约 + attempts fencing + 回收。
 - 测试：`tests/unit/test_transactions.py`、`tests/recovery/`。
 
-### T9 机密泄漏（日志/报告/导出）
+### T7 机密泄漏（日志/报告/导出）
 - 缓解：报告 body 仅来自 ReportSpec 确定性编译（无 Executor 原始输出/思维链直达飞书）；错误净化（`sanitize_validation_error` 只留 loc/type；API 对未预期异常返回固定错误码）；日志不打印 token；doctor 只读。
 - 说明：reasonix overlay 会写入含 provider 配置的 config（0600，位于 gitignored `.data/`）；codex 复制 auth.json（0600）。这是运行所需的 runtime credential 文件，tracked tree 不含任何 secret。
 - 测试：`tests/conformance/test_error_sanitization*`；review 确认无原始输出路径。
@@ -53,7 +53,7 @@
 - 缓解：outbox 持久化（重启后重新投递，idempotency_key 防重复）；orphan reconciliation（RUNNING 孤儿 → ORPHANED → task requeue）；执行中取消 → INTERRUPTED → requeue；kill -9 演练通过。
 - 测试：`tests/recovery/test_scheduler_recovery.py`、`tests/e2e/test_golden_path.py`（执行中重启）。
 
-### T9 secret 进 Git
+### T9 Secret 进 Git
 - 缓解：`.gitignore`（.data/、deploy/researchd.env）；模板只含占位符；凭据仅经 env 引用（`*_env` 模式）。
 - 验证：`git grep` 无 token；`deploy/env.example` 审查。
 

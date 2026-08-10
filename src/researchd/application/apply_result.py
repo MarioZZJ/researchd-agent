@@ -73,10 +73,22 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
     project = ProjectRepo(session).get_by_project_id(project_id)
     for art in result.artifacts:
         artifact_id = art.local_ref
-        if ArtifactRepo(session).get_by_artifact_id(artifact_id):
-            continue  # idempotent
+        existing_artifact = ArtifactRepo(session).get_by_artifact_id(artifact_id)
         path = art.path
-        if project is not None and path:
+        if not path:
+            raise ValueError(f"artifact {artifact_id!r} has an empty path; rejected")
+        if existing_artifact is not None:
+            # idempotent replay: the SAME artifact (project+path) is fine;
+            # a different project/path reusing the id is a conflict
+            if (
+                existing_artifact.project_id != project_id
+                or existing_artifact.path != path
+            ):
+                raise ValueError(
+                    f"artifact id {artifact_id!r} reused with different project/path; rejected"
+                )
+            continue
+        if project is not None:
             # registration gate: project-root boundary + '..' / symlink
             # escape + real file + size/hash — any violation rejects the
             # whole result (the surrounding transaction rolls back)

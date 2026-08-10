@@ -4,6 +4,8 @@ decision answer, commands, sync, reconcile."""
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
+
+from ..dependencies import require_token
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -34,7 +36,7 @@ class CommandRequest(BaseModel):
 
 class DecisionAnswerRequest(BaseModel):
     option_id: str
-    version: int  # required: decision fingerprint guards against stale answers
+    version: int | None = None  # required; missing -> 400 (fingerprint guard)
     actor: str = "pi"
 
 
@@ -46,7 +48,7 @@ def list_projects(uow: UnitOfWork = Depends(get_uow)) -> dict:
     return {"projects": projects}
 
 
-@router.post("/projects")
+@router.post("/projects", dependencies=[Depends(require_token)])
 def create_project(req: ProjectCreateRequest, uow: UnitOfWork = Depends(get_uow)) -> dict:
     repo = ProjectRepo(uow.session)
     if req.project_id and repo.get_by_project_id(req.project_id) is not None:
@@ -95,7 +97,7 @@ def project_status(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
     }
 
 
-@router.post("/projects/{project_id}/pause")
+@router.post("/projects/{project_id}/pause", dependencies=[Depends(require_token)])
 def pause_project(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
     project = _get_project(uow, project_id)
     project.set_status(ProjectStatus.PAUSED, reason="api")
@@ -112,7 +114,7 @@ def pause_project(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
     return {"project_id": project_id, "status": project.status.value}
 
 
-@router.post("/projects/{project_id}/resume")
+@router.post("/projects/{project_id}/resume", dependencies=[Depends(require_token)])
 def resume_project(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
     project = _get_project(uow, project_id)
     project.set_status(ProjectStatus.ACTIVE)
@@ -129,7 +131,7 @@ def resume_project(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
     return {"project_id": project_id, "status": project.status.value}
 
 
-@router.post("/projects/{project_id}/cancel")
+@router.post("/projects/{project_id}/cancel", dependencies=[Depends(require_token)])
 def cancel_project(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
     project = _get_project(uow, project_id)
     project.set_status(ProjectStatus.CANCELLED, reason="api")
@@ -181,8 +183,10 @@ def list_decisions(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
     }
 
 
-@router.post("/decisions/{decision_id}/answer")
+@router.post("/decisions/{decision_id}/answer", dependencies=[Depends(require_token)])
 def answer_decision(decision_id: str, req: DecisionAnswerRequest, uow: UnitOfWork = Depends(get_uow)) -> dict:
+    if req.version is None:
+        raise HTTPException(status_code=400, detail="version is required (decision fingerprint)")
     if req.version <= 0:
         raise HTTPException(status_code=400, detail="version must be a positive integer")
     repo = DecisionRepo(uow.session)
@@ -198,7 +202,7 @@ def answer_decision(decision_id: str, req: DecisionAnswerRequest, uow: UnitOfWor
         )
     except HandlerError as exc:
         uow.rollback()
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
     if decision.status.value != "OPEN":
         return {
             "decision_id": decision_id,
@@ -225,7 +229,7 @@ def answer_decision(decision_id: str, req: DecisionAnswerRequest, uow: UnitOfWor
     return {"decision_id": decision_id, "applied": True, "answer": req.option_id}
 
 
-@router.post("/projects/{project_id}/commands")
+@router.post("/projects/{project_id}/commands", dependencies=[Depends(require_token)])
 def run_command(project_id: str, req: CommandRequest, uow: UnitOfWork = Depends(get_uow)) -> dict:
     _get_project(uow, project_id)
     try:
@@ -242,7 +246,7 @@ def run_command(project_id: str, req: CommandRequest, uow: UnitOfWork = Depends(
     return {"command": cmd.name, "reply": reply.text, "data": reply.data}
 
 
-@router.post("/projects/{project_id}/sync")
+@router.post("/projects/{project_id}/sync", dependencies=[Depends(require_token)])
 def sync_project(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
     _get_project(uow, project_id)
     from ...persistence.outbox import OutboxRepo
@@ -258,7 +262,7 @@ def sync_project(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
     return {"project_id": project_id, "scheduled": True}
 
 
-@router.post("/reconcile")
+@router.post("/reconcile", dependencies=[Depends(require_token)])
 def reconcile(uow: UnitOfWork = Depends(get_uow)) -> dict:
     """Manual reconciliation trigger (orphan recovery runs in the scheduler loop)."""
     from ...domain.base import utcnow
