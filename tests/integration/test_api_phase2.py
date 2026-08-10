@@ -482,3 +482,20 @@ def test_create_project_identity_and_root_constraints(api_env, tmp_path):
     assert r.status_code == 200
     with pytest.raises(Exception):  # unique (project_id, platform_user_id)
         _provision_owner(api_env["factory"], "p-dup")
+
+
+def test_create_project_rejects_symlinked_workspace_root(api_env):
+    """A pre-planted symlink at the derived workspace root must be rejected
+    (lstat check before resolve; the external target must never be accepted)."""
+    import os
+
+    c = api_env["client"]
+    settings = api_env["settings"]
+    outside = Path(settings.data_dir) / "outside"
+    outside.mkdir()
+    target = Path(settings.data_dir) / "workspaces" / "p-symlink"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(outside, target)
+    r = c.post("/v1/projects", json={"project_id": "p-symlink", "name": "x", "actor": "ou_pi"})
+    assert r.status_code == 400
+    assert "symlink" in r.json()["detail"]

@@ -62,22 +62,40 @@ def create_project(req: ProjectCreateRequest, request: Request, uow: UnitOfWork 
     if not actor or len(actor) > 128:
         raise HTTPException(status_code=400, detail="actor is required (non-empty platform user id)")
     project_id = req.project_id or new_id("project")
-    if not _PROJECT_ID_RE.match(project_id) or ".." in project_id.split("/"):
-        raise HTTPException(status_code=400, detail="project_id must be a single safe path segment")
+    if not _PROJECT_ID_RE.fullmatch(project_id) or len(project_id) > 64:
+        raise HTTPException(status_code=400, detail="project_id must be a single safe path segment (<=64 chars)")
     if repo.get_by_project_id(project_id) is not None:
         raise HTTPException(status_code=409, detail=f"project {project_id!r} already exists")
     # workspace_root is service-derived: ALWAYS <data_dir>/workspaces/<project_id>
-    allowed_root = Path(request.app.state.settings.data_dir) / "workspaces"
-    workspace_root = str((allowed_root / project_id).resolve())
+    allowed_root = (Path(request.app.state.settings.data_dir) / "workspaces").resolve()
+
+    def _no_symlink_components(path: Path) -> bool:
+        """Every component under allowed_root must be a real directory (lstat,
+        BEFORE any resolve() that would follow a symlink)."""
+        cur = allowed_root
+        for part in path.relative_to(allowed_root).parts:
+            cur = cur / part
+            if cur.is_symlink():
+                return False
+        return True
+
+    candidate = allowed_root / project_id  # un-resolved: symlink check is meaningful
+    workspace_root = str(candidate)
     if req.workspace_root:
-        requested = Path(req.workspace_root).resolve()
-        if not requested.is_relative_to(workspace_root) or not workspace_root.startswith(str(allowed_root.resolve()) + "/"):
+        requested = Path(req.workspace_root)
+        if not requested.is_absolute() or not requested.is_relative_to(candidate):
             raise HTTPException(status_code=400, detail="workspace_root must be under <data_dir>/workspaces/<project_id>")
         workspace_root = str(requested)
     root = Path(workspace_root)
-    if root.is_symlink() or any(p.is_symlink() for p in root.parents if p != allowed_root.parent):
+    if not _no_symlink_components(root):
         raise HTTPException(status_code=400, detail="workspace_root path must not traverse symlinks")
     root.mkdir(parents=True, exist_ok=True)
+    # post-mkdir re-anchor: after creating, the canonical resolved path must
+    # still sit under the allowed root (guards against race-replaced parents)
+    resolved_root = root.resolve()
+    if not resolved_root.is_relative_to(allowed_root):
+        raise HTTPException(status_code=400, detail="workspace_root escaped the allowed root")
+    workspace_root = str(resolved_root)
     project = Project(
         project_id=project_id,
         name=req.name,
