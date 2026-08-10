@@ -512,3 +512,25 @@ def test_create_project_rejects_dotdot_workspace_root(api_env):
     })
     assert r.status_code == 400
     assert ".." in r.json()["detail"] or "must" in r.json()["detail"]
+
+
+def test_create_project_rejects_symlinked_anchor(api_env):
+    """A pre-planted symlink AT <data_dir>/workspaces must be rejected."""
+    import os as _os
+
+    c = api_env["client"]
+    settings = api_env["settings"]
+    outside = Path(settings.data_dir) / "outside-anchor"
+    outside.mkdir()
+    anchor = Path(settings.data_dir) / "workspaces"
+    if anchor.is_symlink():
+        anchor.unlink()
+    elif anchor.exists():
+        anchor.rename(Path(settings.data_dir) / "workspaces-real")
+    _os.symlink(outside, anchor)
+    r = c.post("/v1/projects", json={"project_id": "p-anchor", "name": "x", "actor": "ou_pi"})
+    assert r.status_code == 400
+    assert "anchor" in r.json()["detail"]
+    # clean up the planted symlink (fixture tmp dir is discarded anyway)
+    if anchor.is_symlink():
+        anchor.unlink()

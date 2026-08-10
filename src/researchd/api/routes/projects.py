@@ -67,9 +67,21 @@ def create_project(req: ProjectCreateRequest, request: Request, uow: UnitOfWork 
         raise HTTPException(status_code=400, detail="project_id must be a single safe path segment (<=64 chars)")
     if repo.get_by_project_id(project_id) is not None:
         raise HTTPException(status_code=409, detail=f"project {project_id!r} already exists")
-    # workspace_root is service-derived: ALWAYS <data_dir>/workspaces/<project_id>
-    allowed_root = (Path(request.app.state.settings.data_dir) / "workspaces").resolve()
-    allowed_root.mkdir(parents=True, exist_ok=True)
+    # workspace_root is service-derived: ALWAYS <data_dir>/workspaces/<project_id>.
+    # The anchor itself is verified BEFORE resolving: mkdir, then O_NOFOLLOW
+    # lstat-style check — a pre-planted symlink at <data_dir>/workspaces must
+    # never become the trusted root.
+    import logging
+
+    logger = logging.getLogger("researchd.api")
+    allowed_anchor = Path(request.app.state.settings.data_dir) / "workspaces"
+    allowed_anchor.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(allowed_anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        os.close(fd)
+    except OSError:
+        raise HTTPException(status_code=400, detail="workspaces anchor is not a real directory") from None
+    allowed_root = allowed_anchor.resolve()
 
     def _no_symlink_components(path: Path) -> bool:
         """Every component under allowed_root must be a real directory (lstat,
@@ -117,8 +129,9 @@ def create_project(req: ProjectCreateRequest, request: Request, uow: UnitOfWork 
         try:
             fd = os.open(cur, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             os.close(fd)
-        except OSError as exc:
-            raise HTTPException(status_code=400, detail=f"workspace_root component not a real directory: {exc}") from exc
+        except OSError:
+            logger.warning("workspace_root component not a real directory: %s", cur)
+            raise HTTPException(status_code=400, detail="workspace_root component is not a real directory") from None
     resolved_root = root.resolve()
     if not resolved_root.is_relative_to(allowed_root):
         raise HTTPException(status_code=400, detail="workspace_root escaped the allowed root")
