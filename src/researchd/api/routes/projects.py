@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from ...application.handlers import CommandHandler, HandlerError, normalize_inbound
+from ...application.handlers import CommandHandler, HandlerError, _require_actor_authorized, normalize_inbound
 from ...application.commands import UnknownCommand, parse_command
 from ...domain.base import Actor, AggregateRef, new_id
 from ...domain.enums import ProjectStatus
@@ -34,7 +34,7 @@ class CommandRequest(BaseModel):
 
 class DecisionAnswerRequest(BaseModel):
     option_id: str
-    version: int | None = None
+    version: int  # required: decision fingerprint guards against stale answers
     actor: str = "pi"
 
 
@@ -183,12 +183,22 @@ def list_decisions(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
 
 @router.post("/decisions/{decision_id}/answer")
 def answer_decision(decision_id: str, req: DecisionAnswerRequest, uow: UnitOfWork = Depends(get_uow)) -> dict:
-    if req.version is not None and req.version <= 0:
+    if req.version <= 0:
         raise HTTPException(status_code=400, detail="version must be a positive integer")
     repo = DecisionRepo(uow.session)
     decision = repo.get_by_decision_id(decision_id)
     if decision is None:
         raise HTTPException(status_code=404, detail=f"decision {decision_id!r} not found")
+    # membership + approval gate (IMPLEMENTATION.md §22): the answering actor
+    # must be a project member with can_approve_decisions once members exist
+    try:
+        _require_actor_authorized(
+            uow.session, decision.project_id, Actor(type="human", platform_user_id=req.actor),
+            require_approval=True,
+        )
+    except HandlerError as exc:
+        uow.rollback()
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     if decision.status.value != "OPEN":
         return {
             "decision_id": decision_id,

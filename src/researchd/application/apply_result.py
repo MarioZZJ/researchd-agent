@@ -33,7 +33,13 @@ from ..domain.evidence import (
 from ..domain.enums import ClaimEvidenceState, ClaimReviewLevel, ClaimUseState
 from ..executors.base import WorkResult
 from ..persistence.models import ClaimEvidenceRow
-from ..persistence.repositories import ArtifactRepo, ClaimRepo, EvidenceRepo, IssueRepo
+from ..persistence.repositories import (
+    ArtifactRepo,
+    ClaimRepo,
+    EvidenceRepo,
+    IssueRepo,
+    ProjectRepo,
+)
 
 logger = logging.getLogger("researchd.apply")
 
@@ -60,11 +66,38 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
     project_id = run.project_id
 
     # 1. artifacts: stable id from the schema's local_ref (run-level
-    #    idempotency below prevents duplicate registration on replay)
+    #    idempotency below prevents duplicate registration on replay).
+    #    Every path goes through the registration gate: resolved inside the
+    #    project root, no '..' / symlink escape — any violation rejects the
+    #    whole result (the transaction rolls back).
+    project = ProjectRepo(session).get_by_project_id(project_id)
     for art in result.artifacts:
         artifact_id = art.local_ref
         if ArtifactRepo(session).get_by_artifact_id(artifact_id):
             continue  # idempotent
+        path = art.path
+        if project is not None and path:
+            # registration gate: project-root boundary + '..' / symlink
+            # escape + real file + size/hash — any violation rejects the
+            # whole result (the surrounding transaction rolls back)
+            from .evidence_validation import register_artifact
+
+            registered = register_artifact(
+                session,
+                project=project,
+                workspace_root=project.workspace_root,
+                rel_path=path,
+                artifact=Artifact(
+                    artifact_id=artifact_id,
+                    project_id=project_id,
+                    task_id=run.task_id,
+                    run_id=run.run_id,
+                    kind=art.kind,
+                    path=path,
+                    description=art.description,
+                ),
+            )
+            path = str(registered.path)
         ArtifactRepo(session).save(
             Artifact(
                 artifact_id=artifact_id,
@@ -72,7 +105,7 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
                 task_id=run.task_id,
                 run_id=run.run_id,
                 kind=art.kind,
-                path=art.path,
+                path=path,
                 description=art.description,
             )
         )

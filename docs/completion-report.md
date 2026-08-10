@@ -8,8 +8,8 @@
 
 ## 2. 分支与 commit
 
-- 分支：`main`（13 个 commit，工作树干净）
-- 最终 commit：`1b8653b`（`fix: harden restore against tar escapes and clobbering`）
+- 分支：`master`（14 个 commit，工作树干净）
+- 最终 commit：`896c59a`（`docs: add threat model traceability and completion report`）
 - 提交序列（新→旧）：`1b8653b` → `b188e06`（deploy/backup/ops）→ `bc84d90`（pilot+e2e）→ `202d77f/c4dd2fa/0fe05da`（投影）→ `8152eb5`（门控/报告/投递）→ `b36c956`（codex）→ `1f91623`（reasonix）→ `40ffa7f`（调度/租约/恢复）→ `58888c7`（service/api/cli/acp）→ `94fe79f`（领域/迁移）→ `4a316c7`（scaffold）
 
 ## 3. 实际兼容性结论
@@ -20,6 +20,7 @@
 | Reasonix | v1.21.2（ACP） | ✓ 真实握手：loadSession、session/new、steer 扩展；conformance 10 项 |
 | Codex | codex-cli 0.146.0（app-server） | ✓ 真实 initialize + thread/start；conformance 6 项；turn/start（付费）GATED |
 | cc-connect | v1.4.1（5d4c96d，Go） | patch 300 insertions 在干净基线 apply 通过；安装 GATED（无 Go 工具链，B-06） |
+| 进程隔离 | 无 root/bwrap/landlock | B-08（同 uid 协作式缓解，无 OS 级隔离） |
 
 ## 4. researchd 服务状态与启动方式
 
@@ -102,7 +103,7 @@ schema 修复循环 → 冲突 → 廉价诊断 → D-002 门控 → blocking_sc
 | 11 | 真实 pilot 创建并开始首批任务 | PARTIAL | 项目 + D-001 ✓；真实模型运行 GATED（B-01/B-03） |
 | 12 | 备份/恢复演练 | ✓ | 在线备份（写中快照）+ round-trip + 恶意 tar 防护 |
 | 13 | 无原始 Executor 输出直达飞书 | ✓ | 报告仅 ReportSpec 编译；review 确认 |
-| 14 | threat model/运维/恢复/回滚/模型配置文档 | ✓ | docs/threat-model.md、operations.md、cc-connect README、env.example |
+| 14 | threat model/运维/恢复/回滚/模型配置文档 | ✓ | docs/threat-model.md（security-review 审查）、operations.md、cc-connect README、env.example |
 | 15 | requirements-traceability | ✓ | docs/requirements-traceability.md |
 | 16 | 全部改动有 commit，工作树明确 | ✓ | 13 commits，`git status` 干净 |
 

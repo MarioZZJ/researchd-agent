@@ -41,9 +41,9 @@ def post_message(req: InboundMessageRequest, uow: UnitOfWork = Depends(get_uow))
     except HandlerError as exc:
         uow.rollback()
         raise HTTPException(status_code=exc.status, detail=exc.message) from exc
-    except Exception as exc:  # unexpected: roll back, surface generic error
+    except Exception as exc:  # unexpected: roll back, surface a fixed error
         uow.rollback()
-        raise HTTPException(status_code=500, detail=f"internal error: {exc}") from exc
+        raise HTTPException(status_code=500, detail="internal error (see service log)") from exc
     return {
         "message_id": req.message_id,
         "duplicate": reply.text.startswith("duplicate"),

@@ -6,10 +6,10 @@
 
 | 要求（章节） | 实现 | 测试 |
 |---|---|---|
-| 可替换 Executor Adapter（§2） | `executors/base.py`（ExecutorAdapter/WorkResult/PlannerResult/AuditResult）、`executors/{fake,reasonix,codex}/` | `tests/conformance/`（三 adapter）、`tests/unit/test_executor_schema.py` |
+| 可替换 Executor Adapter（§2） | `executors/base.py`（ExecutorAdapter/WorkResult/PlannerResult/AuditResult）、`executors/{fake,reasonix,codex}/` | `tests/conformance/`（三 adapter）、`tests/unit/test_executor_schemas.py` |
 | 状态机不得绕过（§7, §25.1） | `domain/state_machine.py` + 各 domain transition（COMPLETED/VERIFIED 仅经门控方法） | `tests/unit/test_state_machines.py`（RUNNING→COMPLETED 拒绝等） |
 | 乐观并发（§25.1） | `persistence/repositories.py` BaseRepo.version 校验 | `tests/unit/test_transactions.py` |
-| 事务 + outbox（§8） | `persistence/transaction.py`、`persistence/outbox.py`（IN_FLIGHT 租约/fencing/回收） | `tests/unit/test_transactions.py`、`tests/unit/test_outbox.py` |
+| 事务 + outbox（§8） | `persistence/transaction.py`、`persistence/outbox.py`（IN_FLIGHT 租约/fencing/回收） | `tests/unit/test_transactions.py`（含 outbox claim/backoff/fencing） |
 
 ## 2. 幂等（§25.2）
 
@@ -18,7 +18,7 @@
 | 同一飞书消息 | inbound_messages.idempotency_key 唯一 | `tests/integration/test_api_phase2.py::test_inbound_*` |
 | 同一 Decision 按钮 | /decision 幂等键 + 版本指纹 | `test_decision_reapply_is_noop` |
 | 同一 Executor 结果 | run-applied 事件唯一键 | `tests/e2e/test_golden_path.py`（重启不重复证据） |
-| 同一 Outbox delivery | outbox.idempotency_key + IN_FLIGHT 唯一 | `test_outbox_*`、`test_outbox_claim_and_backoff` |
+| 同一 Outbox delivery | outbox.idempotency_key + IN_FLIGHT 唯一 | `tests/unit/test_transactions.py::test_outbox_claim_and_backoff` |
 | 同一 Decision answer | decisions.answer 唯一 + 版本校验 | `test_decision_version_conflict` |
 | 重启后重复回调 | 上述全部持久化 | `tests/recovery/` |
 
@@ -26,8 +26,8 @@
 
 | 故障注入 | 实现 | 测试 |
 |---|---|---|
-| service 在 Worker 运行时退出 | orphan reconciliation（RUNNING→INTERRUPTED→requeue） | `tests/recovery/test_orphan_reconciliation.py`、e2e 执行中重启 |
-| 投递后崩溃 | outbox 持久化 + 重投递（幂等） | `tests/recovery/test_outbox_recovery.py` |
+| service 在 Worker 运行时退出 | orphan reconciliation（RUNNING→ORPHANED→requeue；执行中取消→INTERRUPTED） | `tests/recovery/test_scheduler_recovery.py`、e2e 执行中重启 |
+| 投递后崩溃 | outbox 持久化 + 重投递（幂等） | `tests/recovery/test_scheduler_recovery.py` |
 | 重复回调 | 幂等键 | 同上 |
 | kill -9 | 排他锁 flock 自动释放 + Restart | `docs/operations.md` 演练 |
 
@@ -46,14 +46,14 @@
 |---|---|---|
 | Evidence VERIFIED 需真实 provenance | `application/evidence_validation.py`（artifact/run/code/data 门） | `tests/unit/test_evidence_validation.py` |
 | 决策门控（阈值/直接证据/冲突） | `application/decision_gate.py` | `tests/unit/test_decision_gate.py` |
-| 报告确定性（禁 AI slop） | `reporting/reporter.py`（ReportSpec 编译 + FINALIZED 快照） | `tests/unit/test_reporter.py`、e2e 报告断言 |
+| 报告确定性（禁 AI slop） | `reporting/reporter.py`（ReportSpec 编译 + COMPILED 快照） | `tests/integration/test_phase6_gate_reporter.py`、e2e 报告断言 |
 | 无原始输出直达飞书 | 报告仅来自 ReportSpec；DeliveryPort 窄接口 | review 两轮 + `tests/conformance/` |
 
 ## 6. 飞书（§20）
 
 | 要求 | 实现 | 状态 |
 |---|---|---|
-| 决策卡发送/点击/幂等/原地更新 | `delivery/`（FakeDeliveryPort 全链） | Fake ✓；真实 GATED（B-01） |
+| 决策卡发送/点击/幂等/原地更新 | `delivery/`（FakeDeliveryPort 全链） | Fake ✓（`tests/integration/test_phase6_gate_reporter.py`）；真实 GATED（B-01） |
 | 文档增量同步 | `projections/feishu_doc.py`（compile_sections/hash 收敛/PI Notes 保护/TOCTOU） | 13 项测试 ✓；真实 GATED（B-01） |
 | cc-connect 窄补丁 | `integrations/cc-connect/patch/delivery-api.patch`（373 行） | 可应用；安装 GATED（B-06） |
 
@@ -68,7 +68,7 @@
 
 | 要求 | 实现 | 证据 |
 |---|---|---|
-| 唯一写者 | data-dir 排他锁 + UDS 0600 | `tests/unit/test_service_lock.py`、doctor |
+| 唯一写者 | data-dir 排他锁 + UDS 0600 | `tests/integration/test_api_phase2.py`（migrate 被锁拒绝）、doctor |
 | 路径逃逸拒绝 | safe_resolve/symlink 检查/tar 预检 | `tests/unit/test_evidence_validation.py`、`test_backup.py` |
 | Executor 不可访问 secrets | overlay env 白名单 | `tests/conformance/test_overlay_isolation.py` |
 | threat-model 文档 | `docs/threat-model.md` | security-review |

@@ -42,3 +42,10 @@
   - 服务启动/优雅停止/healthz/readyz/journald 日志路径在 docs/operations.md 记录。
 - 解除条件：宿主将 /home（或至少 ~/.config/systemd/user）挂载为 rw，或提供 sudo。
 - 解除后执行：`cp deploy/systemd/researchd.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now researchd`。
+
+## B-08 Executor 无 OS 级进程隔离（威胁模型 T4）
+
+- 现象：reasonix/codex Executor 与 researchd service 同 uid 运行；本机无 root、无 bwrap/landlock 可用（sudo 不可用、容器 no-new-privileges）。
+- 影响：同 uid 的 Executor 在 OS 层面可读 `.data/`（DB/socket/workspace），威胁模型 T4 的"Executor 不可访问其他项目/secret"仅靠协作式锁 + env 白名单 + socket 0600 缓解，非强制隔离。
+- 已缓解：Executor env 白名单（不注入飞书/cc-connect token）；overlay/codex-home 0600 且 gitignored；API socket 0600；结构化输出门控（Executor 无法直接写状态库）。
+- 解除条件：宿主提供独立 uid 或 sandbox（bwrap/unshare/landlock/seccomp）。

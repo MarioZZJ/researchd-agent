@@ -359,7 +359,7 @@ def test_golden_path(golden, factory):
 
         runs = uow.session.execute(select(RunRow)).scalars().all()
         assert runs  # history intact
-        # the interrupted run was reconciled (INTERRUPTED), not silently
+        # the interrupted run was reconciled (ORPHANED), not silently
         # dropped, and its task requeued + redone
         t005 = TaskRepo(uow.session).get_by_task_id("T-005")
         assert t005.status.value in ("REVIEW", "COMPLETED"), "T-005 must recover after restart"
