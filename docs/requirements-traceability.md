@@ -38,14 +38,14 @@
 | Reasonix ACP 真实能力 | `executors/reasonix/`（overlay/transport/adapter） | 真实握手：loadSession、session/new（`docs/compatibility-matrix.md`）；conformance 10 项 |
 | Codex App Server v1/v2 | `executors/codex/`（transport/adapter） | 真实 thread/start；conformance 6 项 |
 | 结构化输出修复循环 | adapter.ensure_valid | conformance |
-| 最小能力（§22） | overlay 白名单 + 独立 HOME/CODEX_HOME | `tests/conformance/test_overlay_isolation.py` |
+| 最小能力（§22） | overlay 白名单 + 独立 HOME/CODEX_HOME | `tests/conformance/test_reasonix_conformance.py`（overlay 隔离子测试） |
 
 ## 5. 科学门控与报告（§17-18）
 
 | 要求 | 实现 | 测试 |
 |---|---|---|
 | Evidence VERIFIED 需真实 provenance | `application/evidence_validation.py`（artifact/run/code/data 门） | `tests/unit/test_evidence_validation.py` |
-| 决策门控（阈值/直接证据/冲突） | `application/decision_gate.py` | `tests/unit/test_decision_gate.py` |
+| 决策门控（阈值/直接证据/冲突） | `application/decision_gate.py` | `tests/integration/test_phase6_gate_reporter.py` |
 | 报告确定性（禁 AI slop） | `reporting/reporter.py`（ReportSpec 编译 + COMPILED 快照） | `tests/integration/test_phase6_gate_reporter.py`、e2e 报告断言 |
 | 无原始输出直达飞书 | 报告仅来自 ReportSpec；DeliveryPort 窄接口 | review 两轮 + `tests/conformance/` |
 
@@ -70,7 +70,7 @@
 |---|---|---|
 | 唯一写者 | data-dir 排他锁 + UDS 0600 | `tests/integration/test_api_phase2.py`（migrate 被锁拒绝）、doctor |
 | 路径逃逸拒绝 | safe_resolve/symlink 检查/tar 预检 | `tests/unit/test_evidence_validation.py`、`test_backup.py` |
-| Executor 不可访问 secrets | overlay env 白名单 | `tests/conformance/test_overlay_isolation.py` |
+| Executor 不可访问 secrets | overlay env 白名单 | `tests/conformance/test_reasonix_conformance.py`（overlay 隔离） |
 | threat-model 文档 | `docs/threat-model.md` | security-review |
 | secret 不进 Git | .gitignore + env 模板 | 人工核验 |
 

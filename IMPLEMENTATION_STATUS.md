@@ -7,7 +7,7 @@
 | # | 判据 | 状态 | 证据 / 备注 |
 |---|---|---|---|
 | 1 | 空库可执行全部 Alembic migration | DONE | `RESEARCHD_DB=/tmp/mig-check/fresh.db uv run alembic upgrade head` 成功；autogenerate 一致性检查零 diff（26 表） |
-| 2 | 单元、集成、conformance、recovery、e2e 测试通过 | PARTIAL | 139 passed + 2 门控跳过（含 6 轮安全加固回归）；真实平台 GATED |
+| 2 | 单元、集成、conformance、recovery、e2e 测试通过 | PARTIAL | 144 passed + 2 门控跳过（含 8 轮安全加固回归）；真实平台 GATED |
 | 3 | Reasonix Adapter 真实 capability tests 通过 | PARTIAL | 真实握手（native 二进制+最小 overlay）initialize/session/new 通过；付费 prompt conformance GATED（B-03） |
 | 4 | Codex Adapter 真实验证或明确 BLOCKED | PARTIAL | 非付费握手（CODEX_HOME 隔离）通过；付费 turn conformance BLOCKED（B-02） |
 | 5 | interaction model 和 project role profiles 可配置 | PENDING | Phase 2 |

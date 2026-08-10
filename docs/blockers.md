@@ -49,3 +49,9 @@
 - 影响：同 uid 的 Executor 在 OS 层面**可读可写** `.data/`（DB/socket/workspace），可 rename/unlink DB、替换 workspace/symlink、绕过 advisory lock 与路径门控——"唯一写者/结构化输出门控"仅是协作式代码约束，威胁模型 T4 的隔离目标依赖 OS 边界，本机无法强制。
 - 已缓解：Executor env 白名单（不注入飞书/cc-connect token）；overlay/codex-home 0600 且 gitignored；API socket 0600 + 写接口 token（同 uid 可读 token 文件，属协作层）；结构化输出 schema 门控。
 - 解除条件：宿主提供独立 uid 或 sandbox（bwrap/unshare/landlock/seccomp）。
+
+## B-06 cc-connect 补丁无法安装验证（无 Go 工具链）
+
+- 现象：本机无 go/cargo 工具链（`go version` 不存在），无法编译 cc-connect 二进制验证 Delivery API 补丁的运行行为。
+- 证据：`integrations/cc-connect/patch/delivery-api.patch`（373 行，300 insertions：engine +40、interfaces +13、management +182、feishu +65）在干净 5d4c96d clone 上 `git apply --check` 通过（Phase 6 与 Phase 10 均验证）。
+- 解除条件：安装 Go 工具链（或由有 Go 环境的维护者）后在 cc-connect 仓库执行 `git apply <patch> && go build ./...` 并运行 Management API 冒烟。

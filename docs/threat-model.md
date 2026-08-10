@@ -21,7 +21,7 @@
 
 ### T1 Executor 输出注入 / 状态库污染
 - 缓解：JSON Schema 严格校验（`executors/schemas/*.json` + `validate_work_result`）；schema 错误 → 修复循环或 FAILED，绝不部分落库；`run-applied` 事件幂等门（同一 run 结果只应用一次）；Executor 无直接 SQL/写库路径（唯一写者 = service）。
-- 测试：`tests/conformance/test_fake_executor_*`（修复循环/耗尽）、`tests/unit/test_idempotency*`。
+- 测试：`tests/conformance/test_reasonix_conformance.py`（修复循环/耗尽）、`tests/unit/test_transactions.py` + `tests/integration/test_api_phase2.py`（幂等）。
 
 ### T2 越权执行（无授权模型调用）
 - 缓解：执行 profile 白名单（scheduler `_resolve_profile`：contract > role_override > default）；`RESEARCHD_SCHEDULER__EXECUTOR=fake` 为默认；真实模型 GATED（docs/blockers.md B-03）。
@@ -34,7 +34,7 @@
 ### T4 Executor 会话越权（跨项目污染）
 - 缓解：每 run 独立会话（session/new 每 run）；最小 overlay（reasonix：仅复制 [[providers]]/default_model，环境白名单 + HOME 重定向，overlay 0600）；codex：独立 CODEX_HOME（0600，helper 拒绝 /tmp）；Executor env 白名单（PATH/HOME/REASONIX_HOME/TERM/LANG/LC_ALL/TZ），不注入飞书/cc-connect token；API socket 0600。
 - **局限（B-08）**：本机无 root/bwrap/landlock，Executor 与 service 同 uid 运行，**没有 OS 级进程隔离**——同 uid 的 Executor 可读写 `.data/`（DB/workspace/socket）、rename/unlink 文件、读 0600 env（含 API token）、替换 symlink 绕过路径门控。当前"唯一写者/认证/路径门控"均为协作式约束，可被同 uid 恶意 Executor 绕过；缓解层级：协作式锁 + 最小暴露 + env 白名单 + 结构化输出 schema 门控。生产多租户环境必须加独立 uid 或 sandbox（bwrap/landlock/seccomp）。
-- 测试：`tests/conformance/test_overlay_isolation.py`（无 key 文件、cwd 隔离）、`tests/integration/test_api_phase2.py::test_uds_mutating_endpoints_require_token`。
+- 测试：`tests/conformance/test_reasonix_conformance.py`（overlay 隔离：无 key 文件、cwd 隔离）、`tests/integration/test_api_phase2.py::test_uds_mutating_endpoints_require_token`。
 
 ### T5 路径逃逸（artifact/workspace/restore）
 - 缓解：`safe_resolve`（resolve 后必须位于项目根，拒绝 `..`）；artifact 注册检查 symlink 逃逸 + 项目根派生；restore tar 成员预检（链接/绝对/`..` 拒绝）+ staging 原子发布 + live 路径拒绝。
@@ -47,7 +47,7 @@
 ### T7 机密泄漏（日志/报告/导出）
 - 缓解：报告 body 仅来自 ReportSpec 确定性编译（无 Executor 原始输出/思维链直达飞书）；错误净化（`sanitize_validation_error` 只留 loc/type；API 对未预期异常返回固定错误码）；日志不打印 token；doctor 只读。
 - 说明：reasonix overlay 会写入含 provider 配置的 config（0600，位于 gitignored `.data/`）；codex 复制 auth.json（0600）。这是运行所需的 runtime credential 文件，tracked tree 不含任何 secret。
-- 测试：`tests/conformance/test_error_sanitization*`；review 确认无原始输出路径。
+- 测试：`tests/conformance/test_reasonix_conformance.py`（错误净化子测试）；review 确认无原始输出路径。
 
 ### T8 重启丢失 / 僵尸状态
 - 缓解：outbox 持久化（重启后重新投递，idempotency_key 防重复）；orphan reconciliation（RUNNING 孤儿 → ORPHANED → task requeue）；执行中取消 → INTERRUPTED → requeue；kill -9 演练通过。

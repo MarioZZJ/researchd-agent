@@ -177,3 +177,21 @@ def test_outbox_dead_letter(uow_factory):
         assert row.status == OutboxStatus.DEAD.value
         attempts = uow.session.execute(select(__import__("researchd.persistence.models", fromlist=["OutboxAttemptRow"]).OutboxAttemptRow)).scalars().all()
         assert len(attempts) == 1
+
+
+def test_run_records_resolved_model_profile(factory):
+    """Runs persist the frozen executor profile (contract §25.7)."""
+    from researchd.domain.run import Run
+    from researchd.persistence.repositories import RunRepo
+    from researchd.persistence.transaction import UnitOfWork
+
+    run = Run(run_id="R-PROF", task_id="T-1", project_id="P", executor="reasonix")
+    run.resolved_model = "gateway/deepseek-v4-flash"
+    run.configuration_source = "contract"
+    with UnitOfWork(factory) as uow:
+        RunRepo(uow.session).save(run)
+        uow.commit()
+    with UnitOfWork(factory) as uow:
+        got = RunRepo(uow.session).get_by_run_id("R-PROF")
+        assert got.resolved_model == "gateway/deepseek-v4-flash"
+        assert got.configuration_source == "contract"

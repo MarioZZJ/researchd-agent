@@ -8,8 +8,8 @@
 
 ## 2. 分支与 commit
 
-- 分支：`master`（14 个 commit，工作树干净）
-- 最终 commit：`896c59a`（`docs: add threat model traceability and completion report`）
+- 分支：`master`（25 个 commit，工作树干净）
+- 最终 commit：`936f109`（docs 对齐与收尾）
 - 提交序列（新→旧）：`1b8653b` → `b188e06`（deploy/backup/ops）→ `bc84d90`（pilot+e2e）→ `202d77f/c4dd2fa/0fe05da`（投影）→ `8152eb5`（门控/报告/投递）→ `b36c956`（codex）→ `1f91623`（reasonix）→ `40ffa7f`（调度/租约/恢复）→ `58888c7`（service/api/cli/acp）→ `94fe79f`（领域/迁移）→ `4a316c7`（scaffold）
 
 ## 3. 实际兼容性结论
@@ -17,8 +17,8 @@
 | 组件 | 版本/路径 | 结论 |
 |---|---|---|
 | Python | 3.12.12（`uv` 0.9.15 管理） | ✓ 全部测试通过 |
-| Reasonix | v1.21.2（ACP） | ✓ 真实握手：loadSession、session/new、steer 扩展；conformance 10 项 |
-| Codex | codex-cli 0.146.0（app-server） | ✓ 真实 initialize + thread/start；conformance 6 项；turn/start（付费）GATED |
+| Reasonix | v1.21.2（ACP） | ✓ 真实握手：loadSession、session/new（compatibility-matrix 记录）；steer 为能力声明；fake conformance 10 项 |
+| Codex | codex-cli 0.146.0（app-server） | ✓ 真实 initialize + thread/start（非付费）；fake conformance 7 项；turn/start（付费）GATED（B-02） |
 | cc-connect | v1.4.1（5d4c96d，Go） | patch 300 insertions 在干净基线 apply 通过；安装 GATED（无 Go 工具链，B-06） |
 | 进程隔离 | 无 root/bwrap/landlock | B-08（同 uid 协作式缓解，无 OS 级隔离） |
 
@@ -39,12 +39,15 @@
 ## 6. 测试命令与结果
 
 ```bash
-uv run pytest -q      # 134 passed, 2 skipped（真实平台 conformance 门控项）
+uv run pytest -q      # 144 passed, 2 skipped（真实平台 conformance 门控项）
 uv run researchctl doctor   # 只读健康检查（PRAGMA/schema 27 表/perms/healthz）
 ```
-覆盖：unit（状态机/幂等/事务/outbox/证据/路径/备份）、integration（API/幂等/授权/409）、
+覆盖：unit（状态机/幂等/事务/outbox/证据/路径/备份/artifact provenance）、integration（API/幂等/授权/409/约束回归）、
 conformance（FakeExecutor 协议 10 项 + Codex 6 项 + 真实进程握手）、recovery（9 项故障注入）、
 e2e（黄金路径 22 步，含执行中重启）。
+安全加固：security-review 10 轮迭代（阻断/高危全部闭环）——mutating API 全 transport token、
+成员门 fail-closed + 创建者即 owner、actor 必填、workspace_root 服务派生（lstat 锚点/O_NOFOLLOW/
+`..` 词法拒绝）、artifact 注册门接入 apply 且 provenance 不可变、tar 逃逸防护、威胁模型诚实化（B-08）。
 
 ## 7. Executor 真实能力矩阵
 
@@ -91,13 +94,13 @@ schema 修复循环 → 冲突 → 廉价诊断 → D-002 门控 → blocking_sc
 | # | 判据 | 状态 | 证据 |
 |---|---|---|---|
 | 1 | 空库全部 Alembic migration | ✓ | `researchd migrate` + autogenerate 零差异 |
-| 2 | 单元/集成/conformance/recovery/e2e | ✓ | 134 passed + 2 门控跳过 |
+| 2 | 单元/集成/conformance/recovery/e2e | ✓ | 144 passed + 2 门控跳过 |
 | 3 | Reasonix 真实 capability tests | ✓ | 真实握手（loadSession/session/new/steer） |
 | 4 | Codex 真实验证或明确 BLOCKED | ✓ | 真实 initialize/thread/start；turn GATED |
 | 5 | interaction model / role profiles 可配置 | ✓ | /research model + role_overrides + 冻结到 run |
 | 6 | cc-connect patch 可应用或真实 blocker | ✓ | 干净基线 apply 通过 + B-06 |
 | 7 | 飞书决策卡或准确 blocker | ✓ | Fake 全链 + B-01 |
-| 8 | 飞书文档增量同步或准确 blocker | ✓ | 13 项投影测试 + B-01 |
+| 8 | 飞书文档增量同步或准确 blocker | ✓ | 15 项投影测试 + B-01 |
 | 9 | systemd 启动/停止/自动恢复 | ✓ | unit 语法 + kill -9 演练；持久安装 B-07 |
 | 10 | deterministic 黄金路径 | ✓ | e2e 22 步 |
 | 11 | 真实 pilot 创建并开始首批任务 | PARTIAL | 项目 + D-001 ✓；真实模型运行 GATED（B-01/B-03） |

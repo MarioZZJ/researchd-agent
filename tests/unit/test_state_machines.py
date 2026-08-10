@@ -132,3 +132,20 @@ def test_run_orphan_transition():
     r.transition(RunStatus.RUNNING)
     r.transition(RunStatus.ORPHANED)
     assert r.status is RunStatus.ORPHANED
+
+
+def test_decision_withdrawn_transition():
+    """An OPEN decision can be WITHDRAWN (contract §25.5); answered ones cannot."""
+    from researchd.domain.decision import Decision, DecisionOption
+
+    d = Decision(decision_id="D-W", project_id="P", status="OPEN", question="q",
+                 options=[DecisionOption(option_id="A", label="A")])
+    d.transition("WITHDRAWN")
+    assert d.status.value == "WITHDRAWN"
+    d2 = Decision(decision_id="D-W2", project_id="P", status="ANSWERED", question="q",
+                  options=[DecisionOption(option_id="A", label="A")])
+    try:
+        d2.transition("WITHDRAWN")
+        assert False, "ANSWERED -> WITHDRAWN must be rejected"
+    except Exception:  # noqa: BLE001 - InvalidTransition
+        pass
