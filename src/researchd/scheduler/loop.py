@@ -81,18 +81,182 @@ class SchedulerLoop:
 
     # ------------------------------------------------------------ tick
     async def tick(self) -> dict:
-        stats: dict = {"orphans": 0, "dispatched": 0, "heartbeats": 0, "outbox": {}}
+        stats: dict = {"orphans": 0, "dispatched": 0, "heartbeats": 0, "outbox": {}, "decisions": 0, "reports": 0}
         # 1. recovery: any stale run (restart/crash) -> ORPHANED, task -> READY
         with self.session_factory() as session:
             stats["orphans"] = len(reconcile_orphans(session))
             session.commit()
-        # 2. outbox delivery (deduplicated, lease-protected)
+        # 2. decision gate: evaluate pending candidates -> OPEN decisions
+        stats["decisions"] = await self._evaluate_decision_candidates()
+        # 3. reporting: emit queued reports for active projects
+        stats["reports"] = await self._report_projects()
+        # 4. outbox delivery (deduplicated, lease-protected)
         stats["outbox"] = await self.sender.send_pending()
-        # 3. dispatch ready tasks (bounded by max_parallel)
+        # 5. dispatch ready tasks (bounded by max_parallel)
         stats["dispatched"] = await self._dispatch_ready()
-        # 4. heartbeats for active runs
+        # 6. heartbeats for active runs
         stats["heartbeats"] = await self._heartbeat_active()
         return stats
+
+    async def _evaluate_decision_candidates(self) -> int:
+        """Evaluate decision_candidates from recent SUCCEEDED runs through the
+        Decision Gate; materialize OPEN decisions and block their scope."""
+        from ..application.decision_gate import DecisionGate, build_decision
+        from ..domain.decision import DecisionOption
+        from ..domain.enums import TaskStatus as TS
+        from ..persistence.repositories import DecisionRepo, RunRepo
+
+        opened = 0
+        with self.session_factory() as session:
+            repo = DecisionRepo(session)
+            existing = {d.fingerprint for d in repo.list_all_statuses(None) if d.fingerprint}
+            gate = DecisionGate(existing_fingerprints=existing)
+            from sqlalchemy import select
+
+            from ..persistence.models import RunRow
+
+            # scan SUCCEEDED runs that were never evaluated (marked at the end)
+            from sqlalchemy import func
+
+            rows = session.execute(
+                select(RunRow)
+                .where(RunRow.status == "SUCCEEDED")
+                .where(
+                    func.json_extract(RunRow.metadata_json, "$.decisions_evaluated").is_(None)
+                    | (func.json_extract(RunRow.metadata_json, "$.decisions_evaluated") != 1)
+                )
+                .order_by(RunRow.created_at.desc())
+                .limit(200)
+            ).scalars().all()
+            blocked_task_ids: set[str] = set()
+            evaluated: list[str] = []
+            for row in rows:
+                if (row.metadata_json or {}).get("decisions_evaluated"):
+                    continue
+                evaluated.append(row.id)
+                result = row.result_json or {}
+                for cand in result.get("decision_candidates", []):
+                    options = [
+                        DecisionOption(
+                            option_id=o["option_id"], label=o.get("label", o["option_id"]),
+                            description=o.get("description", ""),
+                            scientific_consequence=o.get("scientific_consequence", ""),
+                        )
+                        for o in cand.get("options", [])
+                    ]
+                    has_conflict = cand.get("has_option_conflict", True)
+                    cheap = cand.get("cheap_parallel", False)
+                    numerical = cand.get("numerical_only", False)
+                    if cheap and has_conflict:
+                        has_conflict = False  # cheap parallel options do not fork
+                    verdict = gate.evaluate(
+                        project_id=row.project_id,
+                        category=cand.get("category", "other"),
+                        question=cand.get("question", ""),
+                        why_material=cand.get("why_material", ""),
+                        options=options,
+                        affected_object=cand.get("affected_object"),
+                        trigger=cand.get("trigger", ""),
+                        recommendation=cand.get("recommendation"),
+                        recommendation_basis=cand.get("recommendation_basis"),
+                        evidence_refs=cand.get("evidence_refs"),
+                        unresolved_uncertainty=cand.get("unresolved_uncertainty"),
+                        reversibility=cand.get("reversibility"),
+                        blocking_scope=cand.get("blocking_scope"),
+                        continue_scope=cand.get("continue_scope"),
+                        has_option_conflict=has_conflict,
+                        numerical_only=bool(cand.get("numerical_only", False)),
+                        hard_gate_override=bool(cand.get("hard_gate_override", False)),
+                    )
+                    if verdict.action != "ask_pi":
+                        continue
+                    decision = build_decision(
+                        verdict,
+                        project_id=row.project_id,
+                        question=cand.get("question", ""),
+                        options=options,
+                        category=cand.get("category", "other"),
+                        trigger=cand.get("trigger", ""),
+                        why_material=cand.get("why_material", ""),
+                        recommendation=cand.get("recommendation"),
+                        recommendation_basis=cand.get("recommendation_basis"),
+                        evidence_refs=cand.get("evidence_refs"),
+                        unresolved_uncertainty=cand.get("unresolved_uncertainty"),
+                        reversibility=cand.get("reversibility"),
+                    )
+                    repo.save(decision)
+                    opened += 1
+                    blocked_task_ids.update(verdict.blocking_scope)
+            # mark evaluated runs (so stale candidates are never re-scanned)
+            if evaluated:
+                from sqlalchemy import update as sa_update
+
+                session.execute(
+                    sa_update(RunRow)
+                    .where(RunRow.id.in_(evaluated))
+                    .values(metadata_json={"decisions_evaluated": True})
+                    .execution_options(synchronize_session=False)
+                )
+            # block the scope of OPEN decisions (only blocking_scope)
+            for d in repo.list_open(None):
+                if d.status.value == "OPEN":
+                    blocked_task_ids.update(d.blocking_scope)
+            # unblock tasks whose decisions were resolved
+            self._unblock_resolved(session, repo)
+            if blocked_task_ids:
+                from ..persistence.repositories import TaskRepo
+
+                # map task_id -> decision that blocks it (for unblocking later)
+                blockers: dict[str, str] = {}
+                for d in repo.list_all_statuses(None):
+                    if d.status.value == "OPEN":
+                        for t in d.blocking_scope:
+                            blockers[t] = d.decision_id
+                for task in TaskRepo(session).list_by_status(None, [TS.READY.value, TS.RUNNING.value]):
+                    if task.task_id in blocked_task_ids and task.status is TS.READY:
+                        if blockers.get(task.task_id) not in task.blocked_by:
+                            task.block(decision_id=blockers.get(task.task_id))
+                        TaskRepo(session).save(task)
+            session.commit()
+        return opened
+
+    def _unblock_resolved(self, session, repo) -> None:  # noqa: ANN001
+        """When a blocking decision is ANSWERED/APPLIED, remove it from the
+        blocked_by of paused tasks and requeue them (IMPLEMENTATION.md §8:
+        only blocking_scope pauses, and only while OPEN)."""
+        from ..domain.enums import TaskStatus as TS
+        from ..persistence.repositories import TaskRepo
+
+        resolved = [
+            d.decision_id
+            for d in repo.list_all_statuses(None)
+            if d.status.value in ("ANSWERED", "APPLIED", "CLOSED", "WITHDRAWN")
+        ]
+        if not resolved:
+            return
+        for task in TaskRepo(session).list_by_status(None, [TS.BLOCKED.value]):
+            remaining = [d for d in task.blocked_by if d not in resolved]
+            if len(remaining) != len(task.blocked_by):
+                task.blocked_by = remaining
+                if not task.blocked_by:
+                    task.requeue(reason="blocking decision resolved")
+                TaskRepo(session).save(task)
+
+    async def _report_projects(self) -> int:
+        """Emit reports for projects with reportable state (no diff -> no send)."""
+        from ..persistence.repositories import ProjectRepo
+        from ..reporting.reporter import schedule_report
+
+        emitted = 0
+        with self.session_factory() as session:
+            projects = ProjectRepo(session).list_all()
+        for project in projects:
+            if project.status.value != "ACTIVE":
+                continue
+            result = await schedule_report(self.session_factory, project_id=project.project_id)
+            if result.sent:
+                emitted += 1
+        return emitted
 
     async def _dispatch_ready(self) -> int:
         dispatched = 0
@@ -115,7 +279,11 @@ class SchedulerLoop:
                     break
                 if task.task_id in self.active:
                     continue
-                decision = task_dispatch_decision(task, open_decisions)
+                decision = task_dispatch_decision(
+                    task,
+                    open_decisions,
+                    blocked_task_ids=self._open_blocking_scope(session),
+                )
                 if decision.action != "dispatch":
                     continue
                 dispatcher = RunDispatcher(session, self.executor)
@@ -129,6 +297,17 @@ class SchedulerLoop:
                 dispatched += 1
                 slots -= 1
         return dispatched
+
+    def _open_blocking_scope(self, session) -> set:  # noqa: ANN001
+        """Union of blocking_scope across OPEN decisions (IMPLEMENTATION.md §8:
+        only blocking_scope pauses tasks)."""
+        from ..persistence.repositories import DecisionRepo
+
+        blocked: set = set()
+        for d in DecisionRepo(session).list_open(None):
+            if d.status.value == "OPEN":
+                blocked.update(d.blocking_scope)
+        return blocked
 
     def _resolve_profile(self, session, task) -> dict:  # noqa: ANN001
         """Resolve the executor profile for a task (IMPLEMENTATION.md §15.1):

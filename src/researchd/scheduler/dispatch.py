@@ -32,10 +32,16 @@ class DispatchDecision:
     reason: str = ""
 
 
-def task_dispatch_decision(task: Task, open_decision_ids: list[str]) -> DispatchDecision:
-    """Deterministic readiness: dependencies satisfied, no blocking decisions."""
+def task_dispatch_decision(task: Task, open_decision_ids: list[str], blocked_task_ids: set[str] | None = None) -> DispatchDecision:
+    """Deterministic readiness: dependencies satisfied, no blocking decisions.
+
+    `blocked_task_ids` is the union of blocking_scope of OPEN decisions — only
+    those tasks are paused (IMPLEMENTATION.md §8: only blocking_scope blocks).
+    """
     if task.status is not TaskStatus.READY:
         return DispatchDecision("skip", f"status {task.status.value}")
+    if blocked_task_ids and task.task_id in blocked_task_ids:
+        return DispatchDecision("blocked", "in blocking_scope of an OPEN decision")
     if task.blocked_by:
         blocking = [d for d in task.blocked_by if d in open_decision_ids]
         if blocking:

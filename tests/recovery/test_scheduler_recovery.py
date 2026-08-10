@@ -233,11 +233,10 @@ def test_outbox_crash_recovery_no_duplicate(env):
         row.next_attempt_at = None
         uow.commit()
     asyncio.run(loop.tick())
-    # fake port delivers a second time BUT the idempotency key is stable;
-    # the deduplication contract lives at the delivery port (Phase 6 enforces
-    # it against cc-connect); here we assert the sender re-sends the same key.
-    keys = [d["idempotency_key"] for d in port.deliveries]
-    assert keys.count("out-crash") == 2  # sender retries with the same key
+    # the port's idempotency contract returns the SAME message id for the same
+    # key: no second delivery is recorded, no duplicate message exists
+    assert len(port.deliveries) == 1
+    assert port.deliveries[0]["idempotency_key"] == "out-crash"
 
 
 def test_blocked_task_not_dispatched(env):

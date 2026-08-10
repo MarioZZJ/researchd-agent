@@ -68,9 +68,11 @@ class OutboxSender:
                             r2.mark_dead(row2.id, attempts=row2.attempts, error=str(exc)[:2000])
                             stats["dead"] += 1
                         else:
+                            # backoff atomically returns the row to PENDING
+                            # with the retry time (no separate release)
                             r2.backoff(row2.id, attempts=row2.attempts)
-                            r2.release(row2.id, attempts=row2.attempts)
                             stats["released"] += 1
+                        s2.commit()  # receipt must be durable
                         stats["failed"] += 1
                     continue
                 with self.session_factory() as s3:
@@ -82,5 +84,29 @@ class OutboxSender:
                     if not r3.mark_sent(row3.id, attempts=row3.attempts, delivery_id=delivery_id):
                         # row moved on (reclaimed) — delivery itself was idempotent
                         pass
+                    _write_back_delivery(s3, row3, delivery_id)
+                    s3.commit()  # receipt must be durable
                     stats["sent"] += 1
         return stats
+
+
+def _write_back_delivery(session, row, delivery_id: str) -> None:  # noqa: ANN001
+    """Persist the platform message id on the outbox payload AND on the Report
+    row so in-place updates (PATCH) have a handle (IMPLEMENTATION.md §21)."""
+    if not delivery_id:
+        return
+    payload = dict(row.payload_json or {})
+    payload["platform_message_id"] = delivery_id
+    row.payload_json = payload
+    report_id = payload.get("report_id")
+    if report_id:
+        from sqlalchemy import select, update
+
+        from ..persistence.models import ReportRow
+
+        session.execute(
+            update(ReportRow)
+            .where(ReportRow.report_id == report_id)
+            .values(platform_message_id=delivery_id, status="SENT")
+            .execution_options(synchronize_session=False)
+        )

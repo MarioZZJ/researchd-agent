@@ -15,3 +15,9 @@ def db_factory(tmp_path):
     factory = make_session_factory(engine)
     yield factory
     engine.dispose()
+
+
+@pytest.fixture()
+def factory(db_factory):
+    """Alias for db_factory (used by integration tests)."""
+    return db_factory

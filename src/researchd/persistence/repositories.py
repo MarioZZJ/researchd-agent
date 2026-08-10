@@ -556,6 +556,13 @@ class DecisionRepo(BaseRepo):
             stmt = stmt.where(DecisionRow.project_id == project_id)
         return [self._to_domain(r) for r in self.session.execute(stmt.order_by(DecisionRow.created_at)).scalars()]
 
+    def list_all_statuses(self, project_id: str | None = None) -> list:
+        """All decisions regardless of status (fingerprint dedup + unblocking)."""
+        stmt = select(DecisionRow)
+        if project_id:
+            stmt = stmt.where(DecisionRow.project_id == project_id)
+        return [self._to_domain(r) for r in self.session.execute(stmt.order_by(DecisionRow.created_at)).scalars()]
+
     def save(self, d) -> Decision:  # noqa: ANN001
         """Save decision + replace its options in the same transaction."""
         result = super().save(d)

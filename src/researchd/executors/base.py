@@ -94,6 +94,10 @@ class DecisionCandidate(BaseModel):
     reversibility: str | None = None
     blocking_scope: list[str] = Field(default_factory=list)
     continue_scope: list[str] = Field(default_factory=list)
+    has_option_conflict: bool = True
+    cheap_parallel: bool = False
+    numerical_only: bool = False
+    hard_gate_override: bool = False  # external release / forced PI gate
 
 
 class NextTaskProposal(BaseModel):

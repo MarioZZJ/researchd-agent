@@ -142,6 +142,10 @@ class FakeDeliveryPort:
     Mirrors the cc-connect Delivery API surface (IMPLEMENTATION.md §19.2):
     deliver(kind, payload, attachments, idempotency_key) -> platform_message_id
     update(platform_message_id, payload)
+
+    Idempotency contract: the same idempotency_key is delivered exactly once
+    (the key -> message id mapping is cached), so outbox replays after a crash
+    never double-deliver.
     """
 
     def __init__(self):
@@ -150,16 +154,25 @@ class FakeDeliveryPort:
         self.fail_next: int = 0
         self.crash_after_commit: bool = False
         self.delivery_id_counter: int = 1000
+        self._by_key: dict[str, str] = {}
 
     async def deliver(self, *, idempotency_key: str, kind: str, payload: dict, attachments: list | None = None, project_id: str | None = None) -> str:
+        if idempotency_key in self._by_key:
+            # replay: same key -> same platform message id, no new message
+            return self._by_key[idempotency_key]
         if self.fail_next > 0:
             self.fail_next -= 1
             raise RuntimeError("fake delivery failure")
         if self.crash_after_commit:
-            # simulate: DB committed, message "sent" but receipt never written
+            # simulate: message "sent" but the receipt never reaches the sender
+            # (recorded BEFORE raising so a replay returns the same id)
+            self.delivery_id_counter += 1
+            msg_id = f"MSG-{self.delivery_id_counter}"
+            self._by_key[idempotency_key] = msg_id
             raise RuntimeError("fake crash after send, receipt lost")
         self.delivery_id_counter += 1
         msg_id = f"MSG-{self.delivery_id_counter}"
+        self._by_key[idempotency_key] = msg_id
         self.deliveries.append(
             {
                 "idempotency_key": idempotency_key,

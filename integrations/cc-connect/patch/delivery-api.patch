@@ -1,0 +1,373 @@
+diff --git a/core/engine.go b/core/engine.go
+index 79e2892..195188c 100644
+--- a/core/engine.go
++++ b/core/engine.go
+@@ -10629,6 +10629,46 @@ func (e *Engine) tryProviderAddPreset(p Platform, msg *Message, switcher Provide
+ 
+ // SendToSession sends a message to an active session from an external caller (API/CLI).
+ // If sessionKey is empty, it picks the first active session.
++// SendToSessionWithHandle sends a message and returns the platform message id
++// (used by the Delivery API so callers can update the same message in place).
++func (e *Engine) SendToSessionWithHandle(sessionKey, message string) (string, error) {
++	state, p, replyCtx, err := e.resolveOutboundSessionTarget(sessionKey, false)
++	if err != nil {
++		return "", err
++	}
++	sender, ok := p.(MessageHandleSender)
++	if !ok {
++		return "", fmt.Errorf("platform %s: %w", p.Name(), ErrNotSupported)
++	}
++	if err := e.waitOutgoing(p); err != nil {
++		return "", err
++	}
++	handle, err := sender.SendHandle(e.ctx, replyCtx, message)
++	if err != nil {
++		return "", err
++	}
++	if state != nil {
++		state.mu.Lock()
++		state.sideText = strings.TrimSpace(message)
++		state.mu.Unlock()
++	}
++	return handle, nil
++}
++
++// UpdateMessageByIDInSession updates an already-sent message using its
++// platform message id (Delivery API PATCH path).
++func (e *Engine) UpdateMessageByIDInSession(sessionKey, messageID, content string) error {
++	_, p, _, err := e.resolveOutboundSessionTarget(sessionKey, false)
++	if err != nil {
++		return err
++	}
++	updater, ok := p.(MessageUpdaterByID)
++	if !ok {
++		return fmt.Errorf("platform %s: %w", p.Name(), ErrNotSupported)
++	}
++	return updater.UpdateMessageByID(e.ctx, messageID, content)
++}
++
+ func (e *Engine) SendToSession(sessionKey, message string) error {
+ 	return e.SendToSessionWithAttachments(sessionKey, message, nil, nil, nil, false)
+ }
+diff --git a/core/interfaces.go b/core/interfaces.go
+index e92182a..20556f8 100644
+--- a/core/interfaces.go
++++ b/core/interfaces.go
+@@ -704,3 +704,16 @@ const (
+ type PreviewStatusUpdater interface {
+ 	SetPreviewStatus(previewHandle any, status CardStatus)
+ }
++
++// MessageHandleSender is an optional interface for platforms that can send a
++// message and return its platform message id (needed by the Delivery API so
++// the sender can later update the same message in place).
++type MessageHandleSender interface {
++	SendHandle(ctx context.Context, rctx any, content string) (string, error)
++}
++
++// MessageUpdaterByID is an optional interface for platforms that can update an
++// already-sent message using only its platform message id.
++type MessageUpdaterByID interface {
++	UpdateMessageByID(ctx context.Context, messageID, content string) error
++}
+diff --git a/core/management.go b/core/management.go
+index 70bab96..17df6e3 100644
+--- a/core/management.go
++++ b/core/management.go
+@@ -10,6 +10,7 @@ import (
+ 	"log/slog"
+ 	"net/http"
+ 	"os"
++	"path/filepath"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+@@ -619,6 +620,8 @@ func (m *ManagementServer) handleProjectRoutes(w http.ResponseWriter, r *http.Re
+ 		m.handleProjectSessions(w, r, projName, engine, rest)
+ 	case "send":
+ 		m.handleProjectSend(w, r, engine)
++	case "deliveries":
++		m.handleProjectDeliveries(w, r, engine, rest)
+ 	case "providers":
+ 		m.handleProjectProviders(w, r, engine, rest)
+ 	case "provider-refs":
+@@ -1136,6 +1139,113 @@ func (m *ManagementServer) handleProjectSend(w http.ResponseWriter, r *http.Requ
+ 	mgmtOK(w, "message sent")
+ }
+ 
++func (m *ManagementServer) handleProjectDeliveries(w http.ResponseWriter, r *http.Request, e *Engine, rest string) {
++	// POST /deliveries                      -> create (returns platform_message_id)
++	// PATCH /deliveries/{platform_message_id} -> update in place
++	parts := strings.SplitN(rest, "/", 2)
++	deliveryID := ""
++	if len(parts) > 0 {
++		deliveryID = parts[0]
++	}
++
++	if r.Method == http.MethodPost {
++		if deliveryID != "" {
++			mgmtError(w, http.StatusBadRequest, "POST /deliveries takes no id path")
++			return
++		}
++		var body struct {
++			SessionKey string `json:"session_key"`
++			Message    string `json:"message"`
++			IdempotencyKey string `json:"idempotency_key"`
++		}
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++			mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
++			return
++		}
++		if body.Message == "" {
++			mgmtError(w, http.StatusBadRequest, "message is required")
++			return
++		}
++		// idempotency: the same idempotency_key always returns the same
++		// platform_message_id (persisted across restarts). The whole
++		// load->send->save sequence is serialized per process; concurrent
++		// requests for the same key cannot double-deliver.
++		if body.IdempotencyKey != "" {
++			deliveryMu.Lock()
++			defer deliveryMu.Unlock()
++			if existing, ok := loadDelivery(body.IdempotencyKey); ok {
++				if existing == deliveryInFlight {
++					// write-ahead reservation: a previous attempt is still
++					// completing (or crashed mid-send) — retry later; the key
++					// will resolve to the final id once the send completes.
++					mgmtError(w, http.StatusConflict, "delivery in progress for idempotency key")
++					return
++				}
++				mgmtJSON(w, http.StatusOK, map[string]any{
++					"platform_message_id": existing,
++					"idempotency_key":     body.IdempotencyKey,
++					"replayed":            true,
++				})
++				return
++			}
++			// write-ahead: reserve the key BEFORE sending so a crash between
++			// send and persist can never double-deliver the same key
++			if err := saveDelivery(body.IdempotencyKey, deliveryInFlight); err != nil {
++				mgmtError(w, http.StatusInternalServerError, "reserve delivery: "+err.Error())
++				return
++			}
++		}
++		handle, err := e.SendToSessionWithHandle(body.SessionKey, body.Message)
++		if err != nil {
++			// unreserve so the key can be retried
++			if body.IdempotencyKey != "" {
++				_ = deleteDelivery(body.IdempotencyKey)
++			}
++			mgmtError(w, http.StatusInternalServerError, err.Error())
++			return
++		}
++		if body.IdempotencyKey != "" {
++			if err := saveDelivery(body.IdempotencyKey, handle); err != nil {
++				mgmtError(w, http.StatusInternalServerError, "persist delivery: "+err.Error())
++				return
++			}
++		}
++		mgmtJSON(w, http.StatusOK, map[string]any{
++			"platform_message_id": handle,
++			"idempotency_key":     body.IdempotencyKey,
++			"replayed":            false,
++		})
++		return
++	}
++
++	if r.Method == http.MethodPatch {
++		if deliveryID == "" {
++			mgmtError(w, http.StatusBadRequest, "PATCH /deliveries/{platform_message_id} requires an id")
++			return
++		}
++		var body struct {
++			SessionKey string `json:"session_key"`
++			Message    string `json:"message"`
++		}
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++			mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
++			return
++		}
++		if body.Message == "" {
++			mgmtError(w, http.StatusBadRequest, "message is required")
++			return
++		}
++		if err := e.UpdateMessageByIDInSession(body.SessionKey, deliveryID, body.Message); err != nil {
++			mgmtError(w, http.StatusInternalServerError, err.Error())
++			return
++		}
++		mgmtOK(w, "message updated")
++		return
++	}
++
++	mgmtError(w, http.StatusMethodNotAllowed, "POST or PATCH only")
++}
++
+ // ── Provider endpoints ────────────────────────────────────────
+ 
+ func (m *ManagementServer) handleProjectProviders(w http.ResponseWriter, r *http.Request, e *Engine, rest string) {
+@@ -1994,3 +2104,75 @@ func (m *ManagementServer) handleSkillPresets(w http.ResponseWriter, r *http.Req
+ 	}
+ 	mgmtJSON(w, http.StatusOK, data)
+ }
++
++
++// deliveryMu serializes load->send->save for the same idempotency key
++// (single-process; cross-process coordination is out of scope for the patch).
++var deliveryMu sync.Mutex
++
++// deliveriesFile is the persisted idempotency map (key -> platform message id).
++var deliveriesFile = filepath.Join(os.Getenv("HOME"), ".cc-connect", "deliveries.json")
++
++type deliveriesStore struct {
++	Entries map[string]string `json:"entries"`
++}
++
++// deliveryInFlight is the write-ahead reservation value stored before the
++// message is sent; it resolves to the final id once the send completes.
++const deliveryInFlight = "__in_flight__"
++
++func deleteDelivery(key string) error {
++	store := deliveriesStore{Entries: map[string]string{}}
++	if data, err := os.ReadFile(deliveriesFile); err == nil {
++		_ = json.Unmarshal(data, &store)
++	}
++	delete(store.Entries, key)
++	raw, err := json.Marshal(store)
++	if err != nil {
++		return err
++	}
++	if err := os.MkdirAll(filepath.Dir(deliveriesFile), 0o700); err != nil {
++		return err
++	}
++	tmp := deliveriesFile + ".tmp"
++	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
++		return err
++	}
++	return os.Rename(tmp, deliveriesFile)
++}
++
++func loadDelivery(key string) (string, bool) {
++	data, err := os.ReadFile(deliveriesFile)
++	if err != nil {
++		return "", false
++	}
++	var store deliveriesStore
++	if err := json.Unmarshal(data, &store); err != nil {
++		return "", false
++	}
++	id, ok := store.Entries[key]
++	return id, ok
++}
++
++func saveDelivery(key, messageID string) error {
++	store := deliveriesStore{Entries: map[string]string{}}
++	if data, err := os.ReadFile(deliveriesFile); err == nil {
++		_ = json.Unmarshal(data, &store)
++	}
++	if store.Entries == nil {
++		store.Entries = map[string]string{}
++	}
++	store.Entries[key] = messageID
++	raw, err := json.Marshal(store)
++	if err != nil {
++		return err
++	}
++	if err := os.MkdirAll(filepath.Dir(deliveriesFile), 0o700); err != nil {
++		return err
++	}
++	tmp := deliveriesFile + ".tmp"
++	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
++		return err
++	}
++	return os.Rename(tmp, deliveriesFile)
++}
+diff --git a/platform/feishu/feishu.go b/platform/feishu/feishu.go
+index bafedee..a9a2f35 100644
+--- a/platform/feishu/feishu.go
++++ b/platform/feishu/feishu.go
+@@ -2627,6 +2627,21 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
+ 	return p.sendNewMessageToChat(ctx, rc, msgType, msgBody)
+ }
+ 
++// SendHandle implements core.MessageHandleSender: send a message and return
++// its platform message id so the caller can update it in place.
++func (p *Platform) SendHandle(ctx context.Context, rctx any, content string) (string, error) {
++	rc, ok := rctx.(replyContext)
++	if !ok {
++		return "", fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
++	}
++	// Always create a NEW message: the Delivery API must return a real
++	// platform message id so the sender can update it in place (the reply
++	// path cannot produce one).
++	content = p.resolveMentionsInContent(ctx, rc.chatID, content)
++	msgType, msgBody := buildReplyContent(content)
++	return p.createMessageHandle(ctx, rc.chatID, msgType, msgBody, "send")
++}
++
+ // SendWithStatusFooter implements core.StatusFooterSender: send a reply with
+ // the body content followed by a small/dim status-footer block. Always uses
+ // the interactive card path so the footer can render with text_size:
+@@ -3388,6 +3403,37 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
+ 	})
+ }
+ 
++func (p *Platform) createMessageHandle(ctx context.Context, chatID, msgType, content, op string) (string, error) {
++	req := larkim.NewCreateMessageReqBuilder().
++		ReceiveIdType(larkim.ReceiveIdTypeChatId).
++		Body(larkim.NewCreateMessageReqBodyBuilder().
++			ReceiveId(chatID).
++			MsgType(msgType).
++			Content(content).
++			Build()).
++		Build()
++	var messageID string
++	err := p.withTransientRetry(ctx, op, func() error {
++		return p.withFreshTenantAccessTokenRetry(ctx, op, func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
++			resp, err := client.Im.Message.Create(ctx, req, options...)
++			if err != nil {
++				return fmt.Errorf("%s: %s api call: %w", p.tag(), op, err)
++			}
++			if !resp.Success() {
++				return fmt.Errorf("%s: %s failed code=%d msg=%s", p.tag(), op, resp.Code, resp.Msg)
++			}
++			if resp.Data != nil && resp.Data.MessageId != nil {
++				messageID = *resp.Data.MessageId
++			}
++			return nil
++		})
++	})
++	if err != nil {
++		return "", err
++	}
++	return messageID, nil
++}
++
+ func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, op string) error {
+ 	req := larkim.NewCreateMessageReqBuilder().
+ 		ReceiveIdType(larkim.ReceiveIdTypeChatId).
+@@ -4405,6 +4451,25 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
+ 	return p.patchCardMessage(ctx, h.messageID, cardJSON)
+ }
+ 
++// UpdateMessageByID implements core.MessageUpdaterByID: update an existing
++// message using only its platform message id (Delivery API PATCH path).
++func (p *Platform) UpdateMessageByID(ctx context.Context, messageID, content string) error {
++	if !p.useInteractiveCard {
++		return core.ErrNotSupported
++	}
++	cardJSON := ""
++	if isCardJSON(content) {
++		cardJSON = content
++	} else {
++		processed := content
++		if containsMarkdown(content) {
++			processed = preprocessFeishuMarkdown(content)
++		}
++		cardJSON = buildCardJSON(sanitizeMarkdownURLs(processed))
++	}
++	return p.patchCardMessage(ctx, messageID, cardJSON)
++}
++
+ // UpdateMessageWithStatusFooter implements core.StatusFooterUpdater: edit an
+ // existing card to render the body markdown plus a small/dim status-footer
+ // block (Lark `text_size: "notation"`). Falls through to UpdateMessage when

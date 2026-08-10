@@ -141,7 +141,11 @@
         "unresolved_uncertainty": { "type": ["string", "null"] },
         "reversibility": { "type": ["string", "null"] },
         "blocking_scope": { "type": "array", "items": { "type": "string" } },
-        "continue_scope": { "type": "array", "items": { "type": "string" } }
+        "continue_scope": { "type": "array", "items": { "type": "string" } },
+        "has_option_conflict": { "type": "boolean", "default": true },
+        "hard_gate_override": { "type": "boolean", "default": false },
+        "cheap_parallel": { "type": "boolean", "default": false },
+        "numerical_only": { "type": "boolean", "default": false }
       }
     }
   }

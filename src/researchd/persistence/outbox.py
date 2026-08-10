@@ -125,7 +125,8 @@ class OutboxRepo:
         )
 
     def mark_sent(self, row_id: str, *, attempts: int, delivery_id: str | None = None) -> bool:
-        """Mark SENT; only valid for the current claimant's in-flight row."""
+        """Mark SENT; only valid for the current claimant's in-flight row.
+        delivery_id is persisted by the sender (write-back), not here."""
         result = self.session.execute(
             update(OutboxRow)
             .where(
@@ -153,8 +154,10 @@ class OutboxRepo:
         return result.rowcount == 1
 
     def backoff(self, row_id: str, *, attempts: int) -> bool:
-        """Exponential backoff on the current claimant's row; returns False if the
-        row moved on (reclaimed/SENT/DEAD) meanwhile."""
+        """Failed delivery: ATOMICALLY return the in-flight row to PENDING with
+        an exponential retry time (single UPDATE: no window where a concurrent
+        sender could re-claim, and no separate release that would wipe the
+        retry time). Returns False if the row moved on meanwhile."""
         delay = next_backoff_delay(attempts)
         result = self.session.execute(
             update(OutboxRow)
@@ -163,7 +166,7 @@ class OutboxRepo:
                 OutboxRow.status == OutboxStatus.IN_FLIGHT.value,
                 OutboxRow.attempts == attempts,
             )
-            .values(next_attempt_at=utcnow() + delay)
+            .values(status=OutboxStatus.PENDING.value, next_attempt_at=utcnow() + delay)
             .execution_options(synchronize_session=False)
         )
         return result.rowcount == 1
