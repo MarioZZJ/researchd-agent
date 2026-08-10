@@ -7,7 +7,7 @@
 | # | 判据 | 状态 | 证据 / 备注 |
 |---|---|---|---|
 | 1 | 空库可执行全部 Alembic migration | DONE | `RESEARCHD_DB=/tmp/mig-check/fresh.db uv run alembic upgrade head` 成功；autogenerate 一致性检查零 diff（26 表） |
-| 2 | 单元、集成、conformance、recovery、e2e 测试通过 | PARTIAL | 111 passed + 2 门控跳过（Phase 1–6）；e2e 待做 |
+| 2 | 单元、集成、conformance、recovery、e2e 测试通过 | PARTIAL | 126 passed + 2 门控跳过（Phase 1–7）；e2e 待做 |
 | 3 | Reasonix Adapter 真实 capability tests 通过 | PARTIAL | 真实握手（native 二进制+最小 overlay）initialize/session/new 通过；付费 prompt conformance GATED（B-03） |
 | 4 | Codex Adapter 真实验证或明确 BLOCKED | PARTIAL | 非付费握手（CODEX_HOME 隔离）通过；付费 turn conformance BLOCKED（B-02） |
 | 5 | interaction model 和 project role profiles 可配置 | PENDING | Phase 2 |
@@ -33,8 +33,8 @@
 | 3 | 调度、租约、锁、恢复 | DONE | `40ffa7f` |
 | 4 | Reasonix ACP Adapter | DONE | `1f91623` |
 | 5 | Codex App Server Adapter | DONE | `b36c956` |
-| 6 | Decision Gate、Reporter、DeliveryPort | IN_PROGRESS | 待提交 |
-| 7 | 飞书文档投影 | PENDING | — |
+| 6 | Decision Gate、Reporter、DeliveryPort | DONE | `8152eb5` |
+| 7 | 飞书文档投影 | DONE | 待提交 |
 | 8 | 黄金路径与 Pilot | PENDING | — |
 | 9 | 部署、备份、运维 | PENDING | — |
 | 10 | 最终审查与收尾 | PENDING | — |
