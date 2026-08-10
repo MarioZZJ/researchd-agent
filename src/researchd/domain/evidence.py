@@ -123,7 +123,7 @@ class Evidence(DomainModel):
             return bool(self.created_by and self.created_by != "system")
         return bool(self.statement.strip() and (self.task_id or self.run_id))
 
-    def verify(self) -> EvidenceStatus:
+    def verify(self) -> "Evidence":
         if not self.provenance_ok():
             raise ValueError(
                 f"evidence {self.evidence_id} cannot be VERIFIED: missing provenance "
@@ -135,7 +135,7 @@ class Evidence(DomainModel):
             raise InvalidTransition("evidence", self.status, EvidenceStatus.VERIFIED)
         self.status = EvidenceStatus.VERIFIED
         self.updated_at = utcnow()
-        return self.status
+        return self
 
     def transition(self, target: EvidenceStatus | str) -> EvidenceStatus:
         target = EvidenceStatus(target) if isinstance(target, str) else target

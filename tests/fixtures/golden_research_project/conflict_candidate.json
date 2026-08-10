@@ -1,0 +1,31 @@
+{
+  "question": "两套分析方法对跨学科份额变化给出相反结论，如何处理？",
+  "trigger": "T-002 与 T-001 结论冲突",
+  "why_material": "结论影响核心研究问题",
+  "category": "narrative",
+  "unresolved_uncertainty": "两套分析对同一数据给出相反结论，机制解释尚无定论",
+  "options": [
+    {
+      "option_id": "A",
+      "label": "采用描述性定位",
+      "scientific_consequence": "结论范围收窄，不做因果断言"
+    },
+    {
+      "option_id": "B",
+      "label": "保留因果解释",
+      "scientific_consequence": "需要更强的识别策略与稳健性检验"
+    }
+  ],
+  "recommendation": "A",
+  "recommendation_basis": "数据仅覆盖两个时间窗，不足以支持因果识别",
+  "evidence_refs": [
+    "E-1",
+    "E-2"
+  ],
+  "blocking_scope": [
+    "T-004",
+    "T-005"
+  ],
+  "has_option_conflict": true,
+  "cheap_parallel": true
+}

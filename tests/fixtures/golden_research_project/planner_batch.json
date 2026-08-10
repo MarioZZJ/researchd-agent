@@ -1,0 +1,62 @@
+{
+  "schema": "researchd.planner_result.v1",
+  "proposed_tasks": [
+    {
+      "task_id": "T-001",
+      "role": "worker",
+      "objective": "概念与指标边界",
+      "success_criteria": [
+        {
+          "id": "sc1",
+          "text": "定义明确"
+        }
+      ]
+    },
+    {
+      "task_id": "T-002",
+      "role": "worker",
+      "objective": "相关文献和争议",
+      "success_criteria": [
+        {
+          "id": "sc1",
+          "text": "争议清单"
+        }
+      ]
+    },
+    {
+      "task_id": "T-003",
+      "role": "worker",
+      "objective": "候选数据源与引用覆盖审计",
+      "success_criteria": [
+        {
+          "id": "sc1",
+          "text": "数据源清单"
+        }
+      ]
+    },
+    {
+      "task_id": "T-004",
+      "role": "worker",
+      "objective": "field/subfield 分类比较",
+      "success_criteria": [
+        {
+          "id": "sc1",
+          "text": "分类表"
+        }
+      ]
+    },
+    {
+      "task_id": "T-005",
+      "role": "worker",
+      "objective": "最小年度趋势样本",
+      "success_criteria": [
+        {
+          "id": "sc1",
+          "text": "趋势样本"
+        }
+      ]
+    }
+  ],
+  "risks": [],
+  "plan_revisions": []
+}

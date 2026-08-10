@@ -32,6 +32,7 @@ HEARTBEAT_SECONDS = 10.0
 ROLE_TO_PROFILE = {
     "planner": "planner",
     "interaction": "worker",
+    "worker": "worker",
     "worker_default": "worker",
     "literature_worker": "literature",
     "analysis_worker": "worker",
@@ -88,13 +89,22 @@ class SchedulerLoop:
 
     # ------------------------------------------------------------ tick
     async def tick(self) -> dict:
-        stats: dict = {"orphans": 0, "dispatched": 0, "heartbeats": 0, "outbox": {}, "decisions": 0, "reports": 0, "projection": 0}
+        stats: dict = {"orphans": 0, "dispatched": 0, "heartbeats": 0, "outbox": {}, "decisions": 0, "reports": 0, "projection": 0, "diagnostics": 0, "planned": 0, "milestones": 0}
         # 1. recovery: any stale run (restart/crash) -> ORPHANED, task -> READY
         with self.session_factory() as session:
             stats["orphans"] = len(reconcile_orphans(session))
             session.commit()
         # 2. decision gate: evaluate pending candidates -> OPEN decisions
+        #    (cheap-parallel conflict candidates are deferred to diagnostics)
         stats["decisions"] = await self._evaluate_decision_candidates()
+        # 2b. cheap diagnostics: queue diagnostic tasks for cheap conflicts
+        from ..scheduler.extensions import check_milestones, ensure_cheap_diagnostics, plan_projects
+
+        stats["diagnostics"] = ensure_cheap_diagnostics(self.session_factory)
+        # 2c. planning: first task batch for task-less ACTIVE projects
+        stats["planned"] = await plan_projects(self.session_factory, self.executor)
+        # 2d. milestones: verified-evidence threshold reached -> one report
+        stats["milestones"] = check_milestones(self.session_factory)
         # 3. reporting: emit queued reports for active projects
         stats["reports"] = await self._report_projects()
         # 4. project document projection (incremental, PI Notes protected)
@@ -103,6 +113,9 @@ class SchedulerLoop:
         stats["outbox"] = await self.sender.send_pending()
         # 6. dispatch ready tasks (bounded by max_parallel)
         stats["dispatched"] = await self._dispatch_ready()
+        # yield once so freshly created run tasks can make progress even when
+        # ticks are driven back-to-back (production also sleeps between ticks)
+        await asyncio.sleep(0)
         # 7. heartbeats for active runs
         stats["heartbeats"] = await self._heartbeat_active()
         return stats
@@ -113,7 +126,7 @@ class SchedulerLoop:
         from ..application.decision_gate import DecisionGate, build_decision
         from ..domain.decision import DecisionOption
         from ..domain.enums import TaskStatus as TS
-        from ..persistence.repositories import DecisionRepo, RunRepo
+        from ..persistence.repositories import DecisionRepo, RunRepo, TaskRepo
 
         opened = 0
         with self.session_factory() as session:
@@ -142,8 +155,8 @@ class SchedulerLoop:
             for row in rows:
                 if (row.metadata_json or {}).get("decisions_evaluated"):
                     continue
-                evaluated.append(row.id)
                 result = row.result_json or {}
+                deferred = False  # cheap-parallel candidate waiting for a diagnostic
                 for cand in result.get("decision_candidates", []):
                     options = [
                         DecisionOption(
@@ -156,8 +169,20 @@ class SchedulerLoop:
                     has_conflict = cand.get("has_option_conflict", True)
                     cheap = cand.get("cheap_parallel", False)
                     numerical = cand.get("numerical_only", False)
-                    if cheap and has_conflict:
-                        has_conflict = False  # cheap parallel options do not fork
+                    # cheap parallel candidates do not fork: the first time we
+                    # see one, a diagnostic task is queued (ensure_cheap_diagnostics)
+                    # and this candidate is NOT evaluated yet; the diagnostic
+                    # run's own result is evaluated normally below
+                    from ..scheduler.extensions import CHEAP_DIAGNOSTIC_MARKER
+
+                    task = TaskRepo(session).get_by_task_id(row.task_id)
+                    from_diagnostic = bool(
+                        task is not None
+                        and (task.contract.why_now or "").startswith(CHEAP_DIAGNOSTIC_MARKER)
+                    )
+                    if cheap and has_conflict and not from_diagnostic:
+                        deferred = True
+                        continue  # diagnostic queued separately; evaluate later
                     verdict = gate.evaluate(
                         project_id=row.project_id,
                         category=cand.get("category", "other"),
@@ -196,6 +221,10 @@ class SchedulerLoop:
                     repo.save(decision)
                     opened += 1
                     blocked_task_ids.update(verdict.blocking_scope)
+                if not deferred:
+                    # fully evaluated (no cheap-parallel candidate pending a
+                    # diagnostic): mark so stale candidates are never re-scanned
+                    evaluated.append(row.id)
             # mark evaluated runs (so stale candidates are never re-scanned)
             if evaluated:
                 from sqlalchemy import update as sa_update
@@ -315,6 +344,16 @@ class SchedulerLoop:
         dispatched = 0
         with self.session_factory() as session:
             tasks = TaskRepo(session).list_by_status(None, [TaskStatus.READY.value])
+            # cheap-diagnostic tasks are gate dependencies: dispatch them
+            # FIRST so the gate is unblocked as soon as possible
+            from ..scheduler.extensions import CHEAP_DIAGNOSTIC_MARKER
+
+            tasks.sort(
+                key=lambda t: (
+                    0 if (t.contract.why_now or "").startswith(CHEAP_DIAGNOSTIC_MARKER) else 1,
+                    t.created_at,
+                )
+            )
             open_decisions = []
             if tasks:
                 from ..persistence.repositories import DecisionRepo

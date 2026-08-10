@@ -1,0 +1,17 @@
+{
+  "schema": "researchd.work_result.v1",
+  "task_id": "T-XXX",
+  "outcome": "SUBMIT_FOR_REVIEW",
+  "criteria_results": [
+    {
+      "criterion_id": "sc1",
+      "status": "PASS"
+    }
+  ],
+  "artifacts": [],
+  "evidence_candidates": [],
+  "claim_changes": [],
+  "issues": [],
+  "decision_candidates": [],
+  "next_task_proposals": []
+}

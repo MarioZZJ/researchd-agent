@@ -27,7 +27,9 @@ RoleKind = str  # "planner" | "worker" | "auditor"
 
 
 class ScriptStep:
-    """One scripted behavior for a (role, call_index) pair."""
+    """One scripted behavior for a (role, task_id, call_index) triple.
+    task_id None matches any task; otherwise the step is only used for the
+    matching task (deterministic per-task scripts)."""
 
     def __init__(
         self,
@@ -36,11 +38,13 @@ class ScriptStep:
         payload: dict | None = None,
         error: str | None = None,
         delay: float = 0.0,
+        task_id: str | None = None,
     ):
         self.action = action
         self.payload = payload or {}
         self.error = error
         self.delay = delay
+        self.task_id = task_id
 
 
 class FakeExecutor(ExecutorAdapter):
@@ -71,14 +75,27 @@ class FakeExecutor(ExecutorAdapter):
             step = ScriptStep(**step)
         self._scripts.setdefault(role, []).append(step)
 
-    def _next(self, role: RoleKind) -> ScriptStep | None:
+    def _next(self, role: RoleKind, task_id: str | None = None) -> ScriptStep | None:
+        """Next unused step for this role: prefer a step bound to task_id,
+        else the next unbound step. Each call bumps the per-role call count
+        (used for stable session/turn ids)."""
+        self._calls[role] = self._calls.get(role, 0) + 1
         steps = self._scripts.get(role, [])
-        idx = self._calls.get(role, 0)
-        self._calls[role] = idx + 1
-        return steps[idx] if idx < len(steps) else None
+        if task_id is not None:
+            for i, step in enumerate(steps):
+                if step.task_id == task_id and not getattr(step, "_used", False):
+                    step._used = True
+                    return step
+        for i, step in enumerate(steps):
+            if step.task_id is None and not getattr(step, "_used", False):
+                step._used = True
+                return step
+        return None
 
     async def _run(self, role: RoleKind, context: dict, payload_default: dict) -> tuple[Any, ExecutorSessionInfo]:
-        step = self._next(role)
+        """Scripted execution with a structured-output repair loop: a schema
+        validation failure is retried with the next scripted step (mimics the
+        reasonix adapter's repair loop) before surfacing as a failure."""
         session = ExecutorSessionInfo(
             executor="fake",
             process_instance_id=f"fake-{role}-{self._calls.get(role, 0)}",
@@ -86,21 +103,54 @@ class FakeExecutor(ExecutorAdapter):
             turn_id=f"TURN-{role}-{self._calls.get(role, 0)}",
         )
         self.sessions.append(session)
-        if step is None:
-            step = ScriptStep(payload=payload_default)
-        if step.delay:
-            await asyncio.sleep(step.delay)
-        if step.action == "raise":
-            raise RuntimeError(step.error or f"fake {role} failure")
-        if step.action == "hang":
-            await asyncio.sleep(3600)
-        raw = dict(step.payload)
-        self.raw_outputs.append({"role": role, "raw": raw})
-        if role == "planner":
-            return validate_planner_result(raw), session
-        if role == "worker":
-            return validate_work_result(raw), session
-        return validate_audit_result(raw), session
+
+        def _take_step(*, allow_default: bool) -> ScriptStep | None:
+            task_id = (context.get("task") or {}).get("task_id")
+            step = self._next(role, task_id=task_id)
+            if step is not None:
+                return step
+            # only the FIRST attempt may fall back to the default payload
+            # (unscripted executor); a repair retry with no scripted step
+            # must surface the original validation failure instead of
+            # silently substituting a synthetic result
+            return ScriptStep(payload=payload_default) if allow_default else None
+
+        def _validate(raw: dict):
+            if role == "planner":
+                return validate_planner_result(raw)
+            if role == "worker":
+                return validate_work_result(raw)
+            return validate_audit_result(raw)
+
+        first = True
+        first_error: Exception | None = None
+        for attempt in range(4):
+            step = _take_step(allow_default=first)
+            first = False
+            if step is None:
+                # repair retry with no scripted step: surface the ORIGINAL
+                # validation failure (never a synthetic substitute)
+                if first_error is not None:
+                    raise first_error
+                raise RuntimeError(f"fake {role} repair loop exhausted (no scripted step)")
+            if step.delay:
+                await asyncio.sleep(step.delay)
+            if step.action == "raise":
+                raise RuntimeError(step.error or f"fake {role} failure")
+            if step.action == "hang":
+                await asyncio.sleep(3600)
+            raw = dict(step.payload)
+            self.raw_outputs.append({"role": role, "raw": raw})
+            try:
+                return _validate(raw), session
+            except Exception as exc:
+                first_error = first_error or exc
+                if attempt >= 3:
+                    raise  # repair loop exhausted -> real failure
+                # repair: retry with the next scripted step
+        if first_error is not None:
+            raise first_error
+        raise RuntimeError(f"fake {role} repair loop exhausted")
 
     async def run_planner(self, context: dict, *, profile: dict) -> tuple[PlannerResult, ExecutorSessionInfo]:
         default = {

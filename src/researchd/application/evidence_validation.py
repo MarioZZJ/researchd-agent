@@ -74,7 +74,8 @@ def verify_evidence(session: Session, evidence: Evidence) -> Evidence:
                 f"evidence {evidence.evidence_id}: snapshot artifact belongs to project "
                 f"{snap.project_id}, not {evidence.project_id}"
             )
-    return evidence.verify()
+    evidence.verify()
+    return evidence
 
 
 def register_artifact(

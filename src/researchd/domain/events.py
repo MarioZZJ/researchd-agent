@@ -76,11 +76,14 @@ EVENT_TYPES = {
     "inbound.message_duplicate",
     "projection.updated",
     "projection.human_patch",
+    "planner.ran",
     "plan_revision.proposed",
     "plan_revision.applied",
     "taste_rule.proposed",
     "taste_rule.applied",
     "milestone.reached",
+    "result.applied",
+    "diagnostic.giveup",
 }
 
 

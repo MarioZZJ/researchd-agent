@@ -112,6 +112,10 @@ class RunDispatcher:
         else:  # FAILED
             task.fail("worker reported FAILED")
         TaskRepo(self.session).save(task)
+        # persist the worker's structured findings in the SAME transaction
+        from ..application.apply_result import apply_work_result
+
+        apply_work_result(self.session, run, result)
         self._emit("run.succeeded", run, {"task_id": task.task_id, "outcome": result.outcome.value})
         self._emit(
             "task.review_submitted" if result.outcome is WorkOutcome.SUBMIT_FOR_REVIEW else "task.failed",
