@@ -4,7 +4,7 @@ Local conformance pins the exact lark-oapi interaction contract with a fake
 client (block lifecycle, marker parsing, pagination, transient retry). The
 REAL conformance test (block-level incremental sync, human-edit detection,
 PI Notes protection, revision conflict) is gated behind
-RESEARCHD_LARK_APP_ID / RESEARCHD_LARK_APP_SECRET + RESEARCHD_DOC_TEST_ID —
+LARK_APP_ID / LARK_APP_SECRET + RESEARCHD_DOC_TEST_ID —
 it runs only against an explicitly provided staging document.
 """
 
@@ -185,37 +185,102 @@ def test_real_feishu_docx_round_trip():
     human edit (revision conflict: system must NOT overwrite), verifies the
     PI-notes section is never created, and cleans up its own block.
     """
-    app_id = os.environ.get("RESEARCHD_LARK_APP_ID") or os.environ.get("LARK_APP_ID")
-    app_secret = os.environ.get("RESEARCHD_LARK_APP_SECRET") or os.environ.get("LARK_APP_SECRET")
+    app_id = os.environ.get("LARK_APP_ID")
+    app_secret = os.environ.get("LARK_APP_SECRET")
     doc_id = os.environ.get("RESEARCHD_DOC_TEST_ID")
     if not (app_id and app_secret and doc_id):
-        pytest.skip("real feishu docx conformance needs RESEARCHD_LARK_APP_ID/SECRET + RESEARCHD_DOC_TEST_ID")
-    client = FeishuDocClient(app_id_env="RESEARCHD_LARK_APP_ID", app_secret_env="RESEARCHD_LARK_APP_SECRET")
+        pytest.skip("real feishu docx conformance needs LARK_APP_ID/SECRET + RESEARCHD_DOC_TEST_ID")
+    client = FeishuDocClient()  # LARK_APP_ID / LARK_APP_SECRET (single convention)
+    # the FULL path: sync_document -> outbox doc_block rows -> FeishuDocClient
+    # (this is exactly what production projection does)
+    import tempfile
+
+    from researchd.persistence.transaction import init_db, make_engine, make_session_factory, UnitOfWork
+    from researchd.scheduler.outbox_sender import OutboxSender
+    from researchd.domain.project import Project
+    from researchd.persistence.repositories import ProjectRepo
+    from researchd.persistence.outbox import OutboxRepo
+    from researchd.projections.feishu_doc import SECTION_ORDER
+
+    engine = make_engine(os.path.join(tempfile.mkdtemp(), "t.db"))
+    init_db(engine)
+    factory = make_session_factory(engine)
+    with UnitOfWork(factory) as uow:
+        ProjectRepo(uow.session).save(
+            Project(project_id="P-CONF", name="c", description="d", workspace_root="/tmp")
+        )
+        uow.commit()
+
+    sender = OutboxSender(factory, type("P", (), {"deliver": lambda **k: ""}), doc_platform=client)
 
     async def scenario():
         section = f"conformance-{os.getpid()}"
         before = await client.list_blocks(doc_id)
         if section in before:
             raise AssertionError(f"leftover conformance block {section!r} — clean up manually first")
-        # create + read back (incremental sync write path)
-        await client.create_block(doc_id, section, "初始内容 v1")
+        # 1. first creation via the outbox path (create branch)
+        with UnitOfWork(factory) as uow:
+            OutboxRepo(uow.session).enqueue(
+                destination="doc_block",
+                idempotency_key=f"doc-conf-1-{section}",
+                payload={
+                    "kind": "doc_block", "project_id": "P-CONF",
+                    "document_id": doc_id, "section_key": section,
+                    "text": "初始内容 v1", "expected_remote": None, "content_hash": "h1",
+                },
+            )
+            uow.commit()
+        stats = await sender.send_pending()
+        assert stats["sent"] == 1 and stats["skipped"] == 0, stats
         after_create = await client.list_blocks(doc_id)
         assert after_create.get(section) == "初始内容 v1"
-        # update + read back (block-level update path)
-        await client.update_block(doc_id, section, "更新内容 v2")
+        # 2. incremental single-block update; OTHER blocks unchanged
+        other = {k: v for k, v in after_create.items() if k != section}
+        with UnitOfWork(factory) as uow:
+            OutboxRepo(uow.session).enqueue(
+                destination="doc_block",
+                idempotency_key=f"doc-conf-2-{section}",
+                payload={
+                    "kind": "doc_block", "project_id": "P-CONF",
+                    "document_id": doc_id, "section_key": section,
+                    "text": "更新内容 v2", "expected_remote": "初始内容 v1", "content_hash": "h2",
+                },
+            )
+            uow.commit()
+        stats = await sender.send_pending()
+        assert stats["sent"] == 1, stats
         after_update = await client.list_blocks(doc_id)
         assert after_update.get(section) == "更新内容 v2"
-        # revision conflict: simulate a human edit between syncs
+        assert {k: v for k, v in after_update.items() if k != section} == other  # untouched
+        # 3. idempotent replay of the SAME row: nothing new is sent/written
+        stats = await sender.send_pending()
+        assert stats["claimed"] == 0, stats
+        # 4. human edit between enqueue and send -> write SKIPPED, never clobber
         await client.update_block(doc_id, section, "人类手改的内容")
+        with UnitOfWork(factory) as uow:
+            OutboxRepo(uow.session).enqueue(
+                destination="doc_block",
+                idempotency_key=f"doc-conf-3-{section}",
+                payload={
+                    "kind": "doc_block", "project_id": "P-CONF",
+                    "document_id": doc_id, "section_key": section,
+                    "text": "系统想覆盖的内容", "expected_remote": "更新内容 v2", "content_hash": "h3",
+                },
+            )
+            uow.commit()
+        stats = await sender.send_pending()
+        assert stats["skipped"] == 1, stats  # human patch wins
         remote = await client.list_blocks(doc_id)
-        assert remote[section] == "人类手改的内容"
-        # the projection contract must NOT overwrite: recompiling the same
-        # section yields the same text and the caller keeps the human edit
-        assert remote[section] != "更新内容 v2"  # system never clobbers
-        # PI Notes protection: the pi-notes section is never created by us
+        assert remote[section] == "人类手改的内容"  # system never clobbers
+        # 5. revision-aware read surfaces the current revision
+        blocks, rev = await client.list_blocks_with_revision(doc_id)
+        assert blocks.get(section) == "人类手改的内容"
+        assert rev is not None
+        # 6. PI Notes protection: the pi-notes section is never created by us
         assert "pi-notes" not in await client.list_blocks(doc_id)
-        # cleanup: delete our own test block (child-of-page by index)
+        # 7. cleanup: delete our own test block (child-of-page by index)
         await client.delete_block(doc_id, section)
         assert section not in await client.list_blocks(doc_id)
 
     run(scenario())
+    engine.dispose()

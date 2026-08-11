@@ -36,7 +36,17 @@ _BACKOFF_BASE_S = 0.5
 
 
 class FeishuDocError(RuntimeError):
-    pass
+    """docx API failure. `code` carries the lark business code when known
+    (e.g. 1061002 = document revision conflict)."""
+
+    def __init__(self, message: str, code: int | None = None):
+        super().__init__(message)
+        self.code = code
+
+
+class FeishuDocRevisionConflict(FeishuDocError):
+    """The document moved under us (revision conflict). The caller must
+    re-read and decide: adopt-if-equal or treat as a human edit."""
 
 
 class FeishuDocClient:
@@ -62,9 +72,20 @@ class FeishuDocClient:
             )
         return lark.Client.builder().app_id(app_id).app_secret(app_secret).build()
 
+    # real platform rate-limit / transient business codes (lark docx + auth):
+    # 99991663 tenant_access_token rate limit; 99991400 concurrent limit;
+    # 1061001/1061002 document not ready/version conflicts handled separately
+    _RETRY_BUSINESS_CODES = frozenset(
+        {429, 500, 502, 503, 504, 99991663, 99991400, 99991661, 99991662}
+    )
+
     async def _call(self, fn, op: str):
-        """Retry transient failures (429/5xx) with capped exponential backoff.
-        lark-oapi calls are synchronous; run them in a worker thread."""
+        """Retry TRANSIENT failures only, honoring Retry-After when present.
+        lark-oapi calls are synchronous; run them in a worker thread.
+        Business errors outside the retry set (incl. real conflicts) surface
+        immediately — they are NOT disguised as retryable failures."""
+        import time as _time
+
         last = None
         for attempt in range(self.max_retries):
             try:
@@ -77,13 +98,26 @@ class FeishuDocClient:
                 continue
             if resp.success():
                 return resp
-            last = FeishuDocError(f"{op} failed code={resp.code} msg={resp.msg}")
-            if resp.code in (429, 500, 502, 503, 504):
-                if attempt >= self.max_retries - 1:
-                    break
-                await asyncio.sleep(_BACKOFF_BASE_S * (2**attempt))
-                continue
-            raise last
+            retryable = resp.code in self._RETRY_BUSINESS_CODES
+            try:
+                status = resp.status_code if hasattr(resp, "status_code") else None
+                retryable = retryable or (status is not None and status in (429, 500, 502, 503, 504))
+            except Exception:  # noqa: BLE001
+                pass
+            if resp.code == 1061002:
+                raise FeishuDocRevisionConflict(f"{op}: document revision conflict (1061002)")
+            last = FeishuDocError(f"{op} failed code={resp.code} msg withheld", code=resp.code)
+            if not retryable or attempt >= self.max_retries - 1:
+                break
+            # honor Retry-After when the platform provides it
+            wait = _BACKOFF_BASE_S * (2**attempt)
+            try:
+                ra = resp.header("Retry-After")
+                if ra:
+                    wait = max(wait, float(ra))
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(wait)
         raise last  # type: ignore[misc]
 
     # ------------------------------------------------------------ helpers
@@ -112,11 +146,19 @@ class FeishuDocClient:
     # ------------------------------------------------------------ platform
     async def list_blocks(self, document_id: str) -> dict[str, str]:
         """section_key -> block text (current remote truth, paginated)."""
+        sections, _revision = await self.list_blocks_with_revision(document_id)
+        return sections
+
+    async def list_blocks_with_revision(self, document_id: str) -> tuple[dict[str, str], int | None]:
+        """section_key -> block text PLUS the current document revision id
+        (lark returns data.revision_id on the list response). The revision is
+        passed back to create/update for optimistic concurrency."""
         from lark_oapi.api.docx.v1 import ListDocumentBlockRequest, ListDocumentBlockRequestBuilder
 
         client = self._client()
         sections: dict[str, str] = {}
         page_token: str | None = None
+        revision: int | None = None
         while True:
             builder = (
                 ListDocumentBlockRequestBuilder()
@@ -130,6 +172,8 @@ class FeishuDocClient:
                 lambda: client.docx.v1.document_block.list(req),
                 "docx list blocks",
             )
+            if revision is None and getattr(resp.data, "revision_id", None) is not None:
+                revision = int(resp.data.revision_id)
             items = resp.data.items or []
             for block in items:
                 if block.block_type not in _TEXT_BLOCK_TYPES:
@@ -141,7 +185,7 @@ class FeishuDocClient:
             if not resp.data.has_more or not resp.data.page_token:
                 break
             page_token = resp.data.page_token
-        return sections
+        return sections, revision
 
     async def _root_block_id(self, document_id: str) -> str:
         from lark_oapi.api.docx.v1 import ListDocumentBlockRequest, ListDocumentBlockRequestBuilder
@@ -162,7 +206,7 @@ class FeishuDocClient:
                 return block.block_id
         raise FeishuDocError(f"document {document_id}: no page block found")
 
-    async def create_block(self, document_id: str, section_key: str, text: str) -> None:
+    async def create_block(self, document_id: str, section_key: str, text: str, *, document_revision_id: int | None = None) -> None:
         from lark_oapi.api.docx.v1 import (
             Block,
             CreateDocumentBlockChildrenRequestBodyBuilder,
@@ -171,13 +215,12 @@ class FeishuDocClient:
 
         client = self._client()
         # idempotent create: if the marked block already exists (crash after
-        # a successful create + retry), treat it as done — never duplicate
-        try:
-            await self._find_block_id(document_id, section_key)
-            await self.update_block(document_id, section_key, text)
+        # a successful create + retry), treat it as done — never duplicate.
+        # ABSENCE (None) and API FAILURE (raised) are strictly distinct.
+        existing = await self._find_block_id(document_id, section_key)
+        if existing is not None:
+            await self.update_block(document_id, section_key, text, document_revision_id=document_revision_id)
             return
-        except FeishuDocError:
-            pass  # not present -> create below
         root_id = await self._root_block_id(document_id)
         content = f"{SECTION_MARKER_PREFIX}{section_key}-->\n{text}"
         block = Block(
@@ -190,11 +233,15 @@ class FeishuDocClient:
                 },
             }
         )
-        req = (
+        builder = (
             CreateDocumentBlockChildrenRequestBuilder()
             .document_id(document_id)
             .block_id(root_id)
-            .request_body(
+        )
+        if document_revision_id is not None:
+            builder.document_revision_id(document_revision_id)
+        req = (
+            builder.request_body(
                 CreateDocumentBlockChildrenRequestBodyBuilder()
                 .children([block])
                 .build()
@@ -206,7 +253,7 @@ class FeishuDocClient:
             f"docx create block {section_key}",
         )
 
-    async def update_block(self, document_id: str, section_key: str, text: str) -> None:
+    async def update_block(self, document_id: str, section_key: str, text: str, *, document_revision_id: int | None = None) -> None:
         from lark_oapi.api.docx.v1 import (
             PatchDocumentBlockRequestBuilder,
             UpdateBlockRequest,
@@ -214,6 +261,8 @@ class FeishuDocClient:
 
         client = self._client()
         block_id = await self._find_block_id(document_id, section_key)
+        if block_id is None:
+            raise FeishuDocError(f"document {document_id}: section block {section_key!r} not found (create it first)")
         content = f"{SECTION_MARKER_PREFIX}{section_key}-->\n{text}"
         body = UpdateBlockRequest(
             {
@@ -224,20 +273,24 @@ class FeishuDocClient:
                 },
             }
         )
-        req = (
+        builder = (
             PatchDocumentBlockRequestBuilder()
             .document_id(document_id)
             .block_id(block_id)
-            .request_body(body)
-            .build()
         )
+        if document_revision_id is not None:
+            builder.document_revision_id(document_revision_id)
+        req = builder.request_body(body).build()
         await self._call(
             lambda: client.docx.v1.document_block.patch(req),
             f"docx update block {section_key}",
         )
 
-    async def _find_block_id(self, document_id: str, section_key: str) -> str:
-        """block_id of the marked section block (raise if missing)."""
+    async def _find_block_id(self, document_id: str, section_key: str) -> str | None:
+        """block_id of the marked section block, or None when the section is
+        ABSENT. API failures raise — absence and failure are distinct (a
+        failed list is never mistaken for 'not present', which would cause
+        duplicate creates)."""
         from lark_oapi.api.docx.v1 import ListDocumentBlockRequest, ListDocumentBlockRequestBuilder
 
         client = self._client()
@@ -264,7 +317,7 @@ class FeishuDocClient:
             if not resp.data.has_more or not resp.data.page_token:
                 break
             page_token = resp.data.page_token
-        raise FeishuDocError(f"document {document_id}: section block {section_key!r} not found (create it first)")
+        return None  # section absent (NOT an error)
 
     async def delete_block(self, document_id: str, section_key: str) -> None:
         """Delete the section block. batch_delete_children removes children of
@@ -313,6 +366,7 @@ class FeishuDocClient:
                 break
         if page_id is None or target_index is None:
             raise FeishuDocError(f"document {document_id}: section {section_key!r} not found for delete")
+        # (target_index derivation unchanged; find is absence-aware)
         from lark_oapi.api.docx.v1 import BatchDeleteDocumentBlockChildrenRequestBodyBuilder
 
         req = (

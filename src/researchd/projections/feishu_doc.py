@@ -68,16 +68,21 @@ class ProjectionResult:
 
 class DocPlatform:
     """Minimal docx-like surface (blocks keyed by section). The Feishu docx
-    client is PENDING (B-01); FakeDocPlatform serves deterministic tests."""
+    client is real; FakeDocPlatform serves deterministic tests."""
 
     async def list_blocks(self, document_id: str) -> dict[str, str]:
         """section_key -> block text (remote truth)."""
         raise NotImplementedError
 
-    async def create_block(self, document_id: str, section_key: str, text: str) -> None:
+    async def list_blocks_with_revision(self, document_id: str) -> tuple[dict[str, str], int | None]:
+        """section_key -> block text + current document revision (optimistic
+        concurrency token); None revision when the platform has none."""
+        return await self.list_blocks(document_id), None
+
+    async def create_block(self, document_id: str, section_key: str, text: str, *, document_revision_id: int | None = None) -> None:
         raise NotImplementedError
 
-    async def update_block(self, document_id: str, section_key: str, text: str) -> None:
+    async def update_block(self, document_id: str, section_key: str, text: str, *, document_revision_id: int | None = None) -> None:
         raise NotImplementedError
 
 
@@ -89,20 +94,26 @@ class FakeDocPlatform(DocPlatform):
         self.calls: list[tuple] = []
         self.human_edit: list[tuple] = []  # (document_id, section_key, text) applied manually
         self.fail_writes: bool = False  # simulate platform outages
+        self.revision: int | None = 1  # simulated document revision
 
     async def list_blocks(self, document_id: str) -> dict[str, str]:
         return dict(self.blocks.get(document_id, {}))
 
-    async def create_block(self, document_id: str, section_key: str, text: str) -> None:
+    async def list_blocks_with_revision(self, document_id: str) -> tuple[dict[str, str], int | None]:
+        return dict(self.blocks.get(document_id, {})), self.revision
+
+    async def create_block(self, document_id: str, section_key: str, text: str, *, document_revision_id: int | None = None) -> None:
         if self.fail_writes:
             raise RuntimeError("platform outage (simulated)")
         self.blocks.setdefault(document_id, {})[section_key] = text
+        self.revision += 1
         self.calls.append(("create", document_id, section_key))
 
-    async def update_block(self, document_id: str, section_key: str, text: str) -> None:
+    async def update_block(self, document_id: str, section_key: str, text: str, *, document_revision_id: int | None = None) -> None:
         if self.fail_writes:
             raise RuntimeError("platform outage (simulated)")
         self.blocks.setdefault(document_id, {})[section_key] = text
+        self.revision += 1
         self.calls.append(("update", document_id, section_key))
 
     def simulate_human_edit(self, document_id: str, section_key: str, text: str) -> None:

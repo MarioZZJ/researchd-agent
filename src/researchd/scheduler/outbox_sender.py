@@ -16,6 +16,7 @@ from ..domain.base import Actor, AggregateRef, new_id, utcnow
 from ..domain.events import make_event
 from ..persistence.models import EventRow, ProjectionStateRow
 from ..persistence.outbox import OutboxRepo
+from ..projections.feishu_client import FeishuDocRevisionConflict
 from ..projections.feishu_doc import DOC_BLOCK_KIND, DocPlatform, section_hash
 
 logger = logging.getLogger("researchd.outbox")
@@ -131,8 +132,20 @@ class OutboxSender:
             document_id = payload["document_id"]
             section_key = payload["section_key"]
             text = payload["text"]
+            # revision-aware read when the platform exposes it: the current
+            # document revision is passed to create/update as the optimistic
+            # concurrency token, and a revision conflict is resolved by
+            # re-reading (adopt-if-equal, else human-patch skip)
             remote = await self.doc_platform.list_blocks(document_id)
             remote_text = remote.get(section_key)
+            revision = None
+            reader = getattr(self.doc_platform, "list_blocks_with_revision", None)
+            if reader is not None:
+                try:
+                    remote, revision = await reader(document_id)
+                    remote_text = remote.get(section_key)
+                except Exception:  # noqa: BLE001  revision read is best-effort
+                    pass
             if remote_text == text:
                 # already converged (adopt path): no remote write at all
                 return payload.get("content_hash", "")
@@ -142,10 +155,26 @@ class OutboxSender:
             # write no longer applies — skip it (never overwrite humans).
             if remote_text != payload.get("expected_remote"):
                 raise HumanPatchSkip(row.id)
-            if section_key in remote:
-                await self.doc_platform.update_block(document_id, section_key, text)
-            else:
-                await self.doc_platform.create_block(document_id, section_key, text)
+            try:
+                if section_key in remote:
+                    await self.doc_platform.update_block(
+                        document_id, section_key, text, document_revision_id=revision
+                    )
+                else:
+                    await self.doc_platform.create_block(
+                        document_id, section_key, text, document_revision_id=revision
+                    )
+            except FeishuDocRevisionConflict:
+                # the document moved under us between the read and the write:
+                # re-read and only write if the remote is still ours; any
+                # human content wins (never overwrite)
+                remote2 = await self.doc_platform.list_blocks(document_id)
+                if remote2.get(section_key) != payload.get("expected_remote"):
+                    raise HumanPatchSkip(row.id)
+                if section_key in remote2:
+                    await self.doc_platform.update_block(document_id, section_key, text)
+                else:
+                    await self.doc_platform.create_block(document_id, section_key, text)
             return payload.get("content_hash", "")
         return await self.port.deliver(
             idempotency_key=row.idempotency_key,
