@@ -56,12 +56,26 @@ if [ -z "$DEVICE_CODE" ]; then
   INTERVAL=$(printf '%s' "$BEGIN" | python3 -c "import json,sys; print(json.load(sys.stdin)['data'].get('interval', 5))")
   echo
   echo "############################################################"
-  echo "#  请在浏览器打开以下链接，用飞书 App 扫码确认创建智能体：  #"
+  echo "#  请用手机飞书 App 扫描下方二维码，确认创建智能体：        #"
+  echo "#  （扫码即绑定 cc-connect，自动完成应用注册与授权）        #"
   echo "############################################################"
   echo
-  echo "  $QR_URL"
+  # 终端直接渲染二维码（qr_url 已含 PersonalAgent 注册参数与权限）
+  if [ -d ".venv" ] || command -v uv >/dev/null 2>&1; then
+    (cd "$(dirname "$0")/.." && uv run --quiet python3 - "$QR_URL" <<'PYEOF'
+import segno, sys
+segno.make(sys.argv[1], error="m").terminal(compact=True, border=1)
+PYEOF
+) 2>/dev/null || {
+      echo "（无法渲染二维码，请用链接扫码）"
+      echo "  $QR_URL"
+    }
+  else
+    echo "  $QR_URL"
+  fi
   echo
-  echo "（扫码确认后脚本会自动轮询，最多 15 分钟；device_code=$DEVICE_CODE）"
+  echo "  URL 备选: $QR_URL"
+  echo "  （扫码确认后脚本会自动轮询，最多 15 分钟；device_code=$DEVICE_CODE）"
   echo
 else
   INTERVAL=5
