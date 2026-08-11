@@ -60,7 +60,7 @@ uv run researchctl doctor            # 只读健康检查
 
 **GATED（代码就绪，等待宿主授权后执行）**：
 1. **真实 Reasonix 模型 smoke**（planner/worker/auditor 真实调用 + workspace artifact + audit gate + service 重启零重复）——沙箱内凭据被 /dev/null 屏蔽（overlay fail-closed），**须在沙箱外运行**：`RESEARCHD_RUN_REAL_SMOKE=1 uv run pytest tests/e2e/test_live_smoke.py -q`（费用已授权）。
-2. **Decision 按钮点击端到端**（真实 platform user id / version / 幂等键保留）——卡片已在群内，点击验证随 smoke 之后进行。
+2. ~~Decision 按钮点击端到端~~ → **LIVE VERIFIED**（2026-08-12）：手工构造验证决策 D-E31E7247E0D447988EA8E90B（标注验证用途）→ 报告流程自动发决策卡（按钮 value=cmd:/decision ...）→ 真实点击（ou_8c1a4e0a...）→ cc-connect 保留点击者身份 dispatch → service cmd_decision（成员/approval/version 校验）→ decision ANSWERED → 原卡 PATCH 为「✅ 已记录你的选择」→ 重复点击幂等 no-op。
 3. interdisciplinary-citation-pilot 项目与真实 D-002 决策（必须等 smoke 通过）。
 
 ## 5. 发布 v0.1.1 的剩余判据（未满足即不发布）
