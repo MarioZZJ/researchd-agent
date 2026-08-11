@@ -1,7 +1,7 @@
 # researchd v0.1.1 完成报告（live-readiness）
 
 分支：`v0.1.1-live-readiness`（自 master 创建）
-HEAD：`1936905`；测试基线：**207 passed + 6 skipped**
+HEAD：`234ba15`；测试基线：**210 passed + 6 skipped**
 
 状态标注：**IMPLEMENTED**（代码+本地测试完成）/ **LIVE VERIFIED**（真实环境
 验证通过）/ **GATED**（已实现，等待宿主授权/权限后即可验证）/ **FAILED**（未达标）。
@@ -16,7 +16,7 @@ HEAD：`1936905`；测试基线：**207 passed + 6 skipped**
 | 一.2 | CcConnectDeliveryPort：真实 interactive card（卡片 1.0，`cmd:` 按钮协议 + after_click 中性反馈）；send/update/幂等键/platform_message_id 回执；空 session_key fail-closed | **LIVE VERIFIED** | delivery.py；RD测试 群实测：卡片发送 + PATCH 原地更新（`researchctl delivery test` → updated:true） |
 | 三.1 | cc-connect patch：卡片 payload、编译+go test、独立分支安装 | **IMPLEMENTED**（干净克隆 + 双 patch 验证） | `integrations/cc-connect/patch/{delivery-api,inbound-messageid,card-json}.patch` 在干净克隆 v1.4.1（5d4c96d）上 apply + `go build -tags no_web` + `go test ./core/ ./agent/acp/` 全通过 |
 | 三.2 | cc-connect 真实 POST/PATCH/重复 POST/崩溃恢复实测 | **LIVE VERIFIED**（POST/PATCH/重复幂等；崩溃恢复依赖 delivery uuid 幂等，代码级保证） | curl POST 200（platform_message_id）、同 key 重复 POST replayed、`researchctl delivery test` PATCH 更新 |
-| 二 | FeishuDocClient：lark-oapi list/create/update_block + 真实创建/读取 | **LIVE VERIFIED**（创建/读；共享与真实 conformance GATED） | researchd 应用创建项目 Docx `K9WqdRyIHoG54xxgx5sczr3Fn8c`（幂等重跑同 id）+ 读 blocks；真实增量 conformance 待共享权限 |
+| 二 | FeishuDocClient：lark-oapi list/create/update_block + 真实创建/读取/共享/增量投影 | **LIVE VERIFIED** | researchd 应用创建项目 Docx `K9WqdRyIHoG54xxgx5sczr3Fn8c`（幂等）；共享（群 view + PI full_access，成员列表验证）；document test 块级往返全 true；增量投影 5 sections；幂等（无变化不重排队）；人工修改保护（sync 不覆盖人类内容） |
 | 三.3 | researchctl UDS+TCP 都带 Bearer token | **IMPLEMENTED** | ctl.py；回归测试 |
 | 三.4 | `researchctl delivery test` / `document test`（可实际执行） | **LIVE VERIFIED** | delivery test 真实卡片往返；document create 真实创建（幂等）；document test 待共享权限 |
 | 三.5 | docs/pilot.md、README、operations.md 与 CLI 对齐 | **IMPLEMENTED** | 三文档已更新（含 §9c 飞书接入角色/权限） |
@@ -59,19 +59,18 @@ uv run researchctl doctor            # 只读健康检查
 - cc-connect 双 patch 干净克隆编译 + go test 全通过；patch 版实例（9820）承载 researchd project（acp）运行正常。
 
 **GATED（代码就绪，等待宿主授权后执行）**：
-1. **`docs:doc` 权限**（共享 docx 协作者的真实接口要求 `[drive:drive, drive:file, docs:doc]`，最小集 `docs:doc`；实测 `docs:permission.member:create` 不在要求列表中）——在飞书开放平台给 researchd（cli_aaf007476338dd2c）开通并发布+审批后，重放 `researchctl document create` 即补共享（已实现重试），随后可跑真实 Docx 增量 conformance（`document test`）。
-2. **真实 Reasonix 模型 smoke**（planner/worker/auditor 真实调用）→ `RESEARCHD_RUN_REAL_SMOKE=1`（费用授权；沙箱外执行 `scripts/testbot-smoke.sh` 同样受此开关约束）。
-3. **Decision 按钮点击端到端**（真实 platform user id / version / 幂等键保留）——卡片已在群内，点击验证随 1 之后进行。
-4. interdisciplinary-citation-pilot 项目与真实 D-002 决策（必须等 1/2 通过）。
+1. **真实 Reasonix 模型 smoke**（planner/worker/auditor 真实调用 + workspace artifact + audit gate + service 重启零重复）——沙箱内凭据被 /dev/null 屏蔽（overlay fail-closed），**须在沙箱外运行**：`RESEARCHD_RUN_REAL_SMOKE=1 uv run pytest tests/e2e/test_live_smoke.py -q`（费用已授权）。
+2. **Decision 按钮点击端到端**（真实 platform user id / version / 幂等键保留）——卡片已在群内，点击验证随 smoke 之后进行。
+3. interdisciplinary-citation-pilot 项目与真实 D-002 决策（必须等 smoke 通过）。
 
 ## 5. 发布 v0.1.1 的剩余判据（未满足即不发布）
 
-- [ ] researchd 应用开通 `docs:doc` 并发布/审批（共享 Docx 到测试群/PI；代码重试路径已就绪）
+- [x] researchd 应用开通 `docs:doc` 并发布/审批（共享 Docx 到测试群/PI 已 LIVE VERIFIED）
 - [ ] Reasonix 真实 Worker 在项目 workspace 创建 Artifact（真实 smoke GATED）
 - [ ] 独立 Auditor 真实运行（同上）
 - [ ] Evidence provenance 可追溯（代码已验证；真实链路 GATED）
 - [ ] Decision 按钮点击端到端（卡片已真实发送；点击 GATED）
-- [ ] Feishu Docx 真实增量同步 + PI Notes 保护 conformance（GATED）
+- [x] Feishu Docx 真实增量同步 + 人工修改保护 conformance（LIVE VERIFIED）
 - [ ] 服务重启无重复模型调用/Evidence/消息（Fake 链路已验证；真实链路 GATED）
 - [x] 原始 Executor 输出无直达飞书路径（代码审计通过：outbox 仅 ReportSpec body）
 - [x] 全部单元、集成、恢复、e2e 与本地 conformance 测试通过（207+6）
