@@ -232,6 +232,8 @@ class ContextPackageBuilder:
             project_id=project_id,
             created_by="planner",
         )
+        if project.workspace_root:
+            pkg.metadata["workspace_root"] = project.workspace_root
         return self._finalize(pkg, objects, content)
 
     # ------------------------------------------------------------ worker
@@ -302,6 +304,8 @@ class ContextPackageBuilder:
             run_id=run.run_id if run else None,
             created_by="scheduler",
         )
+        if project is not None and project.workspace_root:
+            pkg.metadata["workspace_root"] = project.workspace_root
         return self._finalize(pkg, objects, content)
 
     # ------------------------------------------------------------ auditor
@@ -376,6 +380,8 @@ class ContextPackageBuilder:
             run_id=run.run_id,
             created_by="auditor",
         )
+        if project is not None and project.workspace_root:
+            pkg.metadata["workspace_root"] = project.workspace_root
         return self._finalize(pkg, objects, content)
 
     # ------------------------------------------------------------ persist
@@ -386,13 +392,15 @@ class ContextPackageBuilder:
 
     # ------------------------------------------------------------ wire
     def to_context_dict(self, pkg: ContextPackage, *, objective: str) -> dict:
-        """Executor-facing context: objective + structured package."""
+        """Executor-facing context: objective + structured package + the run's
+        workspace root (the executor confines its subprocess cwd to it)."""
         return {
             "objective": objective,
             "context_id": pkg.context_id,
             "role": pkg.role,
             "task_id": pkg.task_id,
             "run_id": pkg.run_id,
+            "workspace_root": pkg.metadata.get("workspace_root"),
             "package": {
                 "objects": [o.model_dump() for o in pkg.objects],
                 "content": pkg.content,

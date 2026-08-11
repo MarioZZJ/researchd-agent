@@ -101,12 +101,18 @@ class ReasonixTransport(ABC):
 
 # ---------------------------------------------------------------- stdio
 class StdioReasonixTransport(ReasonixTransport):
-    """Real native reasonix process over stdio JSON-RPC."""
+    """Real native reasonix process over stdio JSON-RPC.
+
+    `cwd` is the working directory for the subprocess: the project workspace
+    for a real run (so the model's file operations are confined to the
+    workspace), or the overlay work dir as fallback.
+    """
 
     name = "reasonix-stdio"
 
-    def __init__(self, overlay: Path, *, binary: str | None = None):
+    def __init__(self, overlay: Path, *, cwd: str | Path | None = None, binary: str | None = None):
         self.overlay = overlay
+        self.cwd = Path(cwd) if cwd else overlay_workdir(overlay)
         self.binary = binary or resolve_native_binary()
         self._proc: asyncio.subprocess.Process | None = None
         self._reader: asyncio.StreamReader | None = None
@@ -128,6 +134,7 @@ class StdioReasonixTransport(ReasonixTransport):
             if self._proc is not None:
                 return
             env = overlay_env(self.overlay)
+            self.cwd.mkdir(parents=True, exist_ok=True)
             self._proc = await asyncio.create_subprocess_exec(
                 self.binary,
                 "acp",
@@ -135,7 +142,7 @@ class StdioReasonixTransport(ReasonixTransport):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
-                cwd=overlay_workdir(self.overlay),  # restricted working directory
+                cwd=self.cwd,  # project workspace (per run) or restricted fallback
                 start_new_session=True,  # own process group -> killpg reaches the native process
             )
             self._reader = self._proc.stdout

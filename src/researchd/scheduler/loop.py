@@ -548,6 +548,10 @@ class SchedulerLoop:
                 else:
                     pkg = builder.persist(builder.worker(task, run=run))
                 context = builder.to_context_dict(pkg, objective=task.contract.objective)
+                # freeze the context id on the run for traceability
+                run.metadata = dict(run.metadata or {})
+                run.metadata["context_id"] = pkg.context_id
+                RunRepo(session).save(run)
                 session.commit()
             # record the executor session id as soon as it exists (recovery)
             def _on_session(sid: str) -> None:

@@ -74,6 +74,11 @@ class RunDispatcher:
             lease_token=None,
         )
         run.transition(RunStatus.STARTING)
+        # resolved config + mounted skills are frozen on the run for
+        # traceability (IMPLEMENTATION.md §15.2: record what actually ran)
+        run.metadata = dict(run.metadata or {})
+        run.metadata["skills"] = list(getattr(self.executor, "installed_skills", []) or [])
+        run.metadata["context_id"] = None  # set by the scheduler before the turn
         RunRepo(self.session).save(run)
         self.session.flush()
         token = LeaseRepo(self.session).acquire(
@@ -174,6 +179,8 @@ class RunDispatcher:
             metadata={"role": "auditor", "worker_run_id": worker_run_id or task.current_run_id},
         )
         run.transition(RunStatus.STARTING)
+        run.metadata = dict(run.metadata or {})
+        run.metadata["skills"] = list(getattr(self.executor, "installed_skills", []) or [])
         RunRepo(self.session).save(run)
         self.session.flush()
         token = LeaseRepo(self.session).acquire(
