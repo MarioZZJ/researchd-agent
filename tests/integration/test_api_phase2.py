@@ -534,3 +534,55 @@ def test_create_project_rejects_symlinked_anchor(api_env):
     # clean up the planted symlink (fixture tmp dir is discarded anyway)
     if anchor.is_symlink():
         anchor.unlink()
+
+
+def test_acp_prompt_uses_real_platform_message_id(factory, monkeypatch):
+    """session/prompt with messageId -> the inbound idempotency key uses the
+    REAL platform message id, so a later identical message is a NEW message
+    (never merged with the old one)."""
+    from unittest.mock import AsyncMock, patch
+
+    import researchd.acp.agent as agent_mod
+    import researchd.acp.inbound as inbound_mod
+
+    sent = {}
+
+    async def fake_submit(settings, session, text, *, intent, command=None, message_id=None):
+        sent["message_id"] = message_id
+        sent["intent"] = intent
+        return type("R", (), {"text": "ok"})
+
+    with patch.object(inbound_mod, "_submit", new=fake_submit):
+        handler = agent_mod.AcpServer(
+            type("S", (), {"api": type("A", (), {"socket_path": ""})(), "interaction": type("I", (), {"deterministic_commands": True, "allow_natural_language_intent": False})(), "service_name": "t"})()
+        )
+        import asyncio
+
+        sid = handler._session_new(
+            {"sessionConfig": {"cc_project": "home", "cc_session_key": "oc_test:ou_u1", "cc_user_id": "ou_u1"}}
+        )["sessionId"]
+        resp = asyncio.run(
+            handler._session_prompt(
+                {"sessionId": sid, "prompt": [{"type": "text", "text": "/decision D-1 A --version 1"}], "messageId": "om_real_123"}
+            )
+        )
+        assert sent["message_id"] == "om_real_123"
+        assert sent["intent"] == "deterministic_command"
+        assert resp["message"]["content"][0]["text"] == "ok"
+
+    # WITHOUT messageId the legacy hash-based key is used (back-compat)
+    with patch.object(inbound_mod, "_submit", new=fake_submit):
+        handler2 = agent_mod.AcpServer(
+            type("S", (), {"api": type("A", (), {"socket_path": ""})(), "interaction": type("I", (), {"deterministic_commands": True, "allow_natural_language_intent": False})(), "service_name": "t"})()
+        )
+        import asyncio as _a
+
+        sid2 = handler2._session_new(
+            {"sessionConfig": {"cc_project": "home", "cc_session_key": "oc_test:ou_u1", "cc_user_id": "ou_u1"}}
+        )["sessionId"]
+        _a.run(
+            handler2._session_prompt(
+                {"sessionId": sid2, "prompt": [{"type": "text", "text": "/decision D-1 A --version 1"}]}
+            )
+        )
+        assert sent["message_id"] is None

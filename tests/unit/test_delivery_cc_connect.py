@@ -43,8 +43,12 @@ def test_card_payload_is_real_interactive_card_with_buttons():
     # the cc-connect callback protocol: cmd: dispatch + session key + in-place feedback
     v = buttons[0]["value"]
     assert v["action"] == "cmd:/decision D-002 A --version 1"
-    assert v["session_key"] == "oc_abc"
-    assert v["after_click"]["title"] == "已提交"
+    # NO session_key injection: cc-connect derives the session from the
+    # CLICKER's identity (chat+user), so shared-chat clicks are attributed
+    # to the real member — never to whoever clicked first
+    assert "session_key" not in v
+    assert v["after_click"]["title"] == "已收到"
+    assert "处理结果将随后更新" in v["after_click"]["markdown"]
 
 
 def test_card_payload_without_buttons_has_no_action_element():
@@ -103,7 +107,10 @@ def test_port_send_and_update_shapes(monkeypatch):
     assert calls[0][0] == "POST"
     assert calls[0][1].endswith("/api/v1/projects/proj/deliveries")
     body = calls[0][2]
-    assert body["session_key"] == "key"
+    # the CARD (message string) carries no session_key injection; the
+    # session key is only the top-level routing field
+    card = json.loads(body["message"])
+    assert "session_key" not in json.dumps(card, ensure_ascii=False)
     assert body["idempotency_key"] == "k-1"
     assert "message" in body
     # token goes in the header, never in the payload

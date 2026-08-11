@@ -1,0 +1,87 @@
+diff --git a/agent/acp/session.go b/agent/acp/session.go
+index 00d140f..3ac7093 100644
+--- a/agent/acp/session.go
++++ b/agent/acp/session.go
+@@ -38,6 +38,11 @@ type acpSession struct {
+ 
+ 	sendMu sync.Mutex
+ 
++	// currentMsgID is the platform message id of the message being sent; it
++	// rides along on session/prompt so the agent shim can use it as the
++	// idempotency key (set by the engine right before Send).
++	currentMsgID string
++
+ 	permMu   sync.Mutex
+ 	permByID map[string]permState
+ 
+@@ -587,6 +592,14 @@ func (s *acpSession) emit(ev core.Event) {
+ 	}
+ }
+ 
++// SetCurrentMessageID records the platform message id for the next Send.
++// Optional capability (checked via type assertion by the engine).
++func (s *acpSession) SetCurrentMessageID(id string) {
++	s.sendMu.Lock()
++	s.currentMsgID = id
++	s.sendMu.Unlock()
++}
++
+ func (s *acpSession) Send(prompt string, images []core.ImageAttachment, files []core.FileAttachment) error {
+ 	if !s.alive.Load() {
+ 		return fmt.Errorf("acp: session closed")
+@@ -609,10 +622,21 @@ func (s *acpSession) Send(prompt string, images []core.ImageAttachment, files []
+ 	promptBlocks := []any{
+ 		map[string]any{"type": "text", "text": prompt},
+ 	}
++	s.sendMu.Lock()
++	msgID := s.currentMsgID
++	s.currentMsgID = ""
++	s.sendMu.Unlock()
++
+ 	params := map[string]any{
+ 		"sessionId": sid,
+ 		"prompt":    promptBlocks,
+ 	}
++	// the REAL platform message id rides along so the agent shim can use it
++	// as the idempotency key (identical text on a LATER message is a NEW
++	// message, never a duplicate-merged one)
++	if msgID != "" {
++		params["messageId"] = msgID
++	}
+ 
+ 	slog.Debug("acp: sending session/prompt", "session_id", sid, "prompt_len", len(prompt))
+ 	res, err := s.tr.call(s.ctx, "session/prompt", params)
+diff --git a/core/engine.go b/core/engine.go
+index b03975d..4fe7ca2 100644
+--- a/core/engine.go
++++ b/core/engine.go
+@@ -3711,6 +3711,9 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
+ 			sendDone <- fmt.Errorf("agent session became nil")
+ 			return
+ 		}
++		if m, ok := as.(interface{ SetCurrentMessageID(string) }); ok {
++			m.SetCurrentMessageID(msg.MessageID)
++		}
+ 		sendDone <- as.Send(promptContent, msg.Images, msg.Files)
+ 	}()
+ 
+@@ -5652,6 +5655,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
+ 						nextSend <- fmt.Errorf("agent session became nil")
+ 						return
+ 					}
++					if m, ok := as.(interface{ SetCurrentMessageID(string) }); ok {
++						m.SetCurrentMessageID(queued.messageID)
++					}
+ 					nextSend <- as.Send(queuedPrompt, queued.images, queued.files)
+ 				}()
+ 				pendingSend = nextSend
+@@ -5980,6 +5986,9 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
+ 				sendDone <- fmt.Errorf("agent session became nil")
+ 				return
+ 			}
++			if m, ok := as.(interface{ SetCurrentMessageID(string) }); ok {
++				m.SetCurrentMessageID(queued.messageID)
++			}
+ 			sendDone <- as.Send(prompt, queued.images, queued.files)
+ 		}()
+ 

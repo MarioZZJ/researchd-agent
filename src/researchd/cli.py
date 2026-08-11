@@ -87,12 +87,16 @@ def pilot() -> None:
 @pilot.command("create")
 @click.option("--project-id", required=True, help="pilot project id")
 @click.option("--question", default="", help="research question")
+@click.option("--owner-open-id", default="", help="REAL PI platform open_id (owner member; REQUIRED — the synthetic 'pi' owner is never auto-created)")
 @click.option("--import-decision", default="", help="import a decision as <id>=<answer> (e.g. D-001=A)")
 @click.option("--db", "db_path", default=None, help="database path (default: settings)")
 @click.pass_context
-def pilot_create(ctx: click.Context, project_id: str, question: str, import_decision: str, db_path: str | None) -> None:
+def pilot_create(ctx: click.Context, project_id: str, question: str, owner_open_id: str, import_decision: str, db_path: str | None) -> None:
     """Bootstrap the pilot project (idempotent). Creates the ACTIVE project
-    and optionally imports a pre-decided decision (IMPLEMENTATION.md §24)."""
+    and optionally imports a pre-decided decision (IMPLEMENTATION.md §24).
+
+    The owner member MUST be a real PI open_id: no synthetic 'pi' owner is
+    auto-created (fail-closed membership)."""
     from .domain.decision import Decision, DecisionOption
     from .domain.enums import DecisionStatus
     from .domain.project import Project
@@ -128,35 +132,52 @@ def pilot_create(ctx: click.Context, project_id: str, question: str, import_deci
             ProjectRepo(uow.session).save(
                 Project(project_id=project_id, name=project_id, description=question or "")
             )
-            # provision the owner member (fail-closed membership gate §22);
-            # the pilot PI acts as 'pi' on the internal API
+            # provision the owner member (fail-closed membership gate §22)
+            # with the REAL PI open_id ONLY — the synthetic 'pi' owner is
+            # never auto-created; without --owner-open-id the project is
+            # created member-less and the PI must be added explicitly
             from .persistence.models import ProjectMemberRow
 
-            uow.session.add(
-                ProjectMemberRow(
-                    id=f"PM-{project_id}-pi", member_id=f"PM-{project_id}-pi", project_id=project_id,
-                    platform_user_id="pi", role="owner", can_approve_decisions=True,
+            if owner_open_id:
+                uow.session.add(
+                    ProjectMemberRow(
+                        id=f"PM-{project_id}-{owner_open_id[:24]}",
+                        member_id=f"PM-{project_id}-{owner_open_id[:24]}",
+                        project_id=project_id,
+                        platform_user_id=owner_open_id, role="owner",
+                        can_approve_decisions=True,
+                    )
                 )
-            )
-            print(f"project {project_id} created (owner member provisioned)")
+                print(f"project {project_id} created (owner member {owner_open_id!r} provisioned)")
+            else:
+                print(
+                    f"project {project_id} created WITHOUT owner member — pass "
+                    "--owner-open-id <real PI open_id> to provision one"
+                )
         else:
             # idempotently provision the owner member on existing projects
             from .persistence.models import ProjectMemberRow
 
-            members = uow.session.execute(
-                ProjectMemberRow.__table__.select().where(
-                    ProjectMemberRow.project_id == project_id,
-                    ProjectMemberRow.platform_user_id == "pi",
-                )
-            ).first()
-            if members is None:
-                uow.session.add(
-                    ProjectMemberRow(
-                        id=f"PM-{project_id}-pi", member_id=f"PM-{project_id}-pi", project_id=project_id,
-                        platform_user_id="pi", role="owner", can_approve_decisions=True,
+            if owner_open_id:
+                members = uow.session.execute(
+                    ProjectMemberRow.__table__.select().where(
+                        ProjectMemberRow.project_id == project_id,
+                        ProjectMemberRow.platform_user_id == owner_open_id,
                     )
-                )
-                print(f"project {project_id} exists (owner member provisioned)")
+                ).first()
+                if members is None:
+                    uow.session.add(
+                        ProjectMemberRow(
+                            id=f"PM-{project_id}-{owner_open_id[:24]}",
+                            member_id=f"PM-{project_id}-{owner_open_id[:24]}",
+                            project_id=project_id,
+                            platform_user_id=owner_open_id, role="owner",
+                            can_approve_decisions=True,
+                        )
+                    )
+                    print(f"project {project_id} exists (owner member {owner_open_id!r} provisioned)")
+                else:
+                    print(f"project {project_id} already exists (owner member present)")
             else:
                 print(f"project {project_id} already exists (no-op)")
         if import_decision:

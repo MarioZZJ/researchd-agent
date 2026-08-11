@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+
+from sqlalchemy import select
 import json
 
 import pytest
@@ -403,3 +406,79 @@ def test_scheduler_decision_gate_blocks_scope_and_reports(factory):
             await asyncio.sleep(0.03)
     asyncio.run(run_ticks2())
     assert len(loop.sender.port.deliveries) == n_before
+
+
+def test_decision_answer_updates_original_card_in_place(factory, tmp_path):
+    """Answering a decision PATCHes the already-sent card (receipt from the
+    report row) instead of sending a new meaningless card."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from researchd.domain.base import new_id
+    from researchd.domain.decision import Decision, DecisionOption
+    from researchd.domain.project import Project
+    from researchd.domain.task import Task, TaskContract, Budget, SuccessCriterion
+    from researchd.domain.enums import TaskStatus
+    from researchd.persistence.models import ReportRow
+    from researchd.persistence.repositories import DecisionRepo, ProjectRepo, TaskRepo
+    from researchd.persistence.transaction import UnitOfWork
+    from researchd.scheduler.outbox_sender import OutboxSender
+
+    ws = tmp_path / "ws"
+    ws.mkdir(exist_ok=True)
+    with UnitOfWork(factory) as uow:
+        ProjectRepo(uow.session).save(
+            Project(project_id="P-UPD", name="u", description="d", workspace_root=str(ws))
+        )
+        TaskRepo(uow.session).save(
+            Task(task_id="T-UPD", project_id="P-UPD", status=TaskStatus.READY,
+                 contract=TaskContract(task_id="T-UPD", role="analysis_worker", objective="o",
+                                       success_criteria=[SuccessCriterion(id="SC-1", text="c")],
+                                       budget=Budget(max_wall_seconds=60)),
+                 blocked_by=[])
+        )
+        uow.commit()
+    with UnitOfWork(factory) as uow:
+        d = Decision(
+            decision_id="D-UPD", project_id="P-UPD", category="analysis_strategy",
+            question="继续吗？",
+            options=[DecisionOption(option_id="yes", label="继续"), DecisionOption(option_id="no", label="停止")],
+        )
+        DecisionRepo(uow.session).save(d)
+        uow.session.add(
+            ReportRow(
+                id=new_id("report"), report_id="R-UPD",
+                spec_json={"decision_id": "D-UPD"},
+                platform_message_id="om_card_123", status="SENT",
+            )
+        )
+        uow.commit()
+
+    # answer via the route handler (in-process call)
+    from researchd.api.routes.projects import _enqueue_decision_card_update
+
+    with UnitOfWork(factory) as uow:
+        d = DecisionRepo(uow.session).get_by_decision_id("D-UPD")
+        d.transition("OPEN")  # CANDIDATE -> OPEN before answering
+        d.apply_answer("yes", actor="ou_real_pi", version=1)
+        DecisionRepo(uow.session).save(d)
+        _enqueue_decision_card_update(uow.session, d, "ou_real_pi", "yes")
+        uow.commit()
+
+    with UnitOfWork(factory) as uow:
+        from researchd.persistence.models import OutboxRow
+
+        rows = uow.session.execute(
+            select(OutboxRow).where(OutboxRow.payload_json["kind"].as_string() == "decision_update")
+        ).scalars().all()
+        assert len(rows) == 1
+        p = rows[0].payload_json
+        assert p["platform_message_id"] == "om_card_123"
+        assert "ou_real_pi" in p["body"]
+
+    # sending the row calls port.update (PATCH) — never deliver (new card)
+    fake = AsyncMock()
+    sender = OutboxSender(factory, fake, doc_platform=None)
+    asyncio.run(sender.send_pending())
+    fake.update.assert_awaited_once()
+    fake.deliver.assert_not_awaited()

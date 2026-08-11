@@ -212,8 +212,9 @@ async def schedule_report(session_factory, *, project_id: str) -> ReporterResult
             _emit_report(session, project_id, report_id, spec, compressed.body, compressed.source)
         assert last_report_id is not None
 
-        # persist the new snapshot signature atomically with the emission
+        # persist the FULL new snapshot atomically with the emission
         new_hash = signature + "|open:" + ",".join(sorted(current_open))
+        snapshot_data = _snapshot_dict(snapshot)
         if row is None:
             session.add(
                 ProjectionStateRow(
@@ -222,10 +223,12 @@ async def schedule_report(session_factory, *, project_id: str) -> ReporterResult
                     document_id="report-state",
                     section_key="snapshot",
                     content_hash=new_hash,
+                    snapshot_json=snapshot_data,
                 )
             )
         else:
             row.content_hash = new_hash
+            row.snapshot_json = snapshot_data
         session.commit()
         return ReporterResult(report_id=last_report_id, sent=True, reason="queued")
 
@@ -326,6 +329,16 @@ def _emit_report(session, project_id: str, report_id: str, spec: ReportSpec, bod
         payload=payload,
         project_id=project_id,
     )
+
+
+def _snapshot_dict(snapshot: StateSnapshot) -> dict:
+    """Full persisted state snapshot (deterministic; ts excluded so replays
+    compare state, not wall-clock)."""
+    import dataclasses
+
+    data = dataclasses.asdict(snapshot)
+    data.pop("ts", None)
+    return data
 
 
 def diff_reason(session, project_id: str) -> list[str]:  # noqa: ANN001

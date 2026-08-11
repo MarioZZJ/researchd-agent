@@ -34,10 +34,24 @@ def _client() -> httpx.Client:
     headers = {}
     if settings.api.token:
         headers["Authorization"] = f"Bearer {settings.api.token}"
-    return httpx.Client(transport=transport, headers=headers, base_url="http://localhost", timeout=10.0)
+    # TCP base URL MUST honor the configured port (a bare http://localhost
+    # would silently hit :80 and never reach the service)
+    base = "http://localhost"
+    if not settings.api.socket_path:
+        base = f"http://{settings.api.tcp_host}:{settings.api.tcp_port}"
+    return httpx.Client(transport=transport, headers=headers, base_url=base, timeout=10.0)
+
+
+_MUTATING_METHODS = {"POST", "PATCH", "PUT", "DELETE"}
 
 
 def _call(method: str, path: str, **kw) -> dict:
+    settings = default_settings()
+    if method.upper() in _MUTATING_METHODS and not settings.api.token:
+        raise click.ClickException(
+            "mutating call requires RESEARCHD_API__TOKEN (fail-closed: "
+            "never send a state-changing request without the bearer token)"
+        )
     with _client() as client:
         resp = client.request(method, path, **kw)
         if resp.status_code >= 400:

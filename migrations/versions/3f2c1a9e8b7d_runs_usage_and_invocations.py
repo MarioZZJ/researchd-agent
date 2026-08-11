@@ -21,6 +21,10 @@ def upgrade() -> None:
     # is unavailable — never fabricated)
     with op.batch_alter_table("runs") as batch_op:
         batch_op.add_column(sa.Column("usage_json", sa.JSON(), nullable=True))
+    # reporter persists the FULL previous state snapshot (not just a hash) so
+    # the next tick can compute a real semantic diff
+    with op.batch_alter_table("projection_states") as batch_op:
+        batch_op.add_column(sa.Column("snapshot_json", sa.JSON(), nullable=True))
     # planner invocations have no task/run row (planner is project-level):
     # this table makes EVERY model call traceable end-to-end
     op.create_table(
@@ -51,5 +55,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("invocations")
+    with op.batch_alter_table("projection_states") as batch_op:
+        batch_op.drop_column("snapshot_json")
     with op.batch_alter_table("runs") as batch_op:
         batch_op.drop_column("usage_json")

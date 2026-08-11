@@ -136,3 +136,58 @@ def test_pilot_create_cli_available():
     result = runner.invoke(main, ["pilot", "create", "--help"])
     assert result.exit_code == 0
     assert "--project-id" in result.output
+
+
+def test_ctl_tcp_base_url_uses_configured_port(monkeypatch):
+    """TCP fallback must use the configured tcp_host/tcp_port, never a bare
+    http://localhost (which would silently hit :80)."""
+    from researchd import ctl
+
+    captured = {}
+
+    class FakeSettings:
+        class Api:
+            socket_path = ""
+            token = "tok"
+            tcp_host = "127.0.0.1"
+            tcp_port = 9999
+
+        api = Api()
+
+    class FakeClient:
+        def __init__(self, transport=None, headers=None, base_url=None, timeout=None):
+            captured["base_url"] = base_url
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def request(self, method, path, **kw):
+            return type("R", (), {"status_code": 200, "json": lambda self: {}, "text": "", "headers": {"content-type": "application/json"}})()
+
+    monkeypatch.setattr(ctl, "default_settings", lambda: FakeSettings())
+    monkeypatch.setattr("researchd.ctl.httpx.Client", FakeClient)
+    ctl._call("GET", "/healthz")
+    assert captured["base_url"] == "http://127.0.0.1:9999"
+
+
+def test_ctl_mutating_call_fails_closed_without_token(monkeypatch):
+    """A state-changing researchctl call without a configured token must
+    refuse locally (fail-closed), not send an unauthenticated request."""
+    from researchd import ctl
+    from researchd.config import Settings
+
+    class FakeSettings:
+        class Api:
+            socket_path = "/tmp/x.sock"
+            token = ""
+            tcp_host = "127.0.0.1"
+            tcp_port = 8777
+
+        api = Api()
+
+    monkeypatch.setattr(ctl, "default_settings", lambda: FakeSettings())
+    with pytest.raises(Exception, match="RESEARCHD_API__TOKEN"):
+        ctl._call("POST", "/v1/projects", json={"name": "x"})

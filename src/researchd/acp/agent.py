@@ -152,9 +152,14 @@ class AcpServer:
         prompt = params.get("prompt", "")
         if isinstance(prompt, list):  # content blocks
             prompt = " ".join(b.get("text", "") for b in prompt if isinstance(b, dict))
+        # REAL platform message id (cc-connect sends msg.ID): used verbatim as
+        # the idempotency key, so a user re-sending the SAME text later is a
+        # NEW message, never a duplicate-merged one (the old hash-based key
+        # merged legitimate repeats forever)
+        message_id = params.get("messageId") or None
         from .inbound import process_prompt
 
-        reply = await process_prompt(self.settings, session, prompt)
+        reply = await process_prompt(self.settings, session, prompt, message_id=message_id)
         return {
             "sessionId": session.session_id,
             "requestId": f"REQ-{session.request_counter()}",

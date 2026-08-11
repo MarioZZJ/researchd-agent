@@ -24,7 +24,7 @@ class PromptReply:
     command: str | None = None
 
 
-async def process_prompt(settings: Settings, session: InteractionSession, prompt: str) -> PromptReply:
+async def process_prompt(settings: Settings, session: InteractionSession, prompt: str, *, message_id: str | None = None) -> PromptReply:
     """Process one user prompt from cc-connect."""
     stripped = prompt.strip()
     if not stripped:
@@ -42,7 +42,7 @@ async def process_prompt(settings: Settings, session: InteractionSession, prompt
             return await _bind_project(settings, session, cmd)
         if cmd.name == "model" and cmd.args and cmd.args[0] == "interaction":
             return _set_interaction(session, cmd)
-        return await _submit(settings, session, stripped, intent="deterministic_command", command=cmd.name)
+        return await _submit(settings, session, stripped, intent="deterministic_command", command=cmd.name, message_id=message_id)
 
     # 2. optional constrained intent classification (never for deterministic)
     if (
@@ -53,7 +53,8 @@ async def process_prompt(settings: Settings, session: InteractionSession, prompt
         if intent is not None and intent.confidence >= settings.interaction.intent_confidence_threshold:
             if intent.command_text:
                 return await _submit(
-                    settings, session, intent.command_text, intent=intent.name, command=intent.command_name
+                    settings, session, intent.command_text, intent=intent.name,
+                    command=intent.command_name, message_id=message_id,
                 )
             return PromptReply(text=intent.explanation, intent=intent.name)
 
@@ -96,7 +97,7 @@ async def _service_check(settings: Settings, project_id: str) -> tuple[bool, str
         return False, f"service unreachable: {exc}"
 
 
-async def _submit(settings: Settings, session: InteractionSession, text: str, *, intent: str, command: str | None) -> PromptReply:
+async def _submit(settings: Settings, session: InteractionSession, text: str, *, intent: str, command: str | None, message_id: str | None = None) -> PromptReply:
     """POST the normalized inbound message to the service internal API.
 
     The idempotency key is a hash of the platform session identity + prompt

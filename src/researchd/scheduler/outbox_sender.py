@@ -126,7 +126,20 @@ class OutboxSender:
 
     async def _deliver(self, row) -> str:  # noqa: ANN001
         payload = row.payload_json or {}
-        if (payload.get("kind") or "message") == DOC_BLOCK_KIND:
+        kind = payload.get("kind") or "message"
+        if kind == "decision_update":
+            # in-place update of an already-sent decision card (never a new
+            # meaningless card): the platform_message_id receipt comes from
+            # the report row written at send time
+            mid = payload.get("platform_message_id") or ""
+            if not mid:
+                raise RuntimeError("decision_update without platform_message_id")
+            await self.port.update(
+                mid,
+                {"title": payload.get("title", "researchd"), "body": payload.get("body", "")},
+            )
+            return mid
+        if kind == DOC_BLOCK_KIND:
             if self.doc_platform is None:
                 raise RuntimeError("doc_block outbox row but no doc platform configured")
             document_id = payload["document_id"]

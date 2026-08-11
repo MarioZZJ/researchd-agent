@@ -48,6 +48,11 @@ def build_card_payload(payload: dict, *, session_key: str | None = None) -> str:
     body: markdown body; buttons: decision options with a command value that
     cc-connect dispatches back as a user message (cmd: protocol), so a button
     click keeps the real platform user id and the decision version.
+
+    NO session_key is injected into the button value: cc-connect derives the
+    session from the CLICKER's own identity (chat+user), so in a shared chat
+    each member's click is attributed to THAT member — a fixed session_key
+    would attribute every click to whoever clicked first.
     """
     body = payload.get("body") or ""
     title = payload.get("title") or "researchd"
@@ -60,12 +65,13 @@ def build_card_payload(payload: dict, *, session_key: str | None = None) -> str:
             if not cmd:
                 continue
             value: dict[str, Any] = {"action": f"cmd:{cmd}"}
-            if session_key:
-                value["session_key"] = session_key
+            # neutral in-place feedback: NOT a success claim — the actual
+            # outcome (accepted/expired/non-member/duplicate) is shown by
+            # the decision card update after the service processed it
             value["after_click"] = {
-                "title": "已提交",
-                "color": "green",
-                "markdown": f"已记录你的选择：{b.get('text', '')}",
+                "title": "已收到",
+                "color": "blue",
+                "markdown": "已收到你的选择，处理结果将随后更新",
             }
             actions.append(
                 {

@@ -156,7 +156,28 @@ def compile_sections(session: Session, project_id: str) -> dict[str, SectionCont
         key="decisions",
         text="## 决策\n" + ("\n".join(decision_lines) if decision_lines else "（暂无）"),
     )
-    sections["milestones"] = SectionContent(key="milestones", text="## 里程碑\n（暂无）")
+    # milestones: compiled from REAL milestone.reached events (never a
+    # hardcoded placeholder); each entry cites the task/decision it came from
+    from ..domain.events import make_event  # noqa: F401  (type registry)
+    from ..persistence.repositories import EventRepo
+
+    from sqlalchemy import select
+
+    from ..persistence.models import EventRow
+
+    milestone_rows = session.execute(
+        select(EventRow)
+        .where(EventRow.project_id == project_id, EventRow.event_type == "milestone.reached")
+        .order_by(EventRow.occurred_at)
+    ).scalars().all()
+    milestone_lines = []
+    for m in milestone_rows:
+        body = (m.payload_json or {}).get("body", "")
+        milestone_lines.append(f"- {body[:200]}" if body else f"- {m.idempotency_key}")
+    sections["milestones"] = SectionContent(
+        key="milestones",
+        text="## 里程碑\n" + ("\n".join(milestone_lines) if milestone_lines else "（暂无）"),
+    )
     # PI Notes: PI-owned; the system NEVER writes it
     sections[PI_NOTES_SECTION] = SectionContent(
         key=PI_NOTES_SECTION, text="## PI Notes\n（仅 PI 编辑）", owner="pi"

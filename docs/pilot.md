@@ -29,6 +29,7 @@ uv run researchd service &          # 或 systemd user unit（见 docs/deploymen
 
 # 2. 注入 pilot 项目 + D-001（确定性脚本，幂等）
 uv run researchd pilot create --project-id interdisciplinary-citation-pilot \
+  --owner-open-id <真实 PI 的 open_id> \
     --question '比较 2017–2019 与 2021–2023 年论文参考文献的学科组成和跨学科引用份额变化，描述疫情前后知识来源结构发生了什么变化。' \
     --import-decision D-001=A
 

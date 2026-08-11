@@ -413,6 +413,7 @@ class ProjectionStateRow(Base):
     section_key: Mapped[str] = mapped_column(String(128), nullable=False)
     block_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    snapshot_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # full previous state snapshot (reporter)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
     UniqueConstraint("project_id", "document_id", "section_key", name="uq_projection_section")
 
