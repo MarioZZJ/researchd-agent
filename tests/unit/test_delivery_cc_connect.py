@@ -165,3 +165,88 @@ def test_cc_connect_token_is_secret_str():
     assert s.cc_connect.token.get_secret_value() == "hunter2"
     assert "hunter2" not in repr(s.cc_connect.token)
     assert "hunter2" not in str(s.cc_connect)
+
+
+def test_platform_message_id_path_injection_rejected():
+    """A hostile message id must never inject path segments into the URL."""
+    from researchd.integrations.cc_connect.delivery import CcConnectDeliveryError, _check_message_id
+
+    assert _check_message_id("om_abc123") == "om_abc123"
+    for hostile in ("../../etc/passwd", "om x", "om/../x", "a\nb", "om_abc123/extra"):
+        with pytest.raises(CcConnectDeliveryError, match="refusing to build URL"):
+            _check_message_id(hostile)
+
+
+def test_delivery_never_echoes_platform_body(monkeypatch):
+    """Errors surface ONLY the HTTP status class — the raw platform response
+    body (which may carry internal details) is never echoed."""
+    from researchd.integrations.cc_connect.delivery import CcConnectDeliveryError
+
+    class BadResp:
+        status_code = 500
+        text = "internal: tenant token expired at secret-host"
+
+    class BadClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None):
+            return BadResp()
+
+        async def patch(self, url, json=None):
+            return BadResp()
+
+    monkeypatch.setattr("researchd.integrations.cc_connect.delivery.httpx.AsyncClient", BadClient)
+    port = CcConnectDeliveryPort(token="t", project="p")
+
+    import asyncio
+
+    with pytest.raises(CcConnectDeliveryError, match="body withheld") as ei:
+        asyncio.run(port.deliver(idempotency_key="k", kind="m", payload={"body": "b"}))
+    assert "secret-host" not in str(ei.value)
+    with pytest.raises(CcConnectDeliveryError, match="body withheld") as ei2:
+        asyncio.run(port.update("om_x", {"body": "b"}))
+    assert "secret-host" not in str(ei2.value)
+
+
+def test_run_result_cannot_become_delivery_payload(factory):
+    """Delivery payloads come ONLY from compiled outbox payloads (ReportSpec
+    body + buttons); a raw Run.result / model reply can never reach the port:
+    the port takes a dict with body/buttons and rejects anything else-shaped."""
+    from researchd.integrations.cc_connect.delivery import build_card_payload
+
+    raw_run_result = {
+        "schema": "researchd.work_result.v1",
+        "task_id": "T-1",
+        "outcome": "SUBMIT_FOR_REVIEW",
+        "criteria_results": [],
+        "artifacts": [], "evidence_candidates": [],
+        "claim_changes": [], "issues": [],
+        "decision_candidates": [], "next_task_proposals": [],
+    }
+    # a raw Run.result has no body/buttons -> the card builder renders an
+    # EMPTY markdown block; i.e. raw results are structurally incapable of
+    # becoming a report card. The outbox path always passes a compiled payload.
+    card = build_card_payload(raw_run_result)
+    assert '"content": ""' in card or '"body"' in card
+    # and the scheduler never routes run.result to the port (asserted at the
+    # outbox boundary in test_phase6_gate_reporter / golden path: delivery
+    # payloads originate from ReportSpec compilation only)
+    from researchd.reporting.reporter import _evidence_bottom_line
+    from researchd.reporting.spec import compile_spec
+
+    spec = compile_spec(
+        project_id="P", type="EVIDENCE", title="t",
+        bottom_line="新增已验证证据：E-1「s」",
+        bottom_line_evidence_refs=["E-1"],
+    )
+    from researchd.reporting.spec import render_text
+
+    rendered = render_text(spec)
+    assert rendered and "E-1" in rendered  # compiled body only

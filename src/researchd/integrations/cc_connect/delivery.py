@@ -15,6 +15,7 @@ cc-connect target is not configured.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import httpx
@@ -23,9 +24,22 @@ from ...scheduler.outbox_sender import DeliveryPort
 
 DEFAULT_BASE_URL = "http://127.0.0.1:9820"
 
+# platform message ids are cc-connect/Feishu opaque ids: URL-safe only
+_MESSAGE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
+
 
 class CcConnectDeliveryError(RuntimeError):
     pass
+
+
+def _check_message_id(platform_message_id: str) -> str:
+    """Path-safe validation: only URL-safe characters, so a hostile id can
+    never inject path segments into the management API URL."""
+    if not _MESSAGE_ID_RE.fullmatch(platform_message_id):
+        raise CcConnectDeliveryError(
+            f"invalid platform_message_id {platform_message_id[:20]!r} (refusing to build URL)"
+        )
+    return platform_message_id
 
 
 def build_card_payload(payload: dict, *, session_key: str | None = None) -> str:
@@ -114,13 +128,19 @@ class CcConnectDeliveryPort(DeliveryPort):
                 },
             )
         if resp.status_code >= 400:
+            # NEVER echo the raw platform response body (it may carry internal
+            # details); only the status class is surfaced
             raise CcConnectDeliveryError(
-                f"cc-connect delivery failed: HTTP {resp.status_code}: {resp.text[:300]}"
+                f"cc-connect delivery failed: HTTP {resp.status_code} (body withheld)"
             )
         data = resp.json()
-        return data.get("platform_message_id", "")
+        mid = data.get("platform_message_id", "")
+        if mid:
+            _check_message_id(mid)
+        return mid
 
     async def update(self, platform_message_id: str, payload: dict) -> None:
+        _check_message_id(platform_message_id)
         message = build_card_payload(payload, session_key=self.session_key)
         async with self._client() as client:
             resp = await client.patch(
@@ -128,6 +148,7 @@ class CcConnectDeliveryPort(DeliveryPort):
                 json={"session_key": self.session_key, "message": message},
             )
         if resp.status_code >= 400:
+            # NEVER echo the raw platform response body (see deliver())
             raise CcConnectDeliveryError(
-                f"cc-connect delivery update failed: HTTP {resp.status_code}: {resp.text[:300]}"
+                f"cc-connect delivery update failed: HTTP {resp.status_code} (body withheld)"
             )
