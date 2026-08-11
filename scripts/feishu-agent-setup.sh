@@ -48,7 +48,12 @@ fi
 CURL_CFG=$(mktemp /tmp/cc-setup-curl.XXXXXX)
 chmod 600 "$CURL_CFG"
 printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" > "$CURL_CFG"
-trap 'rm -f "$CURL_CFG"' EXIT
+# one cleanup function removes EVERY temp file on any exit path (token file
+# + secret file); it is installed once and stays installed until exit
+_cleanup() {
+  rm -f "${CURL_CFG:-}" "${SEC_FILE:-}"
+}
+trap _cleanup EXIT
 unset TOKEN
 DEVICE_CODE="${2:-}"
 
@@ -137,9 +142,6 @@ cp "$CONFIG" "$BAK" && chmod 600 "$BAK" && echo "   已备份配置到 $BAK（06
 # 0600 perms; the file is removed immediately after use
 SEC_FILE=$(mktemp /tmp/cc-setup-secret.XXXXXX)
 chmod 600 "$SEC_FILE"
-# cleanup on EVERY exit path (a failed pipeline must not leave the secret
-# behind in /tmp)
-trap 'rm -f "$SEC_FILE"' EXIT
 printf '%s' "$APP_SECRET" > "$SEC_FILE"
 SAVE=$(python3 - "$PROJECT" "$APP_ID" "$PLATFORM" "$OWNER" "$SEC_FILE" <<'PYEOF' | curl -sS --max-time 20 --config "$CURL_CFG" -H "Content-Type: application/json" --data-binary @- "$BASE/api/v1/setup/feishu/save"
 import json, sys
@@ -153,7 +155,7 @@ print(json.dumps({
 PYEOF
 )
 rm -f "$SEC_FILE"
-trap - EXIT
+unset SEC_FILE
 # only allowlisted fields are printed; never fall back to the whole response
 SAVE_MSG=$(printf '%s' "$SAVE" | python3 -c "
 import json, sys

@@ -156,6 +156,45 @@ class FeishuDocClient:
         )
         return False
 
+    async def remove_permission_member(
+        self,
+        document_id: str,
+        *,
+        member_type: str,
+        member_id: str,
+    ) -> bool:
+        """Revoke a collaborator. Returns False when the platform denies it
+        (missing scope); the denial is logged by code only."""
+        import lark_oapi as lark
+
+        def _remove():
+            from lark_oapi.api.drive.v1.model.delete_permission_member_request import (
+                DeletePermissionMemberRequest,
+            )
+
+            req = (
+                lark.drive.v1.DeletePermissionMemberRequest.builder()
+                .token(document_id)
+                .type("docx")
+                .member_type(member_type)
+                .member_id(member_id)
+                .build()
+            )
+            return self._client().drive.v1.permission_member.delete(req)
+
+        resp = await self._call(_remove, "remove_permission_member")
+        if resp.success():
+            logger.info(
+                "feishu doc collaborator removed: document_id=%s member_type=%s",
+                document_id, member_type,
+            )
+            return True
+        logger.warning(
+            "feishu doc collaborator revoke denied: document_id=%s member_type=%s code=%s (raw body withheld)",
+            document_id, member_type, resp.code,
+        )
+        return False
+
     # real platform rate-limit / transient business codes (lark docx + auth):
     # 99991663 tenant_access_token rate limit; 99991400 concurrent limit;
     # 1061001/1061002 document not ready/version conflicts handled separately

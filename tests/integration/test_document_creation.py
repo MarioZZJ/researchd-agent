@@ -119,6 +119,27 @@ async def test_collaborators_added_and_denied_gracefully(db, project):
 
 
 @pytest.mark.asyncio
+async def test_principal_rotation_revokes_stale_collaborator(db, project):
+    """Rotating the PI (or chat) grants the new principal AND revokes the
+    former one — stale collaborators never keep access."""
+    platform = FakeDocPlatform()
+    with db() as session:
+        await _ensure(session, platform, project, pi_open_id="ou_pi_1")
+        session.commit()
+    with db() as session:
+        await _ensure(session, platform, project, pi_open_id="ou_pi_2")
+        session.commit()
+    doc = platform.documents["doc-1"]
+    pi_members = [m for m in doc["members"] if m["member_type"] == "openid"]
+    assert {m["member_id"] for m in pi_members} == {"ou_pi_2"}  # old PI revoked
+    with db() as session:
+        project2 = ProjectRepo(session).get_by_project_id("proj-doc-1")
+        shared = (project2.metadata or {}).get("feishu_document_shared", "")
+        assert "openid:ou_pi_1" not in shared
+        assert "openid:ou_pi_2" in shared
+
+
+@pytest.mark.asyncio
 async def test_first_projection_flows_through_outbox(db, project):
     """ensure + sync: the queued doc_block rows are the same content the
     projection would enqueue; after the outbox sender runs, blocks exist."""

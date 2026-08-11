@@ -124,6 +124,16 @@ class FakeDocPlatform(DocPlatform):
         )
         return True
 
+    async def remove_permission_member(
+        self, document_id: str, *, member_type: str, member_id: str
+    ) -> bool:
+        members = self.documents.setdefault(document_id, {"members": []})["members"]
+        before = len(members)
+        self.documents[document_id]["members"] = [
+            m for m in members if not (m["member_type"] == member_type and m["member_id"] == member_id)
+        ]
+        return len(self.documents[document_id]["members"]) != before
+
     async def list_blocks(self, document_id: str) -> dict[str, str]:
         return dict(self.blocks.get(document_id, {}))
 
@@ -325,25 +335,42 @@ async def _ensure_shared(
     from ..persistence.repositories import ProjectRepo
 
     metadata = dict(project.metadata or {})
-    shared = set((metadata.get("feishu_document_shared") or "").split(","))
+    # marker stores "member_type:member_id" so rotations re-grant to the NEW
+    # principal AND revoke the former one
+    marked = {x for x in (metadata.get("feishu_document_shared") or "").split(",") if x}
     targets = [
         ("openchat:" + staging_chat_id, "openchat", staging_chat_id, "view"),
         ("openid:" + pi_open_id, "openid", pi_open_id, default_permission),
     ]
+    desired = {label for label, member_type, member_id, _ in targets if member_id}
+    # revoke principals that are no longer desired
+    for stale in marked - desired:
+        member_type, _, member_id = stale.partition(":")
+        if not member_id:
+            continue
+        try:
+            await platform.remove_permission_member(doc_id, member_type=member_type, member_id=member_id)
+            marked.discard(stale)
+            logger.info("document share revoked: doc=%s %s", doc_id, stale)
+        except Exception as exc:  # noqa: BLE001 — best-effort by design
+            logger.warning(
+                "document revoke skipped (code %s): doc=%s member=%s",
+                getattr(exc, "code", "unknown"), doc_id, stale,
+            )
     for label, member_type, member_id, perm in targets:
-        if not member_id or label in shared:
+        if not member_id or label in marked:
             continue
         try:
             await platform.add_permission_member(
                 doc_id, member_type=member_type, member_id=member_id, perm=perm
             )
-            shared.add(label)
+            marked.add(label)
         except Exception as exc:  # noqa: BLE001 — best-effort by design
             logger.warning(
                 "document share skipped (code %s): doc=%s member=%s — will retry on next replay",
                 getattr(exc, "code", "unknown"), doc_id, label,
             )
-    metadata["feishu_document_shared"] = ",".join(sorted(shared))
+    metadata["feishu_document_shared"] = ",".join(sorted(marked))
     project.metadata = metadata
     ProjectRepo(session).save(project)
 
