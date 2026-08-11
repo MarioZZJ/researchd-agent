@@ -83,6 +83,18 @@ class DocumentTestResponse(BaseModel):
     note: str
 
 
+class DocumentCreateRequest(BaseModel):
+    project_id: str = Field(min_length=1, description="project id")
+    title: str = Field(default="", description="optional title override (uses template when empty)")
+
+
+class DocumentCreateResponse(BaseModel):
+    project_id: str
+    document_id: str
+    title: str = ""
+    note: str = ""
+
+
 @router.post("/document/create", dependencies=[Depends(require_token)])
 async def document_create(request: Request, body: DocumentCreateRequest) -> DocumentCreateResponse:
     """Create the project's feishu docx ONCE and persist the receipt
@@ -127,18 +139,6 @@ async def document_create(request: Request, body: DocumentCreateRequest) -> Docu
         title=(project.metadata or {}).get("feishu_document_title", ""),
         note="document created/confirmed and collaborators granted (best-effort)",
     )
-
-
-class DocumentCreateRequest(BaseModel):
-    project_id: str = Field(min_length=1, description="project id")
-    title: str = Field(default="", description="optional title override (uses template when empty)")
-
-
-class DocumentCreateResponse(BaseModel):
-    project_id: str
-    document_id: str
-    title: str = ""
-    note: str = ""
 
 
 @router.post("/document/test", dependencies=[Depends(require_token)])

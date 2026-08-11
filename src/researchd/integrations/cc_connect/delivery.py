@@ -84,10 +84,13 @@ def build_card_payload(payload: dict, *, session_key: str | None = None) -> str:
         if actions:
             elements.append({"tag": "action", "actions": actions})
     card = {
-        "schema": "2.0",
-        "config": {"update_multi": True},
+        # Card 1.0 (NOT schema 2.0): cc-connect's createMessageHandle renders
+        # card 1.0 via the Im.Message.Create interactive path, and card 2.0
+        # rejects the 1.0 `tag: action` button element ("cards of schema V2
+        # no longer support this capability"). Drop schema to stay 1.0.
+        "config": {"wide_screen_mode": True},
         "header": {"title": {"tag": "plain_text", "content": title[:100]}},
-        "body": {"elements": elements},
+        "elements": elements,
     }
     return json.dumps(card, ensure_ascii=False)
 
@@ -140,7 +143,9 @@ class CcConnectDeliveryPort(DeliveryPort):
                 f"cc-connect delivery failed: HTTP {resp.status_code} (body withheld)"
             )
         data = resp.json()
-        mid = data.get("platform_message_id", "")
+        # cc-connect wraps payloads as {"data": {...}, "ok": true}
+        inner = data.get("data") if isinstance(data, dict) else None
+        mid = (inner or {}).get("platform_message_id", "") if isinstance(inner, dict) else ""
         if mid:
             _check_message_id(mid)
         return mid

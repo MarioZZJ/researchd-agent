@@ -252,19 +252,15 @@ async def ensure_project_document(
 
     existing = (project.metadata or {}).get("feishu_document_id")
     if existing:
+        # idempotent replay: never create a second document, but retry a
+        # missing collaborator share (e.g. docs:doc scope granted later)
+        await _ensure_shared(session, platform, project, existing, staging_chat_id, pi_open_id, default_permission)
         return existing
     from datetime import date
 
     title = title_template.format(project_name=project.name, date=date.today().isoformat())
     doc_id, revision = await platform.create_document(title, folder_token=folder_token or None)
-    if staging_chat_id:
-        await platform.add_permission_member(
-            doc_id, member_type="openchat", member_id=staging_chat_id, perm=default_permission
-        )
-    if pi_open_id:
-        await platform.add_permission_member(
-            doc_id, member_type="openid", member_id=pi_open_id, perm=default_permission
-        )
+    await _ensure_shared(session, platform, project, doc_id, staging_chat_id, pi_open_id, default_permission)
     # same-transaction write-back: receipt + event + first projection outbox
     project.metadata = dict(project.metadata or {})
     project.metadata["feishu_document_id"] = doc_id
@@ -277,8 +273,7 @@ async def ensure_project_document(
             event_type="document.created",
             aggregate=AggregateRef(type="project", id=project.id, version=project.version),
             idempotency_key=f"project:{project.project_id}:document.created:{doc_id}",
-            project_id=project.project_id,
-            payload={"document_id": doc_id, "title": title, "revision": revision},
+            project_id=project.project_id,            payload={"document_id": doc_id, "title": title, "revision": revision},
         )
     )
     # first projection outbox: queue all sections (write-back happens in the
@@ -302,6 +297,48 @@ async def ensure_project_document(
         project.project_id, doc_id, title,
     )
     return doc_id
+
+
+async def _ensure_shared(
+    session: Session,
+    platform: DocPlatform,
+    project,
+    doc_id: str,
+    staging_chat_id: str,
+    pi_open_id: str,
+    default_permission: str,
+) -> None:
+    """Best-effort collaborator sharing with a persisted shared marker.
+
+    A missing drive scope (e.g. docs:doc not yet granted) must NOT block the
+    projection: the denial is logged by code only, the document receipt is
+    still persisted, and a later replay (after the scope is granted) retries
+    the share. The marker records what was shared so retries are precise.
+    """
+    logger = logging.getLogger("researchd.doc")
+    from ..persistence.repositories import ProjectRepo
+
+    metadata = dict(project.metadata or {})
+    shared = set((metadata.get("feishu_document_shared") or "").split(","))
+    for label, member_type, member_id in (
+        ("chat", "openchat", staging_chat_id),
+        ("pi", "openid", pi_open_id),
+    ):
+        if not member_id or label in shared:
+            continue
+        try:
+            await platform.add_permission_member(
+                doc_id, member_type=member_type, member_id=member_id, perm=default_permission
+            )
+            shared.add(label)
+        except Exception as exc:  # noqa: BLE001 — best-effort by design
+            logger.warning(
+                "document share skipped (code %s): doc=%s member=%s — will retry on next replay",
+                getattr(exc, "code", "unknown"), doc_id, label,
+            )
+    metadata["feishu_document_shared"] = ",".join(sorted(shared))
+    project.metadata = metadata
+    ProjectRepo(session).save(project)
 
 
 def _pending_outbox(session: Session, prefix: str) -> bool:

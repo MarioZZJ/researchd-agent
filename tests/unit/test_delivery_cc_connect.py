@@ -32,9 +32,9 @@ def test_card_payload_is_real_interactive_card_with_buttons():
             session_key="oc_abc",
         )
     )
-    assert card["schema"] == "2.0"
+    assert "schema" not in card  # card 1.0 (schema 2.0 rejects tag:action)
     assert card["header"]["title"]["content"] == "决策 D-002"
-    elements = card["body"]["elements"]
+    elements = card["elements"]
     assert elements[0]["tag"] == "markdown"
     action = elements[1]
     assert action["tag"] == "action"
@@ -53,8 +53,8 @@ def test_card_payload_is_real_interactive_card_with_buttons():
 
 def test_card_payload_without_buttons_has_no_action_element():
     card = json.loads(build_card_payload({"title": "t", "body": "b"}))
-    assert card["body"]["elements"][0]["tag"] == "markdown"
-    assert len(card["body"]["elements"]) == 1
+    assert card["elements"][0]["tag"] == "markdown"
+    assert len(card["elements"]) == 1
 
 
 def test_port_fails_closed_without_token_or_project():
@@ -71,8 +71,11 @@ def test_port_send_and_update_shapes(monkeypatch):
         status_code = 200
         text = "{}"
 
+        def __init__(self, payload=None):
+            self._payload = payload or {"data": {"platform_message_id": "om_123", "replayed": False}}
+
         def json(self):
-            return {"platform_message_id": "om_123"}
+            return self._payload
 
     class FakeClient:
         def __init__(self, *a, **kw):
@@ -86,7 +89,7 @@ def test_port_send_and_update_shapes(monkeypatch):
 
         async def post(self, url, json=None):
             calls.append(("POST", url, json))
-            return FakeResp()
+            return FakeResp({"data": {"platform_message_id": "om_123", "replayed": False}})
 
         async def patch(self, url, json=None):
             calls.append(("PATCH", url, json))

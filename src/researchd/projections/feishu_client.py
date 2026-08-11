@@ -102,10 +102,12 @@ class FeishuDocClient:
 
         resp = await self._call(_create, "create_document")
         data = resp.data  # type: ignore[union-attr]
-        document_id = getattr(data, "document_id", None)
+        # lark-oapi wraps the payload as data.document (CreateDocumentResponseBody)
+        document = getattr(data, "document", None)
+        document_id = getattr(document, "document_id", None) if document is not None else None
         if not document_id:
             raise FeishuDocError("create_document returned no document_id", code=resp.code)
-        revision_id = getattr(data, "revision_id", None)
+        revision_id = getattr(document, "revision_id", None) if document is not None else None
         logger.info("feishu document created: document_id=%s (revision=%s)", document_id, revision_id)
         return DocumentCreated(document_id=document_id, revision_id=revision_id)
 
