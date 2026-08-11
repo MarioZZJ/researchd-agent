@@ -188,9 +188,19 @@ class ReasonixAdapter(ExecutorAdapter):
 
     def _transport_for_run(self, context: dict) -> ReasonixTransport:
         """Transport whose subprocess cwd is the run's project workspace
-        (from the persisted ContextPackage), so file operations stay inside
-        the workspace and researchd internals stay invisible."""
-        return self._transport_for((context or {}).get("workspace_root"))
+        (from the persisted ContextPackage). A REAL run without a workspace
+        fails closed — the overlay work dir is never used as a run cwd
+        (IMPLEMENTATION.md §15.2: workspace-confined means confined)."""
+        if self._explicit:
+            return self._transports["<explicit>"]
+        workspace = (context or {}).get("workspace_root")
+        if not workspace:
+            raise OverlayError(
+                "no workspace_root in context; refusing to run the executor "
+                "in the overlay work dir (fail-closed: real runs need a "
+                "project workspace)"
+            )
+        return self._transport_for(workspace)
 
     def _session_config(self, profile: dict) -> dict:
         cfg: dict = {}
@@ -236,8 +246,18 @@ class ReasonixAdapter(ExecutorAdapter):
             for attempt in range(MAX_REPAIRS + 1):
                 try:
                     raw = extract_json(text)
+                    # transcript path (path ONLY — content stays in the
+                    # executor's run dir, never in the DB) becomes part of
+                    # the session provenance for the scheduler to persist
+                    session_info.transcript_path = transport.last_transcript(session_id)
+                    # controlled runtime receipt: the model already produced
+                    # the full structured result — if we crash before
+                    # collect, recovery can finish WITHOUT calling the model
+                    # again (see reconcile_orphans receipt recovery)
+                    self._write_receipt(context, raw, session_info)
                     return validator(raw), session_info
                 except (ValueError, json.JSONDecodeError, ValidationFailure) as exc:
+                    self._clear_receipt(context)
                     error = str(exc)
                     if isinstance(exc, ValidationFailure):
                         error = sanitize_validation_error(exc.__cause__) if isinstance(exc.__cause__, ValidationError) else error
@@ -248,10 +268,44 @@ class ReasonixAdapter(ExecutorAdapter):
                         f"请只输出修正后的完整 JSON 文档（```json 代码块），不要解释。"
                     )
                     text = await transport.prompt(session_id, repair)
+            self._clear_receipt(context)
             raise TransportError(f"structured output failed after {MAX_REPAIRS} repairs: {error}")
         finally:
             # sessions are closed on every path (success, failure, cancel)
             await transport.close(session_id)
+
+    # ------------------------------------------------------------ runtime receipts
+    def _receipt_path(self, context: dict) -> Path | None:
+        run_id = (context or {}).get("run_id")
+        if not run_id:
+            return None
+        return Path(self._overlay_dir).resolve() / "receipts" / f"{run_id}.json"
+
+    def _write_receipt(self, context: dict, raw: dict, session_info: ExecutorSessionInfo) -> None:
+        """Durable completion receipt (0600) so a crash between model output
+        and collect never re-invokes the model. Contains the structured JSON +
+        provenance, NOT the transcript text."""
+        path = self._receipt_path(context)
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "role": context.get("role", "worker"),
+            "run_id": context.get("run_id"),
+            "session_id": session_info.session_id,
+            "transcript_path": session_info.transcript_path,
+            "extracted_at": __import__("researchd.domain.base", fromlist=["utcnow"]).utcnow(),
+            "raw": raw,
+        }
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False))
+        tmp.chmod(0o600)
+        tmp.replace(path)  # atomic
+
+    def _clear_receipt(self, context: dict) -> None:
+        path = self._receipt_path(context)
+        if path is not None and path.exists():
+            path.unlink()
 
     # ------------------------------------------------------------ ExecutorAdapter
     async def run_planner(self, context: dict, *, profile: dict) -> tuple[PlannerResult, ExecutorSessionInfo]:
@@ -282,6 +336,12 @@ class ReasonixAdapter(ExecutorAdapter):
         )
 
     # ------------------------------------------------------------ control
+    def last_transcript(self, session_id: str) -> str | None:
+        """Path of the persisted transcript for a session (path only)."""
+        if isinstance(self._transport, StdioReasonixTransport):
+            return self._transport.last_transcript(session_id)
+        return None
+
     async def steer(self, session_id: str, instruction: str) -> dict:
         for transport in self._transports.values():
             try:

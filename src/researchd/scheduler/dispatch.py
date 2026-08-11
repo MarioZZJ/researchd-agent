@@ -110,6 +110,9 @@ class RunDispatcher:
             "available": False,
             "reason": "executor does not report usage",
         }
+        run.metadata = dict(run.metadata or {})
+        if getattr(session_info, "transcript_path", None):
+            run.metadata["transcript_path"] = session_info.transcript_path  # path only
         run.transition(RunStatus.SUCCEEDED)
         RunRepo(self.session).save(run)
         LeaseRepo(self.session).release(run.lease_token)
@@ -212,6 +215,9 @@ class RunDispatcher:
             "available": False,
             "reason": "executor does not report usage",
         }
+        run.metadata = dict(run.metadata or {})
+        if getattr(session_info, "transcript_path", None):
+            run.metadata["transcript_path"] = session_info.transcript_path  # path only
         outcome = result.verdict.value if hasattr(result.verdict, "value") else str(result.verdict)
         run.outcome = outcome
         run.transition(RunStatus.SUCCEEDED)
@@ -259,13 +265,21 @@ def orphan_candidates(session: Session, *, max_age_seconds: int = ORPHAN_HEARTBE
     return out
 
 
-def reconcile_orphans(session: Session, *, max_age_seconds: int = ORPHAN_HEARTBEAT_SECONDS) -> list[str]:
-    """Reconcile stale runs after restart/crash: ORPHANED + task back to READY.
-    Returns the list of orphaned run ids."""
+def reconcile_orphans(session: Session, *, max_age_seconds: int = ORPHAN_HEARTBEAT_SECONDS, data_dir: str | Path | None = None) -> list[str]:
+    """Reconcile stale runs after restart/crash.
+
+    Receipt recovery: when the model ALREADY produced the full structured
+    result (runtime receipt written by the executor adapter before collect),
+    the run is finished from the receipt WITHOUT calling the model again.
+    Without a receipt the run is ORPHANED and the task requeued for retry
+    (the retry reason is recorded). Returns the list of handled run ids."""
     orphaned = []
     for run in orphan_candidates(session, max_age_seconds=max_age_seconds):
         dispatcher = RunDispatcher(session, None, actor=Actor(type="system"))  # type: ignore[arg-type]
-        run.termination_reason = "orphaned: heartbeat expired"
+        if data_dir and _recover_from_receipt(session, dispatcher, run, data_dir):
+            orphaned.append(run.run_id)
+            continue
+        run.termination_reason = "orphaned: heartbeat expired; no completion receipt; retry"
         run.transition(RunStatus.ORPHANED)
         RunRepo(session).save(run)
         task = TaskRepo(session).get_by_task_id(run.task_id)
@@ -274,3 +288,41 @@ def reconcile_orphans(session: Session, *, max_age_seconds: int = ORPHAN_HEARTBE
             TaskRepo(session).save(task)
         orphaned.append(run.run_id)
     return orphaned
+
+
+def _recover_from_receipt(session: Session, dispatcher: Any, run: Run, data_dir: str | Path) -> bool:
+    """Finish an orphaned run from its runtime receipt (model already
+    produced the result). Returns True when recovered. A corrupt receipt
+    is treated as absent (retry) — never silently trusted."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    from ..executors.base import ExecutorSessionInfo, validate_audit_result, validate_work_result
+
+    path = _Path(data_dir) / "receipts" / f"{run.run_id}.json"
+    if not path.exists():
+        return False
+    try:
+        receipt = _json.loads(path.read_text())
+        raw = receipt["raw"]
+        role = receipt.get("role", "worker")
+        validator = validate_audit_result if role == "auditor" else validate_work_result
+        result = validator(raw)
+        if validator is validate_audit_result:
+            result = result  # AuditResult
+        info = ExecutorSessionInfo(
+            executor=run.executor or "reasonix",
+            session_id=receipt.get("session_id"),
+            transcript_path=receipt.get("transcript_path"),
+        )
+        if role == "auditor":
+            dispatcher.collect_audit(run, result, info)
+        else:
+            dispatcher.collect_success(run, result, info)
+        run.termination_reason = "recovered from runtime receipt (no re-invocation)"
+        RunRepo(session).save(run)
+        path.unlink()  # receipt is single-use
+        return True
+    except Exception:  # noqa: BLE001  corrupt receipt -> fall through to retry
+        logger.warning("receipt for run %s unusable; falling back to retry", run.run_id)
+        return False

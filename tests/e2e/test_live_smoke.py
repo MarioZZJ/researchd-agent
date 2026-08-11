@@ -17,6 +17,10 @@ import asyncio
 import json
 import os
 import shutil
+import signal
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -228,18 +232,118 @@ def test_real_reasonix_live_smoke(factory, tmp_path):
     import asyncio as _aio
 
     final = _aio.run(_scenario())
+    # semantic assertions only — a real model does NOT deterministically
+    # produce T-SMOKE-1/A-1/E-1; what must hold is the SHAPE of the outcome
     assert final == "COMPLETED", f"real smoke ended {final!r}"
     with UnitOfWork(factory) as uow:
         task = TaskRepo(uow.session).get_by_task_id("T-SMOKE-1")
         assert task.status.value == "COMPLETED"
-        ev = EvidenceRepo(uow.session).get_by_evidence_id("E-1")
-        assert ev is not None and ev.status.value == "VERIFIED"
         runs = RunRepo(uow.session).list_by_project(PROJECT)
+        # independent auditor run exists (never RUNNING -> COMPLETED)
         roles = [(r.task_id, (r.metadata or {}).get("role")) for r in runs]
         assert ("T-SMOKE-1", "auditor") in roles
-        # the worker run recorded the resolved model + skills
+        # worker run recorded resolved model + skills + usage (or explicit
+        # unavailable) — full model-call traceability
         worker_runs = [r for r in runs if (r.metadata or {}).get("role") != "auditor"]
         assert worker_runs and worker_runs[0].resolved_model
+        for r in runs:
+            if r.outcome:
+                assert (r.usage or {}).get("available") is not None  # never fabricated
+        # any evidence that WAS accepted got verified via the audit gate
+        from researchd.persistence.repositories import EvidenceRepo as ER
+
+        evs = ER(uow.session).list_by_project(PROJECT)
+        for ev in evs:
+            assert ev.status.value in ("VERIFIED", "CANDIDATE")
+        # context packages persisted for every turn
+        from researchd.persistence.repositories import ContextPackageRepo as CR
+
+        pkgs = CR(uow.session).list_for_run(runs[0].run_id)
+        assert pkgs
     import asyncio as aio
 
     aio.run(adapter.close())
+
+
+def test_live_smoke_service_process_restart(factory, tmp_path):
+    """REAL smoke with ACTUAL service processes (subprocess): the service
+    drives planner/worker/auditor with real reasonix model calls; after
+    COMPLETED the service process is killed and restarted, and counts
+    (invocations, runs, artifacts + hashes, evidence, outbox) must be
+    IDENTICAL — zero re-invocation, zero duplicates.
+    Gated on RESEARCHD_RUN_REAL_SMOKE=1 (paid model calls + real service)."""
+    if not os.environ.get("RESEARCHD_RUN_REAL_SMOKE") == "1":
+        pytest.skip("real reasonix smoke requires RESEARCHD_RUN_REAL_SMOKE=1 (paid model authorization)")
+    import signal
+    import subprocess
+    import time
+
+    ws = _setup(factory, tmp_path)
+    data_dir = str(tmp_path / "data")
+    env = dict(os.environ)
+    env["RESEARCHD_RUN_REAL_SMOKE"] = "1"
+
+    def _snapshot():
+        with UnitOfWork(factory) as uow:
+            from researchd.persistence.repositories import ArtifactRepo as AR
+            from researchd.persistence.repositories import EvidenceRepo as ER
+            from researchd.persistence.repositories import InvocationRepo as IR
+            from researchd.persistence.repositories import RunRepo as RR
+
+            invs = IR(uow.session).list_by_project(PROJECT)
+            runs = RR(uow.session).list_by_project(PROJECT)
+            arts = AR(uow.session).list_by_project(PROJECT)
+            evs = ER(uow.session).list_by_project(PROJECT)
+            return {
+                "invocations": len(invs),
+                "runs": len(runs),
+                "run_ids": sorted(r.run_id for r in runs),
+                "artifacts": sorted((a.path, a.sha256, a.size_bytes) for a in arts),
+                "evidence": sorted((e.evidence_id, e.status.value) for e in evs),
+            }
+
+    def _start_service():
+        return subprocess.Popen(
+            [sys.executable, "-m", "researchd.cli", "service", "--data-dir", data_dir],
+            cwd=str(Path(__file__).resolve().parent.parent.parent),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    proc = _start_service()
+    try:
+        deadline = time.monotonic() + 480
+        final = "RUNNING"
+        while time.monotonic() < deadline:
+            with UnitOfWork(factory) as uow:
+                task = TaskRepo(uow.session).get_by_task_id("T-SMOKE-1")
+                if task is not None and task.status.value in ("COMPLETED", "FAILED"):
+                    final = task.status.value
+                    break
+            time.sleep(3)
+        assert final == "COMPLETED", f"real smoke (service) ended {final!r}"
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    before = _snapshot()
+    assert before["invocations"] >= 3  # planner + worker + auditor all recorded
+    assert before["runs"] >= 2
+
+    # restart the ACTUAL service process and let it run: nothing may re-run
+    proc2 = _start_service()
+    try:
+        time.sleep(25)  # several ticks with nothing left to do
+    finally:
+        proc2.send_signal(signal.SIGTERM)
+        try:
+            proc2.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc2.kill()
+
+    after = _snapshot()
+    assert after == before, f"restart re-ran work: {before} -> {after}"

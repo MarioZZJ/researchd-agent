@@ -250,6 +250,7 @@ class ExecutorSessionInfo(BaseModel):
     turn_id: str | None = None
     last_event_sequence: int | None = None
     termination_reason: str | None = None
+    transcript_path: str | None = None  # controlled completion receipt (path only)
     raw_events: list[dict] = Field(default_factory=list)
 
 

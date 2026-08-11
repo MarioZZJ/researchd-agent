@@ -142,6 +142,11 @@ class ReasonixTransport(ABC):
     @abstractmethod
     async def cancel(self, session_id: str) -> dict: ...
 
+    def last_transcript(self, session_id: str) -> str | None:
+        """Path of the persisted transcript for a session (path only;
+        transcript CONTENT never leaves the executor run dir)."""
+        return None
+
 
 # ---------------------------------------------------------------- stdio
 class StdioReasonixTransport(ReasonixTransport):
@@ -171,6 +176,10 @@ class StdioReasonixTransport(ReasonixTransport):
         self._generation = 0
         self.notifications: dict[str, list] = {}  # session_id -> bounded list
         self._notif_limit = 200
+        self._last_transcript: dict[str, str] = {}  # session_id -> transcriptPath (path only)
+
+    def last_transcript(self, session_id: str) -> str | None:
+        return self._last_transcript.get(session_id)
 
     # ------------------------------------------------------------ lifecycle
     async def _start(self) -> None:
@@ -347,6 +356,10 @@ class StdioReasonixTransport(ReasonixTransport):
             raise TransportError(
                 f"reasonix acp session/prompt returned no text (result keys: {sorted(result.keys())})"
             )
+        # controlled completion receipt: transcript path only (never content)
+        tp = result.get("transcriptPath")
+        if tp:
+            self._last_transcript[session_id] = tp
         return text_out
 
     @staticmethod

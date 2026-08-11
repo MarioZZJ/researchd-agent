@@ -92,7 +92,9 @@ class SchedulerLoop:
         stats: dict = {"orphans": 0, "dispatched": 0, "heartbeats": 0, "outbox": {}, "decisions": 0, "reports": 0, "projection": 0, "diagnostics": 0, "planned": 0, "milestones": 0}
         # 1. recovery: any stale run (restart/crash) -> ORPHANED, task -> READY
         with self.session_factory() as session:
-            stats["orphans"] = len(reconcile_orphans(session))
+            stats["orphans"] = len(
+                reconcile_orphans(session, data_dir=self.settings.data_dir)
+            )
             session.commit()
         # 2. decision gate: evaluate pending candidates -> OPEN decisions
         #    (cheap-parallel conflict candidates are deferred to diagnostics)
