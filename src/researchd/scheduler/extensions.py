@@ -24,7 +24,7 @@ logger = logging.getLogger("researchd.scheduler.ext")
 CHEAP_DIAGNOSTIC_MARKER = "cheap-diagnostic:"
 
 
-async def plan_projects(session_factory, executor) -> int:  # noqa: ANN001
+async def plan_projects(session_factory, executor, *, planner_profile: dict | None = None) -> int:  # noqa: ANN001
     """Materialize the first task batch for task-less ACTIVE projects."""
     from sqlalchemy import select
 
@@ -43,17 +43,24 @@ async def plan_projects(session_factory, executor) -> int:  # noqa: ANN001
             key = f"planner:{project.project_id}:ran"
             if session.execute(select(EventRow.id).where(EventRow.idempotency_key == key)).first():
                 continue  # planner already ran for this project
-        # execute OUTSIDE the transaction (long-running)
+        # execute OUTSIDE the transaction (long-running): build a bounded,
+        # persisted planner context first (IMPLEMENTATION.md §13)
         try:
+            from ..application.context_package import ContextPackageBuilder
+
+            with session_factory() as session:
+                project_row = ProjectRepo(session).get_by_project_id(project.project_id)
+                if project_row is None:
+                    continue
+                builder = ContextPackageBuilder(session)
+                pkg = builder.persist(builder.planner(project_row))
+                context = builder.to_context_dict(
+                    pkg, objective=f"为项目 {project.project_id} 规划首批研究任务"
+                )
+                session.commit()
             result, _session_info = await executor.run_planner(
-                {
-                    "project": {
-                        "project_id": project.project_id,
-                        "name": project.name,
-                        "description": project.description,
-                    }
-                },
-                profile={},
+                context,
+                profile=planner_profile or {},
             )
         except Exception:  # noqa: BLE001
             logger.exception("planner failed for project %s", project.project_id)

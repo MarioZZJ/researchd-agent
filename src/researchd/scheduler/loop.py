@@ -102,7 +102,9 @@ class SchedulerLoop:
 
         stats["diagnostics"] = ensure_cheap_diagnostics(self.session_factory)
         # 2c. planning: first task batch for task-less ACTIVE projects
-        stats["planned"] = await plan_projects(self.session_factory, self.executor)
+        stats["planned"] = await plan_projects(
+            self.session_factory, self.executor, planner_profile=self._planner_profile()
+        )
         # 2d. milestones: verified-evidence threshold reached -> one report
         stats["milestones"] = check_milestones(self.session_factory)
         # 3. reporting: emit queued reports for active projects
@@ -414,12 +416,19 @@ class SchedulerLoop:
             name = (project.policy.role_overrides or {}).get(role) if project else None
             source = "project_role_override" if name else "default"
         if not name:
-            prefix = {"reasonix": "reasonix", "codex": "codex", "fake": "fake"}.get(self.executor.name, "fake")
-            name = f"{prefix}_{ROLE_TO_PROFILE[role]}"
+            name = self._default_profile_name(role)
+        return self._profile_dict(name, source)
+
+    def _default_profile_name(self, role: str) -> str:
+        """Default profile name for a role: <executor>_<role-suffix>."""
+        prefix = {"reasonix": "reasonix", "codex": "codex", "fake": "fake"}.get(self.executor.name, "fake")
+        return f"{prefix}_{ROLE_TO_PROFILE[role]}"
+
+    def _profile_dict(self, name: str, source: str) -> dict:
         profile_cfg = getattr(self.settings, "profiles", {}).get(name)
         if profile_cfg is None:
             raise ValueError(
-                f"unknown executor profile {name!r} for task {task.task_id} (role {role}, source {source}); "
+                f"unknown executor profile {name!r} (source {source}); "
                 "configure it in settings.profiles"
             )
         return {
@@ -429,6 +438,10 @@ class SchedulerLoop:
             "process_instance_id": profile_cfg.process_instance_id,
             "source": source,
         }
+
+    def _planner_profile(self) -> dict:
+        """Resolved profile for the planner turn (no task object exists yet)."""
+        return self._profile_dict(self._default_profile_name("planner"), "default")
 
     async def _heartbeat_active(self) -> int:
         n = 0
@@ -494,7 +507,18 @@ class SchedulerLoop:
             with self.session_factory() as session:
                 run = RunRepo(session).get_by_run_id(run_id)
                 task = TaskRepo(session).get_by_task_id(run.task_id)
-                context = {"task": task.model_dump(), "project_id": task.project_id}
+                # bounded, traceable context: build + persist the package in
+                # the SAME transaction as the dispatch state (IMPLEMENTATION.md
+                # §13): the run is recoverable and the exact text the model
+                # saw is recorded before any model call happens.
+                from ..application.context_package import ContextPackageBuilder
+
+                pkg = ContextPackageBuilder(session).worker(task, run=run)
+                ContextPackageBuilder(session).persist(pkg)
+                context = ContextPackageBuilder(session).to_context_dict(
+                    pkg, objective=task.contract.objective
+                )
+                session.commit()
             # record the executor session id as soon as it exists (recovery)
             def _on_session(sid: str) -> None:
                 with self.session_factory() as session:

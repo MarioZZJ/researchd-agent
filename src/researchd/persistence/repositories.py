@@ -24,6 +24,7 @@ from ..domain.evidence import Evidence, Claim, Issue  # noqa: F401
 from .models import (  # noqa: F401
     ArtifactRow,
     ClaimRow,
+    ContextPackageRow,
     DecisionOptionRow,
     DecisionRow,
     EventRow,
@@ -655,5 +656,66 @@ class ProjectBindingRepo(BaseRepo):
     def list_for_project(self, project_id: str) -> list:
         rows = self.session.execute(
             select(ProjectBindingRow).where(ProjectBindingRow.project_id == project_id).order_by(ProjectBindingRow.created_at)
+        ).scalars()
+        return [self._to_domain(r) for r in rows]
+
+
+# ---------------------------------------------------------------- Context Package
+class ContextPackageRepo(BaseRepo):
+    """Persist context packages so every model judgment is traceable to the
+    exact objects + rendered text it received (IMPLEMENTATION.md §13)."""
+
+    row_cls = ContextPackageRow
+
+    def _to_row(self, p) -> ContextPackageRow:  # noqa: ANN001
+        return ContextPackageRow(
+            id=p.id,
+            context_id=p.context_id,
+            project_id=p.project_id,
+            task_id=p.task_id,
+            objects_json=[o.model_dump() for o in p.objects],
+            token_estimate=p.token_estimate,
+            excluded_by_budget_json=p.excluded_by_budget or None,
+            content_hash=p.content_hash,
+            version=p.version,
+            created_by=p.created_by,
+            created_at=p.created_at,
+            updated_at=p.updated_at,
+            status=p.role,
+            metadata_json={"role": p.role, "run_id": p.run_id, "content": p.content},
+        )
+
+    def _to_domain(self, row: ContextPackageRow):
+        from ..domain.context import ContextObjectRef, ContextPackage
+
+        meta = row.metadata_json or {}
+        return ContextPackage(
+            id=row.id,
+            context_id=row.context_id,
+            role=meta.get("role") or row.status or "worker",
+            task_id=row.task_id,
+            run_id=meta.get("run_id"),
+            project_id=row.project_id,
+            objects=[ContextObjectRef(**o) for o in (row.objects_json or [])],
+            content=meta.get("content") or "",
+            token_estimate=row.token_estimate,
+            excluded_by_budget=row.excluded_by_budget_json or [],
+            content_hash=row.content_hash,
+            version=row.version,
+            created_by=row.created_by,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+        )
+
+    def get_by_context_id(self, context_id: str):
+        row = self.session.execute(
+            select(ContextPackageRow).where(ContextPackageRow.context_id == context_id)
+        ).scalar_one_or_none()
+        return self._to_domain(row) if row else None
+
+    def list_for_run(self, run_id: str) -> list:
+        rows = self.session.execute(
+            select(ContextPackageRow).where(ContextPackageRow.metadata_json["run_id"].as_string() == run_id)
+            .order_by(ContextPackageRow.created_at)
         ).scalars()
         return [self._to_domain(r) for r in rows]
