@@ -107,8 +107,14 @@ async def _submit(settings: Settings, session: InteractionSession, text: str, *,
     url = f"http://localhost/v1/inbound/messages"
     transport = httpx.AsyncHTTPTransport(uds=settings.api.socket_path) if settings.api.socket_path else None
     identity = session.cc_session_key or session.session_id
-    digest = hashlib.sha256(f"{identity}:{session.cc_project}:{text}".encode()).hexdigest()[:32]
-    message_id = f"acp-{digest}"
+    if message_id:
+        # REAL platform message id (cc-connect msg.ID): unique per platform
+        # message, so re-sending the SAME text later is a NEW message
+        # (the hash-based key merged legitimate repeats forever)
+        message_id = f"acp-{message_id}"
+    else:
+        digest = hashlib.sha256(f"{identity}:{session.cc_project}:{text}".encode()).hexdigest()[:32]
+        message_id = f"acp-{digest}"
     headers = _auth_headers(settings)
     payload = {
         "schema": "researchd.inbound_message.v1",

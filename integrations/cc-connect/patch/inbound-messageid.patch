@@ -33,10 +33,9 @@ index 00d140f..3ac7093 100644
  	promptBlocks := []any{
  		map[string]any{"type": "text", "text": prompt},
  	}
-+	s.sendMu.Lock()
++	// Send() already holds sendMu (non-reentrant): read directly, no relock
 +	msgID := s.currentMsgID
 +	s.currentMsgID = ""
-+	s.sendMu.Unlock()
 +
  	params := map[string]any{
  		"sessionId": sid,

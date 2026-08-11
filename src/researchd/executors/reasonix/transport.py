@@ -42,7 +42,22 @@ STEER_METHOD = "_reasonix.io/session/steer"
 # masked as empty tmpfs. Network stays shared (reasonix needs the provider
 # gateway). Without bubblewrap the transport FAILS CLOSED — no claim of
 # "workspace-confined" is ever made.
-_SANDBOX_MASKED_HOME_DIRS = (".cc-connect", ".reasonix")
+# home paths masked as EMPTY tmpfs inside the sandbox (in addition to the
+# researchd data dir): a readable / is never enough — ssh/aws/git/npm
+# credentials and the whole reasonix home must be unreachable even though
+# --ro-bind / / leaves them readable on disk
+_SANDBOX_MASKED_HOME_DIRS = (
+    ".cc-connect",
+    ".reasonix",
+    ".ssh",
+    ".aws",
+    ".config",
+    ".gnupg",
+    ".gitconfig",
+    ".netrc",
+    ".npmrc",
+    ".cache",
+)
 
 
 def _bwrap_command(binary: str, overlay: Path, cwd: Path) -> list[str] | None:
@@ -68,8 +83,12 @@ def _bwrap_command(binary: str, overlay: Path, cwd: Path) -> list[str] | None:
     cmd += ["--tmpfs", str(data_dir)]
     for name in _SANDBOX_MASKED_HOME_DIRS:
         target = home / name
-        if target.exists():
+        if target.is_dir():
             cmd += ["--tmpfs", str(target)]
+        elif target.exists():
+            # a FILE (e.g. ~/.gitconfig, ~/.netrc): tmpfs cannot mount over a
+            # file — bind /dev/null over it so its content is unreachable
+            cmd += ["--ro-bind", "/dev/null", str(target)]
     cmd += ["--bind", str(overlay), str(overlay)]
     ws = str(cwd)
     cmd += ["--bind", ws, ws]

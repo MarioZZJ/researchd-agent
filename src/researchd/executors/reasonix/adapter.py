@@ -294,7 +294,7 @@ class ReasonixAdapter(ExecutorAdapter):
             "run_id": context.get("run_id"),
             "session_id": session_info.session_id,
             "transcript_path": session_info.transcript_path,
-            "extracted_at": __import__("researchd.domain.base", fromlist=["utcnow"]).utcnow(),
+            "extracted_at": __import__("researchd.domain.base", fromlist=["utcnow"]).utcnow().isoformat(),
             "raw": raw,
         }
         tmp = path.with_suffix(".tmp")

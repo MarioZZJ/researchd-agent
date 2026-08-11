@@ -141,19 +141,37 @@ async def schedule_report(session_factory, *, project_id: str) -> ReporterResult
                 ProjectionStateRow.section_key == "snapshot",
             )
         ).scalar_one_or_none()
+        # the FULL previous snapshot is persisted (not just a hash), so the
+        # next tick computes a REAL semantic diff over the actual state
+        previous_snapshot: StateSnapshot | None = None
         previous_open: set[str] = set()
         if row is not None:
             stored = row.content_hash or ""
             sig_part, _, open_part = stored.partition("|open:")
-            if sig_part == signature:
+            previous_open = set(open_part.split(",")) if open_part else set()
+            if sig_part == signature and row.snapshot_json is not None:
                 return ReporterResult(sent=False, reason="no state diff")
-            if open_part:
-                previous_open = set(open_part.split(","))
+            if row.snapshot_json is not None:
+                try:
+                    previous_snapshot = StateSnapshot(**row.snapshot_json)
+                except Exception:  # noqa: BLE001  stale/corrupt previous state: treat as baseline
+                    previous_snapshot = None
 
+        # semantic diff: only real state changes trigger a report
+        diff = diff_snapshots(previous_snapshot, snapshot)
+        reasons = diff.reasons
+        if previous_snapshot is None:
+            # first observation: report ONLY if there is anything to say
+            # (diff_snapshots reports "first report" by design — override it)
+            reasons = (
+                ["initial state"]
+                if (snapshot.verified_evidence_ids or snapshot.open_decisions)
+                else []
+            )
         current_open = set(snapshot.open_decisions)
         new_decisions = current_open - previous_open
-        specs = _specs_for_snapshot(session, snapshot, new_decisions)
-        if not specs:
+        specs = _specs_for_snapshot(session, snapshot, new_decisions, diff=diff)
+        if not specs and not reasons:
             if row is None:
                 session.add(
                     ProjectionStateRow(
@@ -162,8 +180,12 @@ async def schedule_report(session_factory, *, project_id: str) -> ReporterResult
                         document_id="report-state",
                         section_key="snapshot",
                         content_hash=signature + "|open:" + ",".join(sorted(current_open)),
+                        snapshot_json=_snapshot_dict(snapshot),
                     )
                 )
+            else:
+                row.content_hash = signature + "|open:" + ",".join(sorted(current_open))
+                row.snapshot_json = _snapshot_dict(snapshot)
             session.commit()
             return ReporterResult(sent=False, reason="nothing reportable")
 
@@ -210,7 +232,28 @@ async def schedule_report(session_factory, *, project_id: str) -> ReporterResult
             report_id = new_id("report")
             last_report_id = report_id
             _emit_report(session, project_id, report_id, spec, compressed.body, compressed.source)
-        assert last_report_id is not None
+        if last_report_id is None:
+            # state changed (diff reasons non-empty) but nothing compiled into
+            # a spec: persist the baseline so the change is not re-flagged on
+            # every tick, and stay silent
+            new_hash = signature + "|open:" + ",".join(sorted(current_open))
+            snapshot_data = _snapshot_dict(snapshot)
+            if row is None:
+                session.add(
+                    ProjectionStateRow(
+                        id=new_id("other"),
+                        project_id=project_id,
+                        document_id="report-state",
+                        section_key="snapshot",
+                        content_hash=new_hash,
+                        snapshot_json=snapshot_data,
+                    )
+                )
+            else:
+                row.content_hash = new_hash
+                row.snapshot_json = snapshot_data
+            session.commit()
+            return ReporterResult(sent=False, reason="state changed; nothing reportable")
 
         # persist the FULL new snapshot atomically with the emission
         new_hash = signature + "|open:" + ",".join(sorted(current_open))
@@ -233,9 +276,10 @@ async def schedule_report(session_factory, *, project_id: str) -> ReporterResult
         return ReporterResult(report_id=last_report_id, sent=True, reason="queued")
 
 
-def _specs_for_snapshot(session, snapshot: StateSnapshot, new_decisions: set[str]) -> list[ReportSpec]:  # noqa: ANN001
-    """One spec per NEW decision (in stable order), plus a digest spec for
-    other reportable changes when nothing new is a decision."""
+def _specs_for_snapshot(session, snapshot: StateSnapshot, new_decisions: set[str], diff=None) -> list[ReportSpec]:  # noqa: ANN001
+    """One spec per NEW decision (in stable order), plus an evidence spec
+    for NEW evidence ONLY (never the full evidence set on every tick — the
+    previous snapshot is the baseline)."""
     from ..persistence.repositories import DecisionRepo
 
     project_id = snapshot.project_id
@@ -262,31 +306,42 @@ def _specs_for_snapshot(session, snapshot: StateSnapshot, new_decisions: set[str
                         decision_id=d.decision_id,
                     )
                 )
-        # decision cards plus (when other state changed) a digest for the rest
-        if snapshot.verified_evidence_ids:
+        # decision cards plus (when evidence changed) an evidence card for
+        # the NEW evidence ONLY
+        added_evidence = _added_evidence(snapshot, diff)
+        if added_evidence:
             specs.append(
                 compile_spec(
                     project_id=project_id,
                     type=ReportType.EVIDENCE,
                     title="研究进展",
-                    bottom_line=_evidence_bottom_line(session, snapshot.verified_evidence_ids),
-                    bottom_line_evidence_refs=snapshot.verified_evidence_ids[-5:],
+                    bottom_line=_evidence_bottom_line(session, added_evidence),
+                    bottom_line_evidence_refs=added_evidence[-5:],
                     active_actions=_active_task_actions(session, project_id),
                 )
             )
         return specs
-    if snapshot.verified_evidence_ids:
+    added_evidence = _added_evidence(snapshot, diff)
+    if added_evidence:
         specs.append(
             compile_spec(
                 project_id=project_id,
                 type=ReportType.EVIDENCE,
                 title="研究进展",
-                bottom_line=_evidence_bottom_line(session, snapshot.verified_evidence_ids),
-                bottom_line_evidence_refs=snapshot.verified_evidence_ids[-5:],
+                bottom_line=_evidence_bottom_line(session, added_evidence),
+                bottom_line_evidence_refs=added_evidence[-5:],
                 active_actions=_active_task_actions(session, project_id),
             )
         )
     return specs
+
+
+def _added_evidence(snapshot: StateSnapshot, diff) -> list[str]:  # noqa: ANN001
+    """NEW evidence since the previous report: the diff baseline when one
+    exists, otherwise the full set (first report)."""
+    if diff is not None and getattr(diff, "previous", None) is not None:
+        return sorted(set(snapshot.verified_evidence_ids) - set(diff.previous.verified_evidence_ids))
+    return sorted(snapshot.verified_evidence_ids)
 
 
 def _emit_report(session, project_id: str, report_id: str, spec: ReportSpec, body: str, source: str) -> None:  # noqa: ANN001

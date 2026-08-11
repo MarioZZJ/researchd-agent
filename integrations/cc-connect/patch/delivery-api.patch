@@ -331,6 +331,13 @@ index 70bab96..17df6e3 100644
 +			mgmtError(w, http.StatusInternalServerError, err.Error())
 +			return
 +		}
++		if handle == "" {
++			// a successful platform response WITHOUT a message id must never
++			// be cached as "" — that would permanently break in-place
++			// updates for this key
++			mgmtError(w, http.StatusInternalServerError, "platform returned no message id")
++			return
++		}
 +		if origKey != "" {
 +			if err := saveDelivery(origKey, handle); err != nil {
 +				mgmtError(w, http.StatusInternalServerError, "persist delivery: "+err.Error())

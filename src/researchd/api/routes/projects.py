@@ -338,42 +338,13 @@ def answer_decision(decision_id: str, req: DecisionAnswerRequest, uow: UnitOfWor
         )
     )
     # in-place card update: the already-sent decision card (if any) is
-    # PATCHed to show the recorded answer — no meaningless new card
+    # PATCHed to show the recorded answer — no meaningless new card (shared
+    # application flow: the ACP/button path goes through the same helper)
+    from ...application.handlers import _enqueue_decision_card_update
+
     _enqueue_decision_card_update(uow.session, decision, req.actor, req.option_id)
     uow.commit()
     return {"decision_id": decision_id, "applied": True, "answer": req.option_id}
-
-
-def _enqueue_decision_card_update(session, decision, actor: str, option_id: str) -> None:  # noqa: ANN001
-    """Queue an in-place update of the original decision card (the report row
-    carries the platform_message_id receipt from send time). Idempotent per
-    decision version — a retry of the same answer never re-updates."""
-    from sqlalchemy import select
-
-    from ...domain.base import new_id, utcnow
-    from ...persistence.models import ReportRow
-    from ...persistence.outbox import OutboxRepo
-
-    row = session.execute(
-        select(ReportRow)
-        .where(ReportRow.spec_json["decision_id"].as_string() == decision.decision_id)
-        .order_by(ReportRow.created_at.desc())
-    ).scalars().first()
-    if row is None or not row.platform_message_id:
-        return  # card was never sent (or no receipt) — nothing to update
-    option = next((o for o in (decision.options or []) if o.option_id == option_id), None)
-    text = f"✅ 已记录你的选择：**{getattr(option, 'label', None) or option_id}**（{actor}）"
-    OutboxRepo(session).enqueue(
-        destination="delivery",
-        idempotency_key=f"decision-update:{decision.decision_id}:v{decision.version}",
-        payload={
-            "kind": "decision_update",
-            "project_id": decision.project_id,
-            "platform_message_id": row.platform_message_id,
-            "title": "决策已记录",
-            "body": text,
-        },
-    )
 
 
 @router.post("/projects/{project_id}/commands", dependencies=[Depends(require_token)])

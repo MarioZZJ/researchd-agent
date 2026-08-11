@@ -455,7 +455,7 @@ def test_decision_answer_updates_original_card_in_place(factory, tmp_path):
         uow.commit()
 
     # answer via the route handler (in-process call)
-    from researchd.api.routes.projects import _enqueue_decision_card_update
+    from researchd.application.handlers import _enqueue_decision_card_update
 
     with UnitOfWork(factory) as uow:
         d = DecisionRepo(uow.session).get_by_decision_id("D-UPD")

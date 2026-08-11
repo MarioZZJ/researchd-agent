@@ -44,7 +44,13 @@ def test_planner_invocation_recorded_with_unavailable_usage(env):
         env["factory"], ex, data_dir="t",
         planner_profile={"name": "fake_planner", "model": "fake-model", "reasoning_effort": "low"},
     ))
-    assert n == 0  # no tasks proposed, but the call still happened
+    assert n == 1  # planner.ran marker written even with zero tasks
+    # the marker prevents a second paid planner call on the next tick
+    n2 = asyncio.run(plan_projects(
+        env["factory"], ex, data_dir="t",
+        planner_profile={"name": "fake_planner", "model": "fake-model", "reasoning_effort": "low"},
+    ))
+    assert n2 == 0  # already ran -> no re-invocation
     with UnitOfWork(env["factory"]) as uow:
         invs = InvocationRepo(uow.session).list_by_project("P-INV")
     assert len(invs) == 1

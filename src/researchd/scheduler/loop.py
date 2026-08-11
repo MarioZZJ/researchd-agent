@@ -588,10 +588,18 @@ class SchedulerLoop:
             hook = getattr(self.executor, "on_session_started", None)
             if hook is not None:
                 hook(_on_session)
-            if role == "auditor":
-                result, session_info = await self.executor.run_auditor(context, profile=profile)
-            else:
-                result, session_info = await self.executor.run_worker(context, profile=profile)
+            # model-call invocation ledger: EVERY worker/auditor turn is
+            # recorded durably (RUNNING -> SUCCEEDED/FAILED), matching the
+            # planner turns recorded in plan_projects
+            invocation = self._record_invocation(run_id, role, context, profile)
+            try:
+                if role == "auditor":
+                    result, session_info = await self.executor.run_auditor(context, profile=profile)
+                else:
+                    result, session_info = await self.executor.run_worker(context, profile=profile)
+            except Exception:
+                self._finish_invocation(invocation, status="FAILED", error="executor turn failed")
+                raise
             with self.session_factory() as session:
                 run = RunRepo(session).get_by_run_id(run_id)
                 dispatcher = RunDispatcher(session, self.executor)
@@ -600,8 +608,63 @@ class SchedulerLoop:
                 else:
                     dispatcher.collect_success(run, result, session_info)
                 session.commit()
+            self._finish_invocation(
+                invocation,
+                status="SUCCEEDED",
+                usage=getattr(session_info, "usage", None),
+            )
         finally:
             heartbeat_task.cancel()
+
+    def _record_invocation(self, run_id: str, role: str, context: dict, profile: dict):  # noqa: ANN001
+        """Create a RUNNING invocation row for a worker/auditor turn (durable
+        before the model call; the run row itself is not enough because the
+        planner has no run)."""
+        from ..domain.invocation import Invocation
+        from ..persistence.repositories import InvocationRepo
+
+        with self.session_factory() as session:
+            run = RunRepo(session).get_by_run_id(run_id)
+            if run is None:
+                return None
+            inv = Invocation(
+                role=role,
+                project_id=run.project_id,
+                task_id=run.task_id,
+                run_id=run.run_id,
+                context_id=context.get("context_id"),
+                profile_name=profile.get("name"),
+                resolved_model=profile.get("model"),
+                reasoning_effort=profile.get("reasoning_effort"),
+                skills=list(getattr(self.executor, "installed_skills", []) or []),
+                budget=dict(getattr(run, "metadata", {}) or {}).get("budget", {}) or {},
+                status="RUNNING",
+                created_by="scheduler",
+            )
+            InvocationRepo(session).save(inv)
+            session.commit()
+            return inv.invocation_id
+
+    def _finish_invocation(self, invocation_id, *, status: str, usage=None, error: str = "") -> None:  # noqa: ANN001
+        from ..domain.base import utcnow
+        from ..persistence.repositories import InvocationRepo
+
+        if not invocation_id:
+            return
+        with self.session_factory() as session:
+            inv = InvocationRepo(session).get_by_invocation_id(invocation_id)
+            if inv is None:
+                return
+            inv.status = status
+            inv.finished_at = utcnow()
+            if error:
+                inv.error_message = error[:500]
+            if usage is not None:
+                inv.usage = usage
+            elif status == "SUCCEEDED":
+                inv.usage = {"available": False, "reason": "executor does not report usage"}
+            InvocationRepo(session).save(inv)
+            session.commit()
 
     async def _heartbeat_loop(self, run_id: str) -> None:
         try:

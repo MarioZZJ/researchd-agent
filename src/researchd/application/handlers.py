@@ -326,6 +326,14 @@ class CommandHandler:
             AggregateRef(type="decision", id=decision.id, version=decision.version),
             payload={"option_id": option_id, "version": version},
         )
+        # in-place card update for the ACP/button path too: the original
+        # decision card is PATCHed (shared application flow, idempotent per
+        # decision version)
+        _enqueue_decision_card_update(
+            self.session, decision,
+            actor=str(self.actor.platform_user_id or self.actor.type),
+            option_id=option_id,
+        )
         return CommandReply(
             f"decision {decision_id} answered {option_id}",
             {"decision_id": decision_id, "answer": option_id, "applied": True},
@@ -407,3 +415,35 @@ def handle_inbound(session: Session, msg: dict, *, fallback_project: str | None 
         raise HandlerError(f"unrecognized command: {exc}", 400) from exc
     handler = CommandHandler(session, project_id=project_id, actor=actor)
     return handler.dispatch(cmd)
+
+
+def _enqueue_decision_card_update(session, decision, actor: str, option_id: str) -> None:  # noqa: ANN001
+    """Queue an in-place update of the original decision card (the report row
+    carries the platform_message_id receipt from send time). Idempotent per
+    decision version — a retry of the same answer never re-updates."""
+    from sqlalchemy import select
+
+    from ..domain.base import new_id, utcnow  # noqa: F401  (new_id unused here)
+    from ..persistence.models import ReportRow
+    from ..persistence.outbox import OutboxRepo
+
+    row = session.execute(
+        select(ReportRow)
+        .where(ReportRow.spec_json["decision_id"].as_string() == decision.decision_id)
+        .order_by(ReportRow.created_at.desc())
+    ).scalars().first()
+    if row is None or not row.platform_message_id:
+        return  # card was never sent (or no receipt) — nothing to update
+    option = next((o for o in (decision.options or []) if o.option_id == option_id), None)
+    text = f"✅ 已记录你的选择：**{getattr(option, 'label', None) or option_id}**（{actor}）"
+    OutboxRepo(session).enqueue(
+        destination="delivery",
+        idempotency_key=f"decision-update:{decision.decision_id}:v{decision.version}",
+        payload={
+            "kind": "decision_update",
+            "project_id": decision.project_id,
+            "platform_message_id": row.platform_message_id,
+            "title": "决策已记录",
+            "body": text,
+        },
+    )

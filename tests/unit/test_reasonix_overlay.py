@@ -182,8 +182,15 @@ def test_bwrap_command_masks_secrets_and_mounts_workspace(tmp_path, monkeypatch)
     assert cmd[0] == "bwrap"
     assert cmd[1:4] == ["--ro-bind", "/", "/"]
     assert has(["--tmpfs", str(data)], 0, 2)
-    for name in (".cc-connect", ".reasonix"):
-        assert has(["--tmpfs", str(Path.home() / name)], 0, 2)
+    from researchd.executors.reasonix.transport import _SANDBOX_MASKED_HOME_DIRS
+
+    for name in _SANDBOX_MASKED_HOME_DIRS:
+        target = Path.home() / name
+        if target.is_dir():
+            assert has(["--tmpfs", str(target)], 0, 2), name
+        elif target.exists():
+            # files are masked via /dev/null (tmpfs cannot mount over a file)
+            assert has(["--ro-bind", "/dev/null", str(target)], 0, 3), name
     assert has(["--bind", str(overlay), str(overlay)], 0, 3)
     assert has(["--bind", str(ws), str(ws)], 0, 3)
     assert has(["--chdir", str(ws)], 0, 2)

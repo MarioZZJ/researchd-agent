@@ -763,6 +763,7 @@ class InvocationRepo(BaseRepo):
             status=i.status,
             error_message=i.error_message,
             usage_json=i.usage,
+            metadata_json=i.metadata or None,
             version=i.version,
             created_by=i.created_by,
             created_at=i.created_at,

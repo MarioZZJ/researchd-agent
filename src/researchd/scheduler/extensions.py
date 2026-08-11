@@ -143,20 +143,23 @@ async def plan_projects(session_factory, executor, *, planner_profile: dict | No
                 )
                 TaskRepo(session).save(task)
                 created += 1
-            if created:
-                EventRepo(session).append(
-                    make_event(
-                        event_type="planner.ran",
-                        aggregate=AggregateRef(type="project", id=project.project_id, version=1),
-                        idempotency_key=key,
-                        project_id=project.project_id,
-                        actor=Actor(type="system"),
-                        payload={"task_count": created},
-                    )
+            # the planner.ran marker is written REGARDLESS of task count: a
+            # completed planner call (even with zero proposed tasks) must not
+            # be re-invoked on the next tick — that would burn a paid model
+            # call every scheduler tick for empty projects
+            EventRepo(session).append(
+                make_event(
+                    event_type="planner.ran",
+                    aggregate=AggregateRef(type="project", id=project.project_id, version=1),
+                    idempotency_key=key,
+                    project_id=project.project_id,
+                    actor=Actor(type="system"),
+                    payload={"task_count": created},
                 )
-                session.commit()
-                planned += 1
-                logger.info("planned %d tasks for %s", created, project.project_id)
+            )
+            session.commit()
+            planned += 1
+            logger.info("planned %d tasks for %s", created, project.project_id)
     return planned
 
 

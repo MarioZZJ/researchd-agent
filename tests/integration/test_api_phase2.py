@@ -537,24 +537,39 @@ def test_create_project_rejects_symlinked_anchor(api_env):
 
 
 def test_acp_prompt_uses_real_platform_message_id(factory, monkeypatch):
-    """session/prompt with messageId -> the inbound idempotency key uses the
-    REAL platform message id, so a later identical message is a NEW message
-    (never merged with the old one)."""
-    from unittest.mock import AsyncMock, patch
+    """session/prompt with messageId -> the inbound payload's message_id is
+    the REAL platform message id (acp-<platform id>), so a later identical
+    message is a NEW message (never merged with the old one)."""
+    from unittest.mock import patch
 
     import researchd.acp.agent as agent_mod
     import researchd.acp.inbound as inbound_mod
 
     sent = {}
 
-    async def fake_submit(settings, session, text, *, intent, command=None, message_id=None):
-        sent["message_id"] = message_id
-        sent["intent"] = intent
-        return type("R", (), {"text": "ok"})
+    async def fake_post(client, url, json=None, **kw):
+        sent["payload"] = json
+        return type("R", (), {"status_code": 200, "json": lambda self: {}})()
 
-    with patch.object(inbound_mod, "_submit", new=fake_submit):
+    class FakeAsyncClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *x):
+            return False
+
+        async def post(self, url, json=None, **kw):
+            sent["payload"] = json
+            return type("R", (), {"status_code": 200, "json": lambda self: {}})()
+
+    fake_client = FakeAsyncClient
+
+    with patch.object(inbound_mod.httpx, "AsyncClient", new=fake_client):
         handler = agent_mod.AcpServer(
-            type("S", (), {"api": type("A", (), {"socket_path": ""})(), "interaction": type("I", (), {"deterministic_commands": True, "allow_natural_language_intent": False})(), "service_name": "t"})()
+            type("S", (), {"api": type("A", (), {"socket_path": "", "token": "tok"})(), "interaction": type("I", (), {"deterministic_commands": True, "allow_natural_language_intent": False})(), "service_name": "t"})()
         )
         import asyncio
 
@@ -566,14 +581,13 @@ def test_acp_prompt_uses_real_platform_message_id(factory, monkeypatch):
                 {"sessionId": sid, "prompt": [{"type": "text", "text": "/decision D-1 A --version 1"}], "messageId": "om_real_123"}
             )
         )
-        assert sent["message_id"] == "om_real_123"
-        assert sent["intent"] == "deterministic_command"
+        assert sent["payload"]["message_id"] == "acp-om_real_123"
         assert resp["message"]["content"][0]["text"] == "ok"
 
     # WITHOUT messageId the legacy hash-based key is used (back-compat)
-    with patch.object(inbound_mod, "_submit", new=fake_submit):
+    with patch.object(inbound_mod.httpx, "AsyncClient", new=fake_client):
         handler2 = agent_mod.AcpServer(
-            type("S", (), {"api": type("A", (), {"socket_path": ""})(), "interaction": type("I", (), {"deterministic_commands": True, "allow_natural_language_intent": False})(), "service_name": "t"})()
+            type("S", (), {"api": type("A", (), {"socket_path": "", "token": "tok"})(), "interaction": type("I", (), {"deterministic_commands": True, "allow_natural_language_intent": False})(), "service_name": "t"})()
         )
         import asyncio as _a
 
@@ -585,4 +599,6 @@ def test_acp_prompt_uses_real_platform_message_id(factory, monkeypatch):
                 {"sessionId": sid2, "prompt": [{"type": "text", "text": "/decision D-1 A --version 1"}]}
             )
         )
-        assert sent["message_id"] is None
+        # no messageId from the gateway -> legacy hash key (acp-<sha256 prefix>)
+        assert sent["payload"]["message_id"].startswith("acp-")
+        assert sent["payload"]["message_id"] != "acp-om_real_123"

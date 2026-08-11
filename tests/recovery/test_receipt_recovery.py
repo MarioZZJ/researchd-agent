@@ -110,7 +110,14 @@ def test_receipt_recovery_completes_without_model_reinvocation(env):
         assert run.status.value == "SUCCEEDED"
         assert run.termination_reason == "recovered from runtime receipt (no re-invocation)"
         assert task.status in (TS.REVIEW, TS.RUNNING)  # never READY (no requeue)
-        assert not (env["tmp"] / "receipts" / "RUN-RCP.json").exists()  # single-use
+        # the receipt is deliberately KEPT: a SUCCEEDED run never re-enters
+        # recovery, so a leftover receipt is inert (deleting it pre-commit
+        # would lose the only completed result on a crash)
+        assert (env["tmp"] / "receipts" / "RUN-RCP.json").exists()
+        # a SECOND reconciliation pass must be a no-op (run already SUCCEEDED)
+        handled2 = reconcile_orphans(uow.session, data_dir=str(env["tmp"]))
+        uow.commit()
+        assert "RUN-RCP" not in handled2
     assert ex.call_count("worker") == 0  # model NEVER re-invoked
 
 

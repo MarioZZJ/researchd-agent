@@ -46,6 +46,7 @@ def upgrade() -> None:
         sa.Column("status", sa.String(32), nullable=False),
         sa.Column("error_message", sa.Text(), nullable=True),
         sa.Column("usage_json", sa.JSON(), nullable=True),
+        sa.Column("metadata_json", sa.JSON(), nullable=True),
         sa.Column("version", sa.Integer(), nullable=True),
         sa.Column("created_by", sa.String(64), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),

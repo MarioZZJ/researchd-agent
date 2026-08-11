@@ -302,27 +302,30 @@ def _recover_from_receipt(session: Session, dispatcher: Any, run: Run, data_dir:
     path = _Path(data_dir) / "receipts" / f"{run.run_id}.json"
     if not path.exists():
         return False
+    # parse + validate FIRST (corrupt receipt -> absent -> retry); collection
+    # failures PROPAGATE (a mutated run must never be re-orphaned)
     try:
         receipt = _json.loads(path.read_text())
         raw = receipt["raw"]
         role = receipt.get("role", "worker")
         validator = validate_audit_result if role == "auditor" else validate_work_result
         result = validator(raw)
-        if validator is validate_audit_result:
-            result = result  # AuditResult
-        info = ExecutorSessionInfo(
-            executor=run.executor or "reasonix",
-            session_id=receipt.get("session_id"),
-            transcript_path=receipt.get("transcript_path"),
-        )
-        if role == "auditor":
-            dispatcher.collect_audit(run, result, info)
-        else:
-            dispatcher.collect_success(run, result, info)
-        run.termination_reason = "recovered from runtime receipt (no re-invocation)"
-        RunRepo(session).save(run)
-        path.unlink()  # receipt is single-use
-        return True
     except Exception:  # noqa: BLE001  corrupt receipt -> fall through to retry
         logger.warning("receipt for run %s unusable; falling back to retry", run.run_id)
         return False
+    info = ExecutorSessionInfo(
+        executor=run.executor or "reasonix",
+        session_id=receipt.get("session_id"),
+        transcript_path=receipt.get("transcript_path"),
+    )
+    if role == "auditor":
+        dispatcher.collect_audit(run, result, info)
+    else:
+        dispatcher.collect_success(run, result, info)
+    run.termination_reason = "recovered from runtime receipt (no re-invocation)"
+    RunRepo(session).save(run)
+    # the receipt is deliberately KEPT: recovery only ever applies to stale
+    # (STARTING/RUNNING) runs, so a leftover receipt on a SUCCEEDED run is
+    # inert; deleting it before commit would create a crash window where the
+    # only completed result is lost and the model gets re-invoked
+    return True
