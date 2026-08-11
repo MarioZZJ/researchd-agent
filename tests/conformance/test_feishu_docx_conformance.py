@@ -106,16 +106,17 @@ class FakeDocxApi:
 
 class FakeClient:
     def __init__(self, api):
-        self.docx = SimpleNamespace_v1(document_block=api)
+        self.docx = SimpleNamespace_v1(document_block_children=api, document_block=api)
 
 
 class SimpleNamespace_v1:
-    def __init__(self, document_block):
-        self.v1 = SimpleNamespace_v1_inner(document_block)
+    def __init__(self, document_block_children, document_block):
+        self.v1 = SimpleNamespace_v1_inner(document_block_children, document_block)
 
 
 class SimpleNamespace_v1_inner:
-    def __init__(self, document_block):
+    def __init__(self, document_block_children, document_block):
+        self.document_block_children = document_block_children
         self.document_block = document_block
 
 

@@ -372,7 +372,7 @@ class FeishuDocClient:
             .build()
         )
         await self._call(
-            lambda: client.docx.v1.document_block.create(req),
+            lambda: client.docx.v1.document_block_children.create(req),
             f"docx create block {section_key}",
         )
 
@@ -505,6 +505,6 @@ class FeishuDocClient:
             .build()
         )
         await self._call(
-            lambda: client.docx.v1.document_block.batch_delete_children(req),
+            lambda: client.docx.v1.document_block_children.batch_delete(req),
             f"docx delete block {section_key}",
         )

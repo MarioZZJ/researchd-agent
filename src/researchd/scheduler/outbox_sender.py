@@ -150,13 +150,17 @@ class OutboxSender:
             # concurrency token, and a revision conflict is resolved by
             # re-reading (adopt-if-equal, else human-patch skip)
             remote = await self.doc_platform.list_blocks(document_id)
-            remote_text = remote.get(section_key)
+            # a missing block reads as "" — enqueue-time expected_remote may
+            # be None or "" for a brand-new document; normalize BOTH sides so
+            # a missing block never falsely triggers HumanPatchSkip
+            remote_text = remote.get(section_key, "") or ""
+            expected_remote = payload.get("expected_remote") or ""
             revision = None
             reader = getattr(self.doc_platform, "list_blocks_with_revision", None)
             if reader is not None:
                 try:
                     remote, revision = await reader(document_id)
-                    remote_text = remote.get(section_key)
+                    remote_text = remote.get(section_key, "") or ""
                 except Exception:  # noqa: BLE001  revision read is best-effort
                     pass
             if remote_text == text:
@@ -166,7 +170,7 @@ class OutboxSender:
             # exactly what it was at enqueue time. Any change in between
             # (human edit / block deleted / block created) means the queued
             # write no longer applies — skip it (never overwrite humans).
-            if remote_text != payload.get("expected_remote"):
+            if remote_text != expected_remote:
                 raise HumanPatchSkip(row.id)
             try:
                 if section_key in remote:
@@ -182,7 +186,7 @@ class OutboxSender:
                 # re-read and only write if the remote is still ours; any
                 # human content wins (never overwrite)
                 remote2 = await self.doc_platform.list_blocks(document_id)
-                if remote2.get(section_key) != payload.get("expected_remote"):
+                if remote2.get(section_key, "") or "" != expected_remote:
                     raise HumanPatchSkip(row.id)
                 if section_key in remote2:
                     await self.doc_platform.update_block(document_id, section_key, text)
