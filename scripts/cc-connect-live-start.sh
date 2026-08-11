@@ -24,17 +24,22 @@ if systemctl --user is-active cc-connect-live >/dev/null 2>&1; then
   exit 0
 fi
 
-TOKEN=""
+# The bearer token must never appear in argv (ps-readable) or in the whole
+# unit environment; it is read from a 0600 file by the unit via
+# EnvironmentFile. Only the PATH to the file is visible.
+TOKEN_FILE="$HOME/.cache/cc-connect-live/researchd-api-token.env"
 if [ -f "$ENV_FILE" ]; then
   TOKEN=$(grep '^RESEARCHD_API__TOKEN=' "$ENV_FILE" | head -1 | cut -d= -f2 || true)
+  if [ -n "$TOKEN" ]; then
+    umask 077
+    printf 'RESEARCHD_API__TOKEN=%s\n' "$TOKEN" > "$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+  fi
+  unset TOKEN
 fi
 
-ARGS=(systemd-run --user --unit=cc-connect-live --property=Restart=on-failure
-  --working-directory="$HOME")
-if [ -n "$TOKEN" ]; then
-  ARGS+=(--setenv="RESEARCHD_API__TOKEN=$TOKEN")
-fi
-ARGS+=("$BIN" --config "$CFG")
-
-"${ARGS[@]}"
+systemd-run --user --unit=cc-connect-live --property=Restart=on-failure \
+  --working-directory="$HOME" \
+  --property="EnvironmentFile=$TOKEN_FILE" \
+  -- "$BIN" --config "$CFG"
 echo "cc-connect-live started (transient unit)"

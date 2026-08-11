@@ -313,22 +313,29 @@ async def _ensure_shared(
     A missing drive scope (e.g. docs:doc not yet granted) must NOT block the
     projection: the denial is logged by code only, the document receipt is
     still persisted, and a later replay (after the scope is granted) retries
-    the share. The marker records what was shared so retries are precise.
+    the share.
+
+    Least privilege: the group (openchat) gets read-only `view` — extra chat
+    members must never edit project documents — while the PI (openid) gets
+    the configured permission (full_access so PI Notes stay editable). The
+    marker stores (member_type, member_id) so rotating the chat/PI re-grants
+    to the new principal instead of skipping on the old label.
     """
     logger = logging.getLogger("researchd.doc")
     from ..persistence.repositories import ProjectRepo
 
     metadata = dict(project.metadata or {})
     shared = set((metadata.get("feishu_document_shared") or "").split(","))
-    for label, member_type, member_id in (
-        ("chat", "openchat", staging_chat_id),
-        ("pi", "openid", pi_open_id),
-    ):
+    targets = [
+        ("openchat:" + staging_chat_id, "openchat", staging_chat_id, "view"),
+        ("openid:" + pi_open_id, "openid", pi_open_id, default_permission),
+    ]
+    for label, member_type, member_id, perm in targets:
         if not member_id or label in shared:
             continue
         try:
             await platform.add_permission_member(
-                doc_id, member_type=member_type, member_id=member_id, perm=default_permission
+                doc_id, member_type=member_type, member_id=member_id, perm=perm
             )
             shared.add(label)
         except Exception as exc:  # noqa: BLE001 — best-effort by design

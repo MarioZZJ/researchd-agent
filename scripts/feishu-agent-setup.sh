@@ -107,7 +107,7 @@ if [ "$STATUS" = "expired" ]; then
   echo "ERROR: 授权码已过期，请重跑脚本重新扫码" >&2; exit 5
 fi
 if [ "$STATUS" != "completed" ]; then
-  printf 'ERROR: 轮询异常: %s\n' "$POLL" >&2; exit 5
+  printf 'ERROR: 轮询异常，status=%s（响应内容不显示）\n' "$STATUS" >&2; exit 5
 fi
 
 APP_ID=$(printf '%s' "$POLL" | python3 -c "import json,sys; print(json.load(sys.stdin)['data'].get('app_id',''))")
@@ -137,6 +137,9 @@ cp "$CONFIG" "$BAK" && chmod 600 "$BAK" && echo "   已备份配置到 $BAK（06
 # 0600 perms; the file is removed immediately after use
 SEC_FILE=$(mktemp /tmp/cc-setup-secret.XXXXXX)
 chmod 600 "$SEC_FILE"
+# cleanup on EVERY exit path (a failed pipeline must not leave the secret
+# behind in /tmp)
+trap 'rm -f "$SEC_FILE"' EXIT
 printf '%s' "$APP_SECRET" > "$SEC_FILE"
 SAVE=$(python3 - "$PROJECT" "$APP_ID" "$PLATFORM" "$OWNER" "$SEC_FILE" <<'PYEOF' | curl -sS --max-time 20 --config "$CURL_CFG" -H "Content-Type: application/json" --data-binary @- "$BASE/api/v1/setup/feishu/save"
 import json, sys
@@ -150,7 +153,18 @@ print(json.dumps({
 PYEOF
 )
 rm -f "$SEC_FILE"
-echo "   $(printf '%s' "$SAVE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('data', d).get('message', d))")"
+trap - EXIT
+# only allowlisted fields are printed; never fall back to the whole response
+SAVE_MSG=$(printf '%s' "$SAVE" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    inner = d.get('data', d)
+    print(inner.get('message', 'saved'))
+except Exception:
+    print('saved')
+")
+echo "   $SAVE_MSG"
 unset APP_SECRET 2>/dev/null || true
 
 echo

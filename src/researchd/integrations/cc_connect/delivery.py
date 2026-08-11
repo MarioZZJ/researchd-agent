@@ -112,6 +112,14 @@ class CcConnectDeliveryPort(DeliveryPort):
         self.session_key = session_key
         self.uds = uds
 
+    def _require_session_key(self) -> None:
+        """Fail closed: an empty session_key would make cc-connect resolve the
+        FIRST active session, risking delivery to an unintended chat."""
+        if not self.session_key:
+            raise CcConnectDeliveryError(
+                "cc-connect session_key is required (fail-closed: refusing to target an arbitrary active session)"
+            )
+
     def _client(self) -> httpx.AsyncClient:
         transport = httpx.AsyncHTTPTransport(uds=self.uds) if self.uds else None
         headers = {"Authorization": f"Bearer {self.token}"}
@@ -126,6 +134,7 @@ class CcConnectDeliveryPort(DeliveryPort):
         attachments: list | None = None,
         project_id: str | None = None,
     ) -> str:
+        self._require_session_key()
         message = build_card_payload(payload, session_key=self.session_key)
         async with self._client() as client:
             resp = await client.post(
@@ -151,6 +160,7 @@ class CcConnectDeliveryPort(DeliveryPort):
         return mid
 
     async def update(self, platform_message_id: str, payload: dict) -> None:
+        self._require_session_key()
         _check_message_id(platform_message_id)
         message = build_card_payload(payload, session_key=self.session_key)
         async with self._client() as client:

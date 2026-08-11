@@ -213,7 +213,7 @@ def test_delivery_never_echoes_platform_body(monkeypatch):
             return BadResp()
 
     monkeypatch.setattr("researchd.integrations.cc_connect.delivery.httpx.AsyncClient", BadClient)
-    port = CcConnectDeliveryPort(token="t", project="p")
+    port = CcConnectDeliveryPort(token="t", project="p", session_key="s1")
 
     import asyncio
 
@@ -223,6 +223,11 @@ def test_delivery_never_echoes_platform_body(monkeypatch):
     with pytest.raises(CcConnectDeliveryError, match="body withheld") as ei2:
         asyncio.run(port.update("om_x", {"body": "b"}))
     assert "secret-host" not in str(ei2.value)
+
+    # fail-closed: empty session_key is refused before any request goes out
+    port0 = CcConnectDeliveryPort(token="t", project="p")
+    with pytest.raises(CcConnectDeliveryError, match="session_key is required"):
+        asyncio.run(port0.deliver(idempotency_key="k", kind="m", payload={"body": "b"}))
 
 
 def test_run_result_cannot_become_delivery_payload(factory):

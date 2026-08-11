@@ -103,7 +103,10 @@ async def test_collaborators_added_and_denied_gracefully(db, project):
     member_types = {m["member_type"] for m in doc["members"]}
     assert "openchat" in member_types
     assert "openid" in member_types
-    assert all(m["perm"] == "full_access" for m in doc["members"])
+    # least privilege: the group is read-only, the PI is the editor
+    perms = {m["member_type"]: m["perm"] for m in doc["members"]}
+    assert perms["openchat"] == "view"
+    assert perms["openid"] == "full_access"
 
     # drive scope denied: creation still succeeds, denial logged only
     platform2 = FakeDocPlatform()
