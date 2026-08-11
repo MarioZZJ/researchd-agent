@@ -247,6 +247,7 @@ def add_member(project_id: str, req: ProjectMemberRequest, uow: UnitOfWork = Dep
             can_approve_decisions=req.can_approve_decisions,
         )
     )
+    uow.commit()
     return {"project_id": project_id, "platform_user_id": req.platform_user_id, "added": True}
 
 
