@@ -76,6 +76,7 @@ EVENT_TYPES = {
     "inbound.message_duplicate",
     "projection.updated",
     "projection.human_patch",
+    "document.created",
     "planner.ran",
     "plan_revision.proposed",
     "plan_revision.applied",

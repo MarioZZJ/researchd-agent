@@ -284,3 +284,64 @@ def test_real_feishu_docx_round_trip():
 
     run(scenario())
     engine.dispose()
+
+
+def test_real_feishu_docx_create_and_share():
+    """REAL conformance: researchd CREATES its own document (user-authorized
+    auto-create), grants collaborators, writes the first projection, then
+    cleans up the created document is NOT possible (no delete API) — the
+    document is a REAL artifact, so it is left in place and the caller must
+    clean it manually (the document_id is printed, never the secrets).
+
+    Gated: runs only with LARK_APP_ID / LARK_APP_SECRET and explicit
+    RESEARCHD_FEISHU__ALLOW_AUTO_CREATE=1.
+    """
+    app_id = os.environ.get("LARK_APP_ID")
+    app_secret = os.environ.get("LARK_APP_SECRET")
+    if not (app_id and app_secret):
+        pytest.skip("real feishu docx create needs LARK_APP_ID/SECRET")
+    if os.environ.get("RESEARCHD_FEISHU__ALLOW_AUTO_CREATE") != "1":
+        pytest.skip("auto-create conformance needs explicit RESEARCHD_FEISHU__ALLOW_AUTO_CREATE=1")
+    client = FeishuDocClient()
+    import tempfile
+
+    from researchd.persistence.transaction import init_db, make_engine, make_session_factory, UnitOfWork
+    from researchd.domain.project import Project
+    from researchd.persistence.repositories import ProjectRepo
+    from researchd.projections.feishu_doc import ensure_project_document
+
+    engine = make_engine(os.path.join(tempfile.mkdtemp(), "t2.db"))
+    init_db(engine)
+    factory = make_session_factory(engine)
+
+    async def scenario():
+        with UnitOfWork(factory) as uow:
+            ProjectRepo(uow.session).save(
+                Project(project_id="P-CREATE", name="conformance-create", description="d")
+            )
+            uow.commit()
+        with UnitOfWork(factory) as uow:
+            project = ProjectRepo(uow.session).get_by_project_id("P-CREATE")
+            doc_id = await ensure_project_document(
+                uow.session,
+                client,
+                project,
+                title_template="科研项目报告 - {project_name} - {date}",
+                staging_chat_id=os.environ.get("RESEARCHD_FEISHU__STAGING_CHAT_ID", ""),
+                pi_open_id=os.environ.get("RESEARCHD_FEISHU__PI_OPEN_ID", ""),
+            )
+            uow.commit()
+        # replay (service restart): must NOT create a second document
+        with UnitOfWork(factory) as uow:
+            project = ProjectRepo(uow.session).get_by_project_id("P-CREATE")
+            same = await ensure_project_document(uow.session, client, project, title_template="x")
+            uow.commit()
+        assert same == doc_id
+        blocks = await client.list_blocks(doc_id)
+        # first projection wrote at least one section
+        assert any(k != "pi-notes" for k in blocks), blocks
+        print(f"\nCREATED_DOCUMENT_ID={doc_id} title={project.metadata.get('feishu_document_title')}")
+        print("REAL_DOC_CREATE_CONFORMANCE_OK (cleanup: delete the doc manually in the feishu UI)")
+
+    asyncio.run(scenario())
+    engine.dispose()

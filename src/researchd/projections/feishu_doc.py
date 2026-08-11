@@ -70,6 +70,16 @@ class DocPlatform:
     """Minimal docx-like surface (blocks keyed by section). The Feishu docx
     client is real; FakeDocPlatform serves deterministic tests."""
 
+    async def create_document(self, title: str, *, folder_token: str | None = None):
+        """Create a new document; returns (document_id, revision_id)."""
+        raise NotImplementedError
+
+    async def add_permission_member(
+        self, document_id: str, *, member_type: str, member_id: str, perm: str = "full_access"
+    ) -> bool:
+        """Share the document with a member; False when the platform denies."""
+        raise NotImplementedError
+
     async def list_blocks(self, document_id: str) -> dict[str, str]:
         """section_key -> block text (remote truth)."""
         raise NotImplementedError
@@ -95,6 +105,24 @@ class FakeDocPlatform(DocPlatform):
         self.human_edit: list[tuple] = []  # (document_id, section_key, text) applied manually
         self.fail_writes: bool = False  # simulate platform outages
         self.revision: int | None = 1  # simulated document revision
+        self.documents: dict[str, dict] = {}  # document_id -> {title, folder_token, members}
+        self.deny_collaborator: bool = False  # simulate missing drive scope
+
+    async def create_document(self, title: str, *, folder_token: str | None = None):
+        doc_id = f"doc-{len(self.documents) + 1}"
+        self.documents[doc_id] = {"title": title, "folder_token": folder_token, "members": []}
+        self.revision = 1
+        return doc_id, self.revision
+
+    async def add_permission_member(
+        self, document_id: str, *, member_type: str, member_id: str, perm: str = "full_access"
+    ) -> bool:
+        if self.deny_collaborator:
+            return False
+        self.documents.setdefault(document_id, {"members": []})["members"].append(
+            {"member_type": member_type, "member_id": member_id, "perm": perm}
+        )
+        return True
 
     async def list_blocks(self, document_id: str) -> dict[str, str]:
         return dict(self.blocks.get(document_id, {}))
@@ -197,6 +225,83 @@ def _state_row(session: Session, project_id: str, document_id: str, section_key:
             ProjectionStateRow.section_key == section_key,
         )
     ).scalar_one_or_none()
+
+
+async def ensure_project_document(
+    session: Session,
+    platform: DocPlatform,
+    project,
+    *,
+    title_template: str,
+    folder_token: str = "",
+    staging_chat_id: str = "",
+    pi_open_id: str = "",
+    default_permission: str = "full_access",
+) -> str:
+    """Create the project's document ONCE and persist the receipt in the same
+    transaction (project.metadata.feishu_document_id + document.created event
+    + first projection outbox). Idempotent: a replay with the receipt already
+    persisted never creates a second document.
+
+    Collaborator sharing is best-effort by design: a missing drive scope must
+    not block the projection (the PI can still be granted access later), but
+    the denial is logged by code only.
+    """
+    from ..persistence.outbox import OutboxRepo
+    from ..persistence.repositories import ProjectRepo
+
+    existing = (project.metadata or {}).get("feishu_document_id")
+    if existing:
+        return existing
+    from datetime import date
+
+    title = title_template.format(project_name=project.name, date=date.today().isoformat())
+    doc_id, revision = await platform.create_document(title, folder_token=folder_token or None)
+    if staging_chat_id:
+        await platform.add_permission_member(
+            doc_id, member_type="openchat", member_id=staging_chat_id, perm=default_permission
+        )
+    if pi_open_id:
+        await platform.add_permission_member(
+            doc_id, member_type="openid", member_id=pi_open_id, perm=default_permission
+        )
+    # same-transaction write-back: receipt + event + first projection outbox
+    project.metadata = dict(project.metadata or {})
+    project.metadata["feishu_document_id"] = doc_id
+    project.metadata["feishu_document_title"] = title
+    project.metadata["feishu_document_revision"] = revision
+    project.updated_at = utcnow()
+    ProjectRepo(session).save(project)
+    EventRepo(session).append(
+        make_event(
+            event_type="document.created",
+            aggregate=AggregateRef(type="project", id=project.id, version=project.version),
+            idempotency_key=f"project:{project.project_id}:document.created:{doc_id}",
+            project_id=project.project_id,
+            payload={"document_id": doc_id, "title": title, "revision": revision},
+        )
+    )
+    # first projection outbox: queue all sections (write-back happens in the
+    # outbox sender AFTER a successful delivery, same design as sync_document)
+    sections = compile_sections(session, project.project_id)
+    for key in SECTION_ORDER:
+        content = sections[key]
+        if content.owner == "pi":
+            continue
+        _enqueue_doc_block(
+            session,
+            project_id=project.project_id,
+            document_id=doc_id,
+            section_key=key,
+            text=content.text,
+            expected_remote="",  # brand-new document: no remote content yet
+            actor=Actor(type="system"),
+        )
+    logger.info(
+        "project document ensured: project=%s document_id=%s title=%r",
+        project.project_id, doc_id, title,
+    )
+    return doc_id
 
 
 def _pending_outbox(session: Session, prefix: str) -> bool:

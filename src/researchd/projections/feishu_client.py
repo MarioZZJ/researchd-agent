@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from typing import NamedTuple
 
 logger = logging.getLogger("researchd.feishu_doc")
 
@@ -49,6 +50,13 @@ class FeishuDocRevisionConflict(FeishuDocError):
     re-read and decide: adopt-if-equal or treat as a human edit."""
 
 
+class DocumentCreated(NamedTuple):
+    """Result of FeishuDocClient.create_document."""
+
+    document_id: str
+    revision_id: int | None
+
+
 class FeishuDocClient:
     """lark-oapi docx adapter: list/create/update blocks by section."""
 
@@ -71,6 +79,80 @@ class FeishuDocClient:
                 "(set them to use the real doc client)"
             )
         return lark.Client.builder().app_id(app_id).app_secret(app_secret).build()
+
+    # ------------------------------------------------------------ create
+    async def create_document(self, title: str, *, folder_token: str | None = None) -> DocumentCreated:
+        """Create a new feishu docx document. Errors only carry the business
+        code — the raw platform response is never surfaced (no secret/body
+        leakage into logs)."""
+        import lark_oapi as lark
+
+        def _create():
+            req = (
+                lark.docx.v1.CreateDocumentRequest.builder()
+                .request_body(
+                    lark.docx.v1.CreateDocumentRequestBody.builder()
+                    .title(title)
+                    .folder_token(folder_token or "")
+                    .build()
+                )
+                .build()
+            )
+            return self._client().docx.v1.document.create(req)
+
+        resp = await self._call(_create, "create_document")
+        data = resp.data  # type: ignore[union-attr]
+        document_id = getattr(data, "document_id", None)
+        if not document_id:
+            raise FeishuDocError("create_document returned no document_id", code=resp.code)
+        revision_id = getattr(data, "revision_id", None)
+        logger.info("feishu document created: document_id=%s (revision=%s)", document_id, revision_id)
+        return DocumentCreated(document_id=document_id, revision_id=revision_id)
+
+    async def add_permission_member(
+        self,
+        document_id: str,
+        *,
+        member_type: str,  # "openchat" | "openid" | "userid" | "email"
+        member_id: str,
+        perm: str = "full_access",  # view | edit | full_access
+    ) -> bool:
+        """Share the document with a member (group / user). full_access grants
+        edit. Returns False when the platform denies it (missing scope) so the
+        caller can fall back to a user collaborator — the denial reason is
+        logged by code only, never the raw body."""
+        import lark_oapi as lark
+
+        def _add():
+            from lark_oapi.api.drive.v1.model.base_member import BaseMember
+
+            req = (
+                lark.drive.v1.CreatePermissionMemberRequest.builder()
+                .token(document_id)
+                .type("docx")
+                .request_body(
+                    BaseMember.builder()
+                    .member_type(member_type)
+                    .member_id(member_id)
+                    .perm(perm)
+                    .build()
+                )
+                .build()
+            )
+            return self._client().drive.v1.permission_member.create(req)
+
+        resp = await self._call(_add, "add_permission_member")
+        if resp.success():
+            logger.info(
+                "feishu doc collaborator added: document_id=%s member_type=%s perm=%s",
+                document_id, member_type, perm,
+            )
+            return True
+        logger.warning(
+            "feishu doc collaborator denied: document_id=%s member_type=%s code=%s (raw body withheld)",
+            document_id, member_type, resp.code,
+        )
+        return False
 
     # real platform rate-limit / transient business codes (lark docx + auth):
     # 99991663 tenant_access_token rate limit; 99991400 concurrent limit;

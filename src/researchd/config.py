@@ -87,6 +87,22 @@ class CcConnectConfig(BaseModel):
         )
 
 
+class FeishuConfig(BaseModel):
+    """Feishu docx projection config (IMPLEMENTATION.md §20). Credentials are
+    secrets: read from env vars (never logged, never persisted to the DB,
+    artifacts, or executor environment). allow_auto_create gates the
+    researchd-initiated document creation (user-authorized for staging)."""
+
+    lark_app_id_env: str = "LARK_APP_ID"
+    lark_app_secret_env: str = "LARK_APP_SECRET"
+    folder_token: str = ""  # optional folder for created documents
+    staging_chat_id: str = ""  # RD测试 group (openchat collaborator target)
+    pi_open_id: str = ""  # real PI open_id (collaborator target, optional)
+    doc_title_template: str = "科研项目报告 - {project_name} - {date}"
+    allow_auto_create: bool = True
+    default_permission: str = "full_access"  # drive permission level for collaborators
+
+
 class ProfileConfig(BaseModel):
     """Named executor profile (IMPLEMENTATION.md §15.1): resolved model and
     reasoning effort. Profile names are referenced by Task contracts and by
@@ -124,6 +140,7 @@ class Settings(BaseSettings):
     db_path: str = Field(default=".data/researchd.db", validation_alias=AliasChoices("RESEARCHD_DB", "db_path"))
     log_level: str = "info"
     doc_platform: str = "none"  # none | feishu
+    feishu: FeishuConfig = Field(default_factory=FeishuConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
     interaction: InteractionConfig = Field(default_factory=InteractionConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)

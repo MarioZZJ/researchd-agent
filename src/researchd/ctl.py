@@ -162,15 +162,30 @@ def delivery_cmd(action: str) -> None:
 
 
 @main.command("document")
-@click.argument("action", type=click.Choice(["test"]))
-@click.option("--document-id", required=True, help="staging feishu docx document id")
-def document_cmd(action: str, document_id: str) -> None:
-    """document test --document-id <id> — block-level docx round-trip.
+@click.argument("action", type=click.Choice(["create", "test"]))
+@click.option("--project-id", default="", help="project id (test defaults to the project's own document)")
+@click.option("--document-id", default="", help="explicit staging feishu docx document id (test only)")
+@click.option("--title", default="", help="optional title override (create only)")
+def document_cmd(action: str, project_id: str, document_id: str, title: str) -> None:
+    """document create --project-id <id> — create the project's feishu docx
+    once and persist the receipt (idempotent).
 
-    Creates/updates/reads/deletes one test block in the given staging
-    document (requires RESEARCHD_LARK_APP_ID/SECRET on the service)."""
-    if action == "test":
-        click.echo(json.dumps(_call("POST", "/v1/document/test", json={"document_id": document_id}), ensure_ascii=False, indent=2))
+    document test [--project-id <id>] [--document-id <id>] — block-level
+    docx round-trip on the project's own document by default (no external id
+    required); requires RESEARCHD_LARK_APP_ID/SECRET on the service."""
+    if action == "create":
+        if not project_id:
+            raise click.ClickException("document create requires --project-id")
+        click.echo(json.dumps(
+            _call("POST", "/v1/document/create", json={"project_id": project_id, "title": title}),
+            ensure_ascii=False, indent=2,
+        ))
+    else:
+        body = {"project_id": project_id, "document_id": document_id}
+        click.echo(json.dumps(
+            _call("POST", "/v1/document/test", json=body),
+            ensure_ascii=False, indent=2,
+        ))
 
 
 @main.command()
