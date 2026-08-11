@@ -140,6 +140,27 @@ async def test_principal_rotation_revokes_stale_collaborator(db, project):
 
 
 @pytest.mark.asyncio
+async def test_denied_revoke_keeps_marker_for_retry(db, project):
+    """When the platform denies the revoke (missing scope), the stale marker
+    is KEPT so a later replay retries — a denied revoke must never be
+    recorded as successful."""
+    platform = FakeDocPlatform()
+    with db() as session:
+        await _ensure(session, platform, project, pi_open_id="ou_pi_1")
+        session.commit()
+    platform.deny_collaborator = True  # now the platform refuses membership ops
+    with db() as session:
+        await _ensure(session, platform, project, pi_open_id="ou_pi_2")
+        session.commit()
+    with db() as session:
+        project2 = ProjectRepo(session).get_by_project_id("proj-doc-1")
+        shared = (project2.metadata or {}).get("feishu_document_shared", "")
+        assert "openid:ou_pi_1" in shared  # kept: revoke was denied
+    # the new PI was also denied; marker must not claim it
+    assert "openid:ou_pi_2" not in shared
+
+
+@pytest.mark.asyncio
 async def test_first_projection_flows_through_outbox(db, project):
     """ensure + sync: the queued doc_block rows are the same content the
     projection would enqueue; after the outbox sender runs, blocks exist."""

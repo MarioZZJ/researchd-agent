@@ -127,6 +127,8 @@ class FakeDocPlatform(DocPlatform):
     async def remove_permission_member(
         self, document_id: str, *, member_type: str, member_id: str
     ) -> bool:
+        if self.deny_collaborator:
+            return False  # platform refuses membership ops (missing scope)
         members = self.documents.setdefault(document_id, {"members": []})["members"]
         before = len(members)
         self.documents[document_id]["members"] = [
@@ -349,22 +351,41 @@ async def _ensure_shared(
         if not member_id:
             continue
         try:
-            await platform.remove_permission_member(doc_id, member_type=member_type, member_id=member_id)
-            marked.discard(stale)
-            logger.info("document share revoked: doc=%s %s", doc_id, stale)
+            revoked = await platform.remove_permission_member(
+                doc_id, member_type=member_type, member_id=member_id
+            )
+            if revoked:
+                marked.discard(stale)
+                logger.info("document share revoked: doc=%s %s", doc_id, stale)
+            else:
+                # platform denied the revoke (e.g. missing scope): KEEP the
+                # marker so a later replay retries; the stale principal must
+                # not silently stay authorized
+                logger.warning(
+                    "document revoke denied by platform (code unknown): doc=%s member=%s — marker kept for retry",
+                    doc_id, stale,
+                )
         except Exception as exc:  # noqa: BLE001 — best-effort by design
             logger.warning(
-                "document revoke skipped (code %s): doc=%s member=%s",
+                "document revoke skipped (code %s): doc=%s member=%s — marker kept for retry",
                 getattr(exc, "code", "unknown"), doc_id, stale,
             )
     for label, member_type, member_id, perm in targets:
         if not member_id or label in marked:
             continue
         try:
-            await platform.add_permission_member(
+            granted = await platform.add_permission_member(
                 doc_id, member_type=member_type, member_id=member_id, perm=perm
             )
-            marked.add(label)
+            if granted:
+                marked.add(label)
+            else:
+                # platform denied (missing scope): do NOT record as shared —
+                # a later replay retries
+                logger.warning(
+                    "document share denied by platform: doc=%s member=%s — marker not set",
+                    doc_id, label,
+                )
         except Exception as exc:  # noqa: BLE001 — best-effort by design
             logger.warning(
                 "document share skipped (code %s): doc=%s member=%s — will retry on next replay",
