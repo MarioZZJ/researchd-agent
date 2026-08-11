@@ -40,7 +40,7 @@ token = "MCP-SECRET"
 
 [[providers]]
 name = "gateway"
-api_key = "GATEWAY-KEY"
+api_key_env = "CLIPROXY_API_KEY"
 
 [[providers]]
 name = "direct"
@@ -53,6 +53,9 @@ def fake_home(tmp_path, monkeypatch):
     home = tmp_path / "home"
     (home / ".reasonix" / "skills").mkdir(parents=True)
     (home / ".reasonix" / "config.toml").write_text(GLOBAL_CONFIG)
+    (home / ".reasonix" / ".env").write_text(
+        'CLIPROXY_API_KEY=sk-real\nUNRELATED_SECRET=do-not-copy\n'
+    )
     for skill in ALLOWED_SKILLS:
         d = home / ".reasonix" / "skills" / skill
         d.mkdir()
@@ -66,11 +69,21 @@ def test_minimal_config_whitelists_keys_and_providers(fake_home):
     out = _minimal_config(fake_home / ".reasonix" / "config.toml")
     for key in TOP_LEVEL_KEYS:
         assert key in out, f"whitelisted key {key} missing"
-    assert 'api_key = "GATEWAY-KEY"' in out
+    assert 'api_key_env = "CLIPROXY_API_KEY"' in out
     assert 'api_key = "DIRECT-KEY"' in out
     # secrets and unrelated config are NOT copied
     for banned in ("BOT-SECRET", "MCP-SECRET", "[bot]", "[[mcp", "telemetry = true", "theme = "):
         assert banned not in out, f"banned content leaked: {banned}"
+    assert "api_key_env = \"CLIPROXY_API_KEY\"" in out  # provider env ref survives
+
+
+def test_overlay_copies_only_provider_env_keys(fake_home, tmp_path):
+    overlay = ensure_overlay(tmp_path / "data")
+    env_file = overlay / ".env"
+    content = env_file.read_text()
+    assert "CLIPROXY_API_KEY=sk-real" in content  # api_key_env whitelisted
+    assert "UNRELATED_SECRET" not in content  # nothing else leaks
+    assert (env_file.stat().st_mode & 0o777) == 0o600
 
 
 def test_overlay_installs_whitelisted_skills_only(fake_home, tmp_path):
@@ -109,7 +122,7 @@ def test_overlay_workdir_fallback(fake_home, tmp_path):
     assert work.is_dir()
 
 
-def test_adapter_routes_transports_per_workspace(tmp_path, monkeypatch):
+def test_adapter_routes_transports_per_workspace(fake_home, tmp_path, monkeypatch):
     """The adapter gives each project workspace its own subprocess cwd; the
     fallback (no workspace) uses the overlay work dir."""
     from researchd.executors.reasonix.adapter import ReasonixAdapter

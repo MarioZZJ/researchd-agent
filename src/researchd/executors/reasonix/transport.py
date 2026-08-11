@@ -240,7 +240,20 @@ class StdioReasonixTransport(ReasonixTransport):
 
     async def new_session(self, session_config: dict) -> str:
         result = await self._call("session/new", {"sessionConfig": session_config})
-        return result.get("sessionId") or result.get("session", {}).get("sessionId", "")
+        sid = result.get("sessionId") or result.get("session", {}).get("sessionId", "")
+        if not sid:
+            raise TransportError("reasonix acp session/new: no sessionId")
+        # headless execution: the default tool-approval gate (ask) interrupts
+        # every turn in non-interactive mode; switch the gate to yolo AFTER
+        # creation (isolated overlay + workspace-confined cwd is the sandbox)
+        try:
+            await self._call(
+                "session/set_config_option",
+                {"sessionId": sid, "configId": "tool_approval", "value": "yolo"},
+            )
+        except TransportError:
+            pass  # older servers without the control: leave the gate as-is
+        return sid
 
     async def prompt(self, session_id: str, text: str, *, request_id: str | None = None) -> str:
         params = {
@@ -268,10 +281,48 @@ class StdioReasonixTransport(ReasonixTransport):
                             agg.append(b["text"])
             text_out = "\n".join(agg)
         if not text_out.strip():
+            # reasonix v1.21.2 returns {stopReason, transcriptPath} and keeps
+            # the assistant text in the persisted transcript: read the last
+            # assistant block from the transcript file
+            tp = result.get("transcriptPath")
+            if tp:
+                text_out = self._last_assistant_text(tp)
+        if not text_out.strip():
             raise TransportError(
                 f"reasonix acp session/prompt returned no text (result keys: {sorted(result.keys())})"
             )
         return text_out
+
+    @staticmethod
+    def _last_assistant_text(transcript_path: str) -> str:
+        """Extract the last assistant text block from a reasonix transcript
+        jsonl (message content may be a string or a list of blocks)."""
+        from pathlib import Path
+
+        try:
+            lines = Path(transcript_path).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return ""
+        for line in reversed(lines):
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("role") != "assistant":
+                continue
+            content = rec.get("content")
+            if isinstance(content, str) and content.strip():
+                return content
+            if isinstance(content, list):
+                parts = [
+                    b.get("text", "")
+                    for b in content
+                    if isinstance(b, dict) and b.get("text")
+                ]
+                joined = "\n".join(parts).strip()
+                if joined:
+                    return joined
+        return ""
 
     async def status(self, session_id: str) -> dict:
         """Session status. reasonix v1.21.2 does not implement session/status
@@ -385,6 +436,9 @@ class FakeReasonixTransport(ReasonixTransport):
         if method == "session/new":
             self._session_counter += 1
             return {"sessionId": f"SES-FAKE-{self._session_counter}"}
+        if method == "session/set_config_option":
+            # headless approval switch: record and accept (no script needed)
+            return {"sessionId": params.get("sessionId"), "configOptions": []}
         if method == "session/close":
             return {"sessionId": params.get("sessionId", "SES-FAKE-1")}  # idempotent
         replies = self.scripted_replies.get(method, [])

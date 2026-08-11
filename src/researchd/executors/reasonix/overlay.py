@@ -135,6 +135,46 @@ def _install_skills(overlay: Path, global_skills: Path) -> list[str]:
     return mounted
 
 
+def _provider_env_keys(global_config: Path) -> list[str]:
+    """api_key_env keys referenced by [[providers]] blocks (the ONLY env keys
+    the overlay may carry — everything else stays out)."""
+    keys: list[str] = []
+    try:
+        data = tomllib.loads(global_config.read_text())
+    except Exception:  # noqa: BLE001  fall back to text scan
+        for line in global_config.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith("api_key_env"):
+                key = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+                if key:
+                    keys.append(key)
+        return sorted(set(keys))
+    for provider in data.get("providers", []):
+        key = provider.get("api_key_env")
+        if key:
+            keys.append(key)
+    return sorted(set(keys))
+
+
+def _copy_provider_env(global_env: Path, overlay: Path, keys: list[str]) -> None:
+    """Copy ONLY the whitelisted provider env keys from the global reasonix
+    .env into the overlay .env (0600). The overlay is otherwise hermetic."""
+    if not keys or not global_env.exists():
+        return
+    lines: list[str] = []
+    for raw in global_env.read_text().splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        name = stripped.split("=", 1)[0].strip()
+        if name in keys:
+            lines.append(raw)
+    if lines:
+        dst = overlay / ".env"
+        dst.write_text("\n".join(lines) + "\n")
+        os.chmod(dst, 0o600)
+
+
 def ensure_overlay(data_dir: str | Path, *, skills: bool = True) -> Path:
     """Create the whitelisted isolated overlay. Returns the overlay path."""
     overlay = Path(data_dir) / OVERLAY_DIRNAME
@@ -150,6 +190,12 @@ def ensure_overlay(data_dir: str | Path, *, skills: bool = True) -> Path:
     dst = overlay / "config.toml"
     dst.write_text(_minimal_config(global_config))
     os.chmod(dst, 0o600)
+    # provider credential env keys (api_key_env) — nothing else
+    _copy_provider_env(
+        Path.home() / ".reasonix" / ".env",
+        overlay,
+        _provider_env_keys(global_config),
+    )
     (overlay / "sessions").mkdir(parents=True, exist_ok=True)
     os.chmod(overlay / "sessions", 0o700)
     if skills:
