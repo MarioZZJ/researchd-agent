@@ -104,6 +104,12 @@ class RunDispatcher:
         run.session_id = session_info.session_id
         run.turn_id = session_info.turn_id
         run.outcome = result.outcome.value
+        # usage: exactly what the executor reports; explicit unavailable when
+        # it reports nothing — never fabricated
+        run.usage = getattr(session_info, "usage", None) or {
+            "available": False,
+            "reason": "executor does not report usage",
+        }
         run.transition(RunStatus.SUCCEEDED)
         RunRepo(self.session).save(run)
         LeaseRepo(self.session).release(run.lease_token)
@@ -202,6 +208,10 @@ class RunDispatcher:
         run.result = result.model_dump()
         run.session_id = session_info.session_id
         run.turn_id = session_info.turn_id
+        run.usage = getattr(session_info, "usage", None) or {
+            "available": False,
+            "reason": "executor does not report usage",
+        }
         outcome = result.verdict.value if hasattr(result.verdict, "value") else str(result.verdict)
         run.outcome = outcome
         run.transition(RunStatus.SUCCEEDED)

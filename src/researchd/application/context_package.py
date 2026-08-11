@@ -21,6 +21,7 @@ Role separation:
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -57,7 +58,8 @@ def _token_estimate(text: str) -> int:
 
 
 def _hash(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest()[:32]
+    """Full SHA-256 (64 hex chars) of the exact rendered content."""
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 def _section(title: str, lines: list[str]) -> str:
@@ -65,10 +67,15 @@ def _section(title: str, lines: list[str]) -> str:
 
 
 class ContextPackageBuilder:
-    """Builds + persists role-specific context packages."""
+    """Builds + persists role-specific context packages.
 
-    def __init__(self, session: Session):
+    `data_dir` (from Settings, resolved) provides the canonical boundary for
+    forbidden paths — never guessed from workspace_root parents.
+    """
+
+    def __init__(self, session: Session, *, data_dir: str | Path | None = None):
         self.session = session
+        self.data_dir = Path(data_dir).resolve() if data_dir else None
 
     # ------------------------------------------------------------ helpers
     def _questions(self, project_id: str) -> list[ContextObjectRef]:
@@ -156,15 +163,17 @@ class ContextPackageBuilder:
         return refs
 
     def _forbidden_paths(self, project: Any) -> list[str]:
-        """Paths the model must never read/write: researchd data dir (db,
-        socket, other projects' workspaces) and the global reasonix home."""
-        forbidden = []
-        root = getattr(project, "workspace_root", None)
-        if root:
-            from pathlib import Path
+        """Paths the model must never read/write. The researchd data dir is
+        taken from the injected Settings-derived boundary (never guessed via
+        workspace_root.parent.parent); the global reasonix home is masked too.
+        The project workspace root itself is allowed (it is the cwd)."""
+        from pathlib import Path as _P
 
-            data_dir = Path(root).resolve().parent.parent  # <data>/workspaces/<p> -> <data>
-            forbidden.append(str(data_dir))
+        forbidden: list[str] = []
+        if self.data_dir is not None:
+            forbidden.append(str(self.data_dir))
+        forbidden.append(str(_P.home() / ".reasonix"))
+        forbidden.append(str(_P.home() / ".cc-connect"))
         return forbidden
 
     # ------------------------------------------------------------ render
@@ -240,13 +249,17 @@ class ContextPackageBuilder:
     def worker(self, task, run=None) -> ContextPackage:  # noqa: ANN001
         project_id = task.project_id
         contract = task.contract
+        # task-scoped artifacts (the task's OWN outputs) — never the whole
+        # project's artifact set
+        artifacts = self._artifacts(project_id, task_id=task.task_id)
         objects = [
             ContextObjectRef(kind="task", id=task.task_id, summary=_clip(contract.objective)),
             *self._questions(project_id),
             *self._claims(project_id),
             *self._verified_evidence(project_id),
+            *self._approved_decisions(project_id),
             *self._open_decisions(project_id),
-            *self._artifacts(project_id),
+            *artifacts,
         ]
         project = ProjectRepo(self.session).get_by_project_id(project_id)
         contract_lines = [
@@ -274,12 +287,16 @@ class ContextPackageBuilder:
                     [f"- {o.id}: {o.summary}" for o in self._verified_evidence(project_id)],
                 ),
                 _section(
+                    "APPROVED_DECISIONS",
+                    [f"- {o.id}: {o.summary}" for o in self._approved_decisions(project_id)],
+                ),
+                _section(
                     "OPEN_DECISIONS",
                     [f"- {o.id}: {o.summary}" for o in self._open_decisions(project_id)],
                 ),
                 _section(
                     "RELATED_ARTIFACTS",
-                    [f"- {o.id}: {o.summary}" for o in self._artifacts(project_id)],
+                    [f"- {o.id}: {o.summary}" for o in artifacts],
                 ),
                 _section("WORKSPACE_ROOT", [project.workspace_root or "（未配置）"] if project else ["（未配置）"]),
                 _section(
@@ -306,6 +323,8 @@ class ContextPackageBuilder:
         )
         if project is not None and project.workspace_root:
             pkg.metadata["workspace_root"] = project.workspace_root
+        pkg.metadata["budget"] = contract.budget.model_dump() if hasattr(contract.budget, "model_dump") else str(contract.budget)
+        pkg.metadata["excluded_by_budget"] = list(pkg.excluded_by_budget or [])
         return self._finalize(pkg, objects, content)
 
     # ------------------------------------------------------------ auditor
@@ -318,12 +337,29 @@ class ContextPackageBuilder:
         run = worker_run
         result = run.result or {}
         candidates = result.get("evidence_candidates", [])
-        artifacts = result.get("artifacts", [])
+        declared_artifacts = result.get("artifacts", [])
+        # RE-QUERY the registry: the auditor sees the REAL persisted artifacts
+        # of the worker run (full sha256, size, version, run) — the worker's
+        # declared list is only used to flag missing registrations.
+        registered = ArtifactRepo(self.session).list_by_run(run.run_id)
+        declared_paths = {str(a.get("path", "")).lstrip("./") for a in declared_artifacts}
+        registered_paths = {a.path.lstrip("./") for a in registered}
+        missing = sorted(declared_paths - registered_paths)
         objects = [
             ContextObjectRef(kind="task", id=task.task_id, summary=_clip(task.contract.objective)),
             ContextObjectRef(kind="run", id=run.run_id, summary=f"executor={run.executor} outcome={run.outcome}"),
             *[ContextObjectRef(kind="evidence_candidate", id=c.get("local_ref", "?"), summary=_clip(c.get("statement", ""))) for c in candidates],
-            *[ContextObjectRef(kind="artifact", id=a.get("local_ref", "?"), summary=_clip(a.get("path", ""))) for a in artifacts],
+            *[
+                ContextObjectRef(
+                    kind="artifact",
+                    id=a.artifact_id,
+                    summary=_clip(
+                        f"path={a.path} sha256={a.sha256 or '?'} size={a.size_bytes or '?'} "
+                        f"v{a.version or 1} run={a.run_id or '-'}"
+                    ),
+                )
+                for a in registered
+            ],
             *self._verified_evidence(project_id),
             *self._claims(project_id),
         ]
@@ -335,9 +371,15 @@ class ContextPackageBuilder:
                 f"limitations={c.get('limitations', [])} provenance={c.get('literature') or c.get('computational') or 'none'}"
             )
             cand_lines.append(f"    statement: {_clip(c.get('statement', ''))}")
-        artifact_lines = []
-        for a in artifacts:
-            artifact_lines.append(f"- {a.get('local_ref')} path={a.get('path')} kind={a.get('kind')} {_clip(a.get('description', ''))}")
+        # real registry rows (not the worker's claim): relative path + FULL
+        # sha256 + size + version + owning run
+        artifact_lines = [
+            f"- {a.artifact_id} path={a.path} sha256={a.sha256 or '?'} "
+            f"size={a.size_bytes or '?'} v{a.version or 1} run={a.run_id or '-'} kind={a.kind}"
+            for a in registered
+        ]
+        if missing:
+            artifact_lines.append(f"MISSING_FROM_REGISTRY: {missing}")
         contract = task.contract
         content = "\n\n".join(
             [

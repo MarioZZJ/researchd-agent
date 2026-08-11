@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from pathlib import Path
 
 from ..domain.base import Actor, AggregateRef, new_id
 from ..domain.events import make_event
@@ -24,12 +25,21 @@ logger = logging.getLogger("researchd.scheduler.ext")
 CHEAP_DIAGNOSTIC_MARKER = "cheap-diagnostic:"
 
 
-async def plan_projects(session_factory, executor, *, planner_profile: dict | None = None) -> int:  # noqa: ANN001
-    """Materialize the first task batch for task-less ACTIVE projects."""
+async def plan_projects(session_factory, executor, *, planner_profile: dict | None = None, data_dir: str | Path | None = None) -> int:  # noqa: ANN001
+    """Materialize the first task batch for task-less ACTIVE projects.
+
+    Every planner model call is recorded in the invocations ledger (planner
+    turns have no task/run row): role/profile/resolved model/effort/skills/
+    budget + start/finish + status + usage ("unavailable" when the executor
+    does not report it — never fabricated).
+    """
     from sqlalchemy import select
 
+    from ..domain.base import utcnow
+    from ..domain.invocation import Invocation
     from ..persistence.models import EventRow
-    from ..persistence.repositories import EventRepo, ProjectRepo, TaskRepo
+    from ..persistence.repositories import EventRepo, InvocationRepo, ProjectRepo, TaskRepo
+    from ..executors.base import ExecutorSessionInfo
 
     planned = 0
     with session_factory() as session:
@@ -45,6 +55,7 @@ async def plan_projects(session_factory, executor, *, planner_profile: dict | No
                 continue  # planner already ran for this project
         # execute OUTSIDE the transaction (long-running): build a bounded,
         # persisted planner context first (IMPLEMENTATION.md §13)
+        invocation = None
         try:
             from ..application.context_package import ContextPackageBuilder
 
@@ -52,18 +63,57 @@ async def plan_projects(session_factory, executor, *, planner_profile: dict | No
                 project_row = ProjectRepo(session).get_by_project_id(project.project_id)
                 if project_row is None:
                     continue
-                builder = ContextPackageBuilder(session)
+                builder = ContextPackageBuilder(session, data_dir=data_dir)
                 pkg = builder.persist(builder.planner(project_row))
                 context = builder.to_context_dict(
                     pkg, objective=f"为项目 {project.project_id} 规划首批研究任务"
                 )
+                invocation = Invocation(
+                    role="planner",
+                    project_id=project.project_id,
+                    context_id=pkg.context_id,
+                    profile_name=(planner_profile or {}).get("name"),
+                    resolved_model=(planner_profile or {}).get("model"),
+                    reasoning_effort=(planner_profile or {}).get("reasoning_effort"),
+                    skills=list(getattr(executor, "installed_skills", []) or []),
+                    budget=dict(getattr(project_row.policy, "default_budget", {}) or {}),
+                    status="RUNNING",
+                    created_by="scheduler",
+                )
+                InvocationRepo(session).save(invocation)
                 session.commit()
-            result, _session_info = await executor.run_planner(
+            result, session_info = await executor.run_planner(
                 context,
                 profile=planner_profile or {},
             )
+            finished_ok = True
         except Exception:  # noqa: BLE001
             logger.exception("planner failed for project %s", project.project_id)
+            finished_ok = False
+            session_info = None
+        # invocation ledger close-out (same shape for ok and failed paths)
+        with session_factory() as session:
+            if invocation is None:
+                continue
+            inv = InvocationRepo(session).get_by_invocation_id(invocation.invocation_id)
+            if inv is not None:
+                inv.status = "SUCCEEDED" if finished_ok else "FAILED"
+                inv.finished_at = utcnow()
+                if not finished_ok:
+                    inv.error_message = "planner turn failed"[:500]
+                elif isinstance(session_info, ExecutorSessionInfo):
+                    if session_info.session_id:
+                        inv.metadata = dict(getattr(inv, "metadata", {}) or {})
+                        inv.metadata["session_id"] = session_info.session_id
+                        inv.metadata["turn_id"] = session_info.turn_id or ""
+                # usage: record exactly what the executor reports; explicit
+                # unavailable when it reports nothing
+                inv.usage = getattr(session_info, "usage", None) if isinstance(session_info, ExecutorSessionInfo) else None
+                if inv.usage is None:
+                    inv.usage = {"available": False, "reason": "executor does not report usage"}
+                InvocationRepo(session).save(inv)
+                session.commit()
+        if not finished_ok:
             continue
         with session_factory() as session:
             if TaskRepo(session).list_by_status(project.project_id, []):

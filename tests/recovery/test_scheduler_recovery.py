@@ -174,7 +174,7 @@ def test_budget_timeout_interrupts_run(env):
 async def _drive_with_timeout(env, ex, run_id, task_id):
     from researchd.config import DEFAULT_PROFILES
 
-    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 1})(), "profiles": dict(DEFAULT_PROFILES)})()
+    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 1})(), "profiles": dict(DEFAULT_PROFILES), "data_dir": "t"})()
     loop = SchedulerLoop(settings, env["factory"], ex, FakeDeliveryPort(), max_parallel=1)
     await loop._drive_run(run_id, task_id)
 
@@ -201,7 +201,7 @@ def test_scheduler_dispatch_and_collect(env):
         uow.commit()
     from researchd.config import DEFAULT_PROFILES
 
-    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 4})(), "profiles": dict(DEFAULT_PROFILES)})()
+    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 4})(), "profiles": dict(DEFAULT_PROFILES), "data_dir": "t"})()
     loop = SchedulerLoop(settings, env["factory"], ex, port, max_parallel=4)
 
     async def run_ticks():
@@ -242,7 +242,7 @@ def test_outbox_crash_recovery_no_duplicate(env):
         uow.commit()
     from researchd.config import DEFAULT_PROFILES
 
-    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 1})(), "profiles": dict(DEFAULT_PROFILES)})()
+    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 1})(), "profiles": dict(DEFAULT_PROFILES), "data_dir": "t"})()
     loop = SchedulerLoop(settings, env["factory"], ex := FakeExecutor(), port, max_parallel=1)
     asyncio.run(loop.tick())
     assert len(port.deliveries) == 1
@@ -292,7 +292,7 @@ def test_blocked_task_not_dispatched(env):
         uow.commit()
     from researchd.config import DEFAULT_PROFILES
 
-    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 4})(), "profiles": dict(DEFAULT_PROFILES)})()
+    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 4})(), "profiles": dict(DEFAULT_PROFILES), "data_dir": "t"})()
     loop = SchedulerLoop(settings, env["factory"], ex, FakeDeliveryPort(), max_parallel=4)
     asyncio.run(loop.tick())
     with UnitOfWork(env["factory"]) as uow:

@@ -103,7 +103,10 @@ class SchedulerLoop:
         stats["diagnostics"] = ensure_cheap_diagnostics(self.session_factory)
         # 2c. planning: first task batch for task-less ACTIVE projects
         stats["planned"] = await plan_projects(
-            self.session_factory, self.executor, planner_profile=self._planner_profile()
+            self.session_factory,
+            self.executor,
+            planner_profile=self._planner_profile(),
+            data_dir=self.settings.data_dir,
         )
         # 2d. milestones: verified-evidence threshold reached -> one report
         stats["milestones"] = check_milestones(self.session_factory)
@@ -551,7 +554,7 @@ class SchedulerLoop:
                 # saw is recorded before any model call happens.
                 from ..application.context_package import ContextPackageBuilder
 
-                builder = ContextPackageBuilder(session)
+                builder = ContextPackageBuilder(session, data_dir=self.settings.data_dir)
                 if role == "auditor":
                     # the audit package is built from the WORKER run under
                     # review (its structured result + real artifacts), never

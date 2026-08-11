@@ -321,7 +321,7 @@ def test_scheduler_decision_gate_blocks_scope_and_reports(factory):
     from researchd.persistence.transaction import UnitOfWork
     from researchd.scheduler.loop import SchedulerLoop
 
-    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 4})(), "profiles": dict(DEFAULT_PROFILES)})()
+    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 4})(), "profiles": dict(DEFAULT_PROFILES), "data_dir": "t"})()
     loop = SchedulerLoop(settings, factory, FakeExecutor(), FakeDeliveryPort(), max_parallel=4)
 
     with UnitOfWork(factory) as uow:

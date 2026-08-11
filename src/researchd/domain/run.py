@@ -42,6 +42,8 @@ class Run(DomainModel):
     outcome: str | None = None  # WorkOutcome
     result: dict[str, Any] | None = None  # validated WorkResult/PlannerResult
     error_message: str | None = None
+    usage: dict | None = None  # token usage when the executor reports it;
+    #  {"available": False, "reason": "..."} when it does not — never fabricated
     repair_attempts: int = 0
 
     def __init__(self, **data):

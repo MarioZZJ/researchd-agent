@@ -29,6 +29,7 @@ from .models import (  # noqa: F401
     DecisionRow,
     EventRow,
     EvidenceRow,
+    InvocationRow,
     IssueRow,
     ProjectBindingRow,
     ProjectRow,
@@ -242,6 +243,7 @@ class RunRepo(BaseRepo[Run]):
             outcome=r.outcome,
             result_json=r.result,
             error_message=r.error_message,
+            usage_json=r.usage,
             repair_attempts=r.repair_attempts,
             version=r.version,
             created_by=r.created_by,
@@ -273,6 +275,7 @@ class RunRepo(BaseRepo[Run]):
             outcome=row.outcome,
             result=row.result_json,
             error_message=row.error_message,
+            usage=row.usage_json,
             repair_attempts=row.repair_attempts,
             version=row.version,
             created_by=row.created_by,
@@ -397,6 +400,16 @@ class ArtifactRepo(BaseRepo):
     def get_by_artifact_id(self, artifact_id: str):
         row = self.session.execute(select(ArtifactRow).where(ArtifactRow.artifact_id == artifact_id)).scalar_one_or_none()
         return self._to_domain(row) if row else None
+
+    def list_by_run(self, run_id: str) -> list[Any]:
+        """All artifacts REGISTERED for a run (auditor re-checks these; the
+        worker's declared artifact list is not trusted)."""
+        rows = self.session.execute(
+            select(ArtifactRow)
+            .where(ArtifactRow.run_id == run_id)
+            .order_by(ArtifactRow.path, ArtifactRow.version)
+        ).scalars()
+        return [self._to_domain(r) for r in rows]
 
 
 # ---------------------------------------------------------------- Evidence
@@ -721,5 +734,78 @@ class ContextPackageRepo(BaseRepo):
         rows = self.session.execute(
             select(ContextPackageRow).where(ContextPackageRow.metadata_json["run_id"].as_string() == run_id)
             .order_by(ContextPackageRow.created_at)
+        ).scalars()
+        return [self._to_domain(r) for r in rows]
+
+
+class InvocationRepo(BaseRepo):
+    """Model-call invocation ledger (planner/worker/auditor turns). Worker and
+    auditor turns also have runs rows; planner turns exist ONLY here."""
+
+    row_cls = InvocationRow
+
+    def _to_row(self, i) -> InvocationRow:  # noqa: ANN001
+        return InvocationRow(
+            id=i.id,
+            invocation_id=i.invocation_id,
+            role=i.role,
+            project_id=i.project_id,
+            task_id=i.task_id,
+            run_id=i.run_id,
+            context_id=i.context_id,
+            profile_name=i.profile_name,
+            resolved_model=i.resolved_model,
+            reasoning_effort=i.reasoning_effort,
+            skills_json=i.skills or None,
+            budget_json=i.budget or None,
+            started_at=i.started_at,
+            finished_at=i.finished_at,
+            status=i.status,
+            error_message=i.error_message,
+            usage_json=i.usage,
+            version=i.version,
+            created_by=i.created_by,
+            created_at=i.created_at,
+            updated_at=i.updated_at,
+        )
+
+    def _to_domain(self, row: InvocationRow):
+        from ..domain.invocation import Invocation
+
+        return Invocation(
+            id=row.id,
+            invocation_id=row.invocation_id,
+            role=row.role,
+            project_id=row.project_id,
+            task_id=row.task_id,
+            run_id=row.run_id,
+            context_id=row.context_id,
+            profile_name=row.profile_name,
+            resolved_model=row.resolved_model,
+            reasoning_effort=row.reasoning_effort,
+            skills=row.skills_json or [],
+            budget=row.budget_json or {},
+            started_at=row.started_at,
+            finished_at=row.finished_at,
+            status=row.status,
+            error_message=row.error_message,
+            usage=row.usage_json,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+            metadata=row.metadata_json or {},
+        )
+
+    def get_by_invocation_id(self, invocation_id: str):
+        row = self.session.execute(
+            select(InvocationRow).where(InvocationRow.invocation_id == invocation_id)
+        ).scalar_one_or_none()
+        return self._to_domain(row) if row else None
+
+    def list_by_project(self, project_id: str, limit: int = 100) -> list:
+        rows = self.session.execute(
+            select(InvocationRow)
+            .where(InvocationRow.project_id == project_id)
+            .order_by(InvocationRow.started_at.desc())
+            .limit(limit)
         ).scalars()
         return [self._to_domain(r) for r in rows]
