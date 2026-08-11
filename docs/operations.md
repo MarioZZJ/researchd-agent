@@ -105,6 +105,13 @@ uv run researchctl document test --document-id <docx_id>  # 服务端需 LARK_AP
 两个命令都是显式、用户触发的 mutating 探测（Bearer token 保护），不会自动触发；
 目标必须由用户显式提供。
 
+testbot → researchd 群消息自动化冒烟（真实平台，需显式开关）：
+```bash
+RESEARCHD_RUN_REAL_SMOKE=1 bash scripts/testbot-smoke.sh --chat-id oc_xxx
+# 断言：请求 sender=cli_aaf9998d25f89bcf（testbot）、回复 sender=cli_aaf007476338dd2c
+# （researchd）、回复内容为项目状态；单次发送+轮询，不重发不重复命令。
+```
+
 ## 9c. 飞书接入：应用角色、权限与接线
 
 两个飞书应用职责严格分离（沙箱 `/home` 只读，cc-connect 运行配置放
