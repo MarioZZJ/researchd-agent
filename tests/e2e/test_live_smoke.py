@@ -215,7 +215,7 @@ def test_real_reasonix_live_smoke(factory, tmp_path):
     port = FakeDeliveryPort()
     loop = SchedulerLoop(settings, factory, adapter, port, max_parallel=1)
 
-    async def _scenario(timeout_s: float = 480.0):
+    async def _scenario(timeout_s: float = 900.0):
         import time
 
         deadline = time.monotonic() + timeout_s
@@ -313,7 +313,7 @@ def test_live_smoke_service_process_restart(factory, tmp_path):
 
     proc = _start_service()
     try:
-        deadline = time.monotonic() + 480
+        deadline = time.monotonic() + 900
         final = "RUNNING"
         while time.monotonic() < deadline:
             with UnitOfWork(factory) as uow:

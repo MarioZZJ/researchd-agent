@@ -540,8 +540,8 @@ class SchedulerLoop:
         with self.session_factory() as session:
             task = TaskRepo(session).get_by_task_id(task_id)
             if task is None:
-                return 300.0
-            return float(task.contract.budget.max_wall_seconds or 300.0)
+                return 900.0
+            return float(task.contract.budget.max_wall_seconds or 900.0)
 
     async def _execute_with_heartbeat(self, run_id: str, profile: dict, *, role: str = "worker") -> None:
         """Run the executor turn, refreshing heartbeat every HEARTBEAT_SECONDS."""

@@ -304,7 +304,7 @@ class StdioReasonixTransport(ReasonixTransport):
             self._generation += 1
             self.capabilities = None  # force re-initialize after restart
 
-    async def _call(self, method: str, params: dict | None = None, *, timeout: float = 120.0) -> dict:
+    async def _call(self, method: str, params: dict | None = None, *, timeout: float = 600.0) -> dict:
         await self._start()
         self._id += 1
         mid = self._id
