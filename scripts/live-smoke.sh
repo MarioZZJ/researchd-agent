@@ -28,5 +28,11 @@ echo "== running real reasonix live smoke (paid model calls) =="
 uv run pytest tests/e2e/test_live_smoke.py::test_real_reasonix_live_smoke -q -s
 
 echo
-echo "== done: real planner/worker/auditor loop verified =="
+echo "== running service-process restart recovery verification =="
+echo "   (real service child process; must NOT re-invoke the model,"
+echo "    invocation/run/artifact/evidence counts must stay identical)"
+uv run pytest tests/e2e/test_live_smoke.py::test_live_smoke_service_process_restart -q -s
+
+echo
+echo "== done: real planner/worker/auditor loop + restart recovery verified =="
 echo "next: researchctl delivery test (needs cc_connect configured on the service)"
