@@ -281,16 +281,82 @@ index 70bab96..17df6e3 100644
 +	}
 +	return os.Rename(tmp, deliveriesFile)
 +}
+diff --git a/core/management_delivery_test.go b/core/management_delivery_test.go
+new file mode 100644
+index 0000000..b19d9dc
+--- /dev/null
++++ b/core/management_delivery_test.go
+@@ -0,0 +1,58 @@
++package core
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestDeliveryIdempotencyStore(t *testing.T) {
++	dir := t.TempDir()
++	deliveriesFile = filepath.Join(dir, "deliveries.json")
++
++	if _, ok := loadDelivery("k-1"); ok {
++		t.Fatal("empty store must not contain k-1")
++	}
++	// write-ahead reservation, then final id
++	if err := saveDelivery("k-1", deliveryInFlight); err != nil {
++		t.Fatal(err)
++	}
++	if v, ok := loadDelivery("k-1"); !ok || v != deliveryInFlight {
++		t.Fatalf("reservation missing: %q %v", v, ok)
++	}
++	if err := saveDelivery("k-1", "om_123"); err != nil {
++		t.Fatal(err)
++	}
++	if v, ok := loadDelivery("k-1"); !ok || v != "om_123" {
++		t.Fatalf("final id missing: %q %v", v, ok)
++	}
++	// distinct keys stay independent
++	if err := saveDelivery("k-2", "om_456"); err != nil {
++		t.Fatal(err)
++	}
++	if v, _ := loadDelivery("k-1"); v != "om_123" {
++		t.Fatalf("k-1 clobbered: %q", v)
++	}
++	// delete (unreserve on failure path)
++	if err := deleteDelivery("k-2"); err != nil {
++		t.Fatal(err)
++	}
++	if _, ok := loadDelivery("k-2"); ok {
++		t.Fatal("deleted key must be gone")
++	}
++}
++
++func TestDeliveryStoreFileMode(t *testing.T) {
++	dir := t.TempDir()
++	deliveriesFile = filepath.Join(dir, "nested", "deliveries.json")
++	if err := saveDelivery("k", "om"); err != nil {
++		t.Fatal(err)
++	}
++	info, err := os.Stat(deliveriesFile)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if info.Mode().Perm() != 0o600 {
++		t.Fatalf("deliveries.json mode = %o, want 600", info.Mode().Perm())
++	}
++}
 diff --git a/platform/feishu/feishu.go b/platform/feishu/feishu.go
-index bafedee..a9a2f35 100644
+index bafedee..99b2ec3 100644
 --- a/platform/feishu/feishu.go
 +++ b/platform/feishu/feishu.go
-@@ -2627,6 +2627,21 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
+@@ -2627,6 +2627,27 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
  	return p.sendNewMessageToChat(ctx, rc, msgType, msgBody)
  }
  
 +// SendHandle implements core.MessageHandleSender: send a message and return
 +// its platform message id so the caller can update it in place.
++// A full interactive card JSON (schema 2.0) is passed through verbatim so
++// decision buttons survive; plain markdown is wrapped like a normal send.
 +func (p *Platform) SendHandle(ctx context.Context, rctx any, content string) (string, error) {
 +	rc, ok := rctx.(replyContext)
 +	if !ok {
@@ -301,13 +367,17 @@ index bafedee..a9a2f35 100644
 +	// path cannot produce one).
 +	content = p.resolveMentionsInContent(ctx, rc.chatID, content)
 +	msgType, msgBody := buildReplyContent(content)
++	if isCardJSON(content) {
++		msgType = larkim.MsgTypeInteractive
++		msgBody = content
++	}
 +	return p.createMessageHandle(ctx, rc.chatID, msgType, msgBody, "send")
 +}
 +
  // SendWithStatusFooter implements core.StatusFooterSender: send a reply with
  // the body content followed by a small/dim status-footer block. Always uses
  // the interactive card path so the footer can render with text_size:
-@@ -3388,6 +3403,37 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
+@@ -3388,6 +3409,37 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
  	})
  }
  
@@ -345,7 +415,7 @@ index bafedee..a9a2f35 100644
  func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, op string) error {
  	req := larkim.NewCreateMessageReqBuilder().
  		ReceiveIdType(larkim.ReceiveIdTypeChatId).
-@@ -4405,6 +4451,25 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
+@@ -4405,6 +4457,25 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
  	return p.patchCardMessage(ctx, h.messageID, cardJSON)
  }
  

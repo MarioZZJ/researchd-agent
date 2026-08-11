@@ -1,14 +1,75 @@
 """cc-connect Delivery API client (IMPLEMENTATION.md §19.2).
 
-Backed by the narrow patch in integrations/cc-connect/patch/. Real sends are
-GATED (B-01); the scheduler uses FakeDeliveryPort until authorized.
+Sends REAL Feishu interactive cards (schema 2.0): the decision card keeps its
+buttons (never degraded to text), the card carries the cc-connect callback
+protocol (`value.action = "cmd:<command>"`, `session_key`, `after_click`
+in-place feedback), and `platform_message_id` receipts enable in-place PATCH
+updates. Raw executor output is NEVER sent through this port — only compiled
+report payloads from the outbox.
+
+The token comes from the 0600 settings (env file), is sent only in the
+Authorization header / never logged, and the port fails closed when the
+cc-connect target is not configured.
 """
 
 from __future__ import annotations
 
+import json
+from typing import Any
+
 import httpx
 
 from ...scheduler.outbox_sender import DeliveryPort
+
+DEFAULT_BASE_URL = "http://127.0.0.1:9820"
+
+
+class CcConnectDeliveryError(RuntimeError):
+    pass
+
+
+def build_card_payload(payload: dict, *, session_key: str | None = None) -> str:
+    """Compile an interactive card JSON from an outbox payload.
+
+    body: markdown body; buttons: decision options with a command value that
+    cc-connect dispatches back as a user message (cmd: protocol), so a button
+    click keeps the real platform user id and the decision version.
+    """
+    body = payload.get("body") or ""
+    title = payload.get("title") or "researchd"
+    elements: list[dict[str, Any]] = [{"tag": "markdown", "content": body}]
+    buttons = payload.get("buttons") or []
+    if buttons:
+        actions: list[dict[str, Any]] = []
+        for b in buttons:
+            cmd = b.get("value", "")
+            if not cmd:
+                continue
+            value: dict[str, Any] = {"action": f"cmd:{cmd}"}
+            if session_key:
+                value["session_key"] = session_key
+            value["after_click"] = {
+                "title": "已提交",
+                "color": "green",
+                "markdown": f"已记录你的选择：{b.get('text', '')}",
+            }
+            actions.append(
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": (b.get("text") or "")[:40]},
+                    "type": "primary",
+                    "value": value,
+                }
+            )
+        if actions:
+            elements.append({"tag": "action", "actions": actions})
+    card = {
+        "schema": "2.0",
+        "config": {"update_multi": True},
+        "header": {"title": {"tag": "plain_text", "content": title[:100]}},
+        "body": {"elements": elements},
+    }
+    return json.dumps(card, ensure_ascii=False)
 
 
 class CcConnectDeliveryPort(DeliveryPort):
@@ -17,16 +78,20 @@ class CcConnectDeliveryPort(DeliveryPort):
     transport: uds (api.sock) or tcp localhost with bearer token.
     """
 
-    def __init__(self, *, base_url: str, token: str, project: str, session_key: str, uds: str | None = None):
+    def __init__(self, *, base_url: str = DEFAULT_BASE_URL, token: str, project: str, session_key: str = "", uds: str | None = None):
+        if not token:
+            raise CcConnectDeliveryError("cc-connect token is required (fail-closed)")
+        if not project:
+            raise CcConnectDeliveryError("cc-connect project is required (fail-closed)")
         self.base_url = base_url
-        self.token = token
+        self.token = token  # never logged; Authorization header only
         self.project = project
         self.session_key = session_key
         self.uds = uds
 
     def _client(self) -> httpx.AsyncClient:
         transport = httpx.AsyncHTTPTransport(uds=self.uds) if self.uds else None
-        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+        headers = {"Authorization": f"Bearer {self.token}"}
         return httpx.AsyncClient(transport=transport, headers=headers, timeout=15.0)
 
     async def deliver(
@@ -38,36 +103,31 @@ class CcConnectDeliveryPort(DeliveryPort):
         attachments: list | None = None,
         project_id: str | None = None,
     ) -> str:
-        body = payload.get("body", "")
-        # card buttons are rendered as deterministic text lines until the
-        # platform card API is wired (PARTIAL, gated by B-01)
-        buttons = payload.get("buttons") or []
-        if buttons:
-            body += "\n\n选项：\n" + "\n".join(
-                f"- {b.get('text', '')}：{b.get('scientific_consequence', '')} "
-                f"（{b.get('value', '')}）"
-                for b in buttons
-            )
+        message = build_card_payload(payload, session_key=self.session_key)
         async with self._client() as client:
             resp = await client.post(
                 f"{self.base_url}/api/v1/projects/{self.project}/deliveries",
                 json={
                     "session_key": self.session_key,
-                    "message": body,
+                    "message": message,
                     "idempotency_key": idempotency_key,
                 },
             )
         if resp.status_code >= 400:
-            raise RuntimeError(f"cc-connect delivery failed: HTTP {resp.status_code}: {resp.text[:300]}")
+            raise CcConnectDeliveryError(
+                f"cc-connect delivery failed: HTTP {resp.status_code}: {resp.text[:300]}"
+            )
         data = resp.json()
         return data.get("platform_message_id", "")
 
     async def update(self, platform_message_id: str, payload: dict) -> None:
-        body = payload.get("body", "")
+        message = build_card_payload(payload, session_key=self.session_key)
         async with self._client() as client:
             resp = await client.patch(
                 f"{self.base_url}/api/v1/projects/{self.project}/deliveries/{platform_message_id}",
-                json={"session_key": self.session_key, "message": body},
+                json={"session_key": self.session_key, "message": message},
             )
         if resp.status_code >= 400:
-            raise RuntimeError(f"cc-connect delivery update failed: HTTP {resp.status_code}: {resp.text[:300]}")
+            raise CcConnectDeliveryError(
+                f"cc-connect delivery update failed: HTTP {resp.status_code}: {resp.text[:300]}"
+            )

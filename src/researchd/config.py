@@ -50,6 +50,20 @@ class SchedulerConfig(BaseModel):
     tick_seconds: float = 2.0
 
 
+class CcConnectConfig(BaseModel):
+    """cc-connect Delivery API target (IMPLEMENTATION.md §19.2). The token is
+    a secret: read from env/config file, used only in the Authorization
+    header, never logged, never persisted to the DB, artifacts, or executor
+    environment."""
+
+    base_url: str = "http://127.0.0.1:9820"
+    uds: str | None = None  # optional unix domain socket (preferred when set)
+    token: str = ""
+    project: str = ""  # cc-connect project name (required, fail-closed)
+    session_key: str = ""  # cc-connect session key for card callbacks
+    chat_id: str = ""  # explicit staging chat override (delivery test only)
+
+
 class ProfileConfig(BaseModel):
     """Named executor profile (IMPLEMENTATION.md §15.1): resolved model and
     reasoning effort. Profile names are referenced by Task contracts and by
@@ -86,10 +100,11 @@ class Settings(BaseSettings):
     data_dir: str = Field(default=DEFAULT_DATA_DIR, validation_alias=AliasChoices("RESEARCHD_DATA_DIR", "data_dir"))
     db_path: str = Field(default=".data/researchd.db", validation_alias=AliasChoices("RESEARCHD_DB", "db_path"))
     log_level: str = "info"
-    doc_platform: str = "none"  # none | feishu (feishu is PENDING/B-01 gated)
+    doc_platform: str = "none"  # none | feishu
     api: ApiConfig = Field(default_factory=ApiConfig)
     interaction: InteractionConfig = Field(default_factory=InteractionConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
+    cc_connect: CcConnectConfig = Field(default_factory=CcConnectConfig)
     profiles: dict[str, ProfileConfig] = Field(default_factory=lambda: dict(DEFAULT_PROFILES))
     service_name: str = "researchd"
 
