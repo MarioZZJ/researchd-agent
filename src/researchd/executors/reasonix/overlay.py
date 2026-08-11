@@ -9,7 +9,11 @@ The overlay is a WHITELIST:
 - top-level config keys actually used by researchd (default_model,
   planner_model, subagent_model, subagent_effort, subagent_models,
   max_subagent_depth, max_subagent_concurrency, max_parallel_writers) plus
-  the [[providers]] blocks (which carry the api keys needed to run);
+  provider metadata (FIELD-LEVEL whitelist: name/kind/base_url/models/
+  default/api_key_env/context_window/effort/supported_efforts); inline
+  api_key values are REFUSED — credentials only come via api_key_env,
+  whose values are copied key-by-key from the global .env (never the
+  whole file);
 - a whitelisted set of user skills (reviewer, deep-research) copied into the
   overlay's skills dir; builtin skills ship with the reasonix binary and need
   no copying.
@@ -33,6 +37,23 @@ OVERLAY_DIRNAME = "rx-overlay"
 ENV_WHITELIST = ("PATH", "HOME", "REASONIX_HOME", "TERM", "LANG", "LC_ALL", "TZ")
 
 _REQUIRED_PROVIDER_KEYS = {"name"}
+
+# provider fields researchd is allowed to carry (metadata + model routing).
+# INLINE api_key IS REFUSED (see _minimal_config): credentials only via
+# api_key_env, copied key-by-key from the global .env.
+PROVIDER_FIELD_KEYS = frozenset(
+    {
+        "name",
+        "kind",
+        "base_url",
+        "models",
+        "default",
+        "api_key_env",
+        "context_window",
+        "effort",
+        "supported_efforts",
+    }
+)
 
 # top-level config keys researchd actually needs (whitelist; everything else
 # — bot, MCP, speech, telemetry, theme, desktop — is excluded)
@@ -60,9 +81,13 @@ class OverlayError(RuntimeError):
 
 
 def _minimal_config(global_config: Path) -> str:
-    """Extract whitelisted top-level keys VERBATIM + [[providers]] blocks
-    VERBATIM from the global config (text-level slicing, so nested TOML
-    structures stay byte-identical). Everything else is excluded."""
+    """Extract whitelisted top-level keys + FIELD-LEVEL provider whitelist.
+
+    Provider blocks are NOT copied verbatim: only the fields in
+    PROVIDER_FIELD_KEYS are carried over (metadata + model routing). An
+    inline `api_key` is REFUSED (fail closed) — credentials must come via
+    api_key_env. Unknown provider fields are dropped, not copied.
+    """
     lines = global_config.read_text().splitlines()
     blocks: list[list[str]] = []
     current: list[str] | None = None
@@ -78,11 +103,20 @@ def _minimal_config(global_config: Path) -> str:
             continue
         if current is not None:
             if stripped.startswith("[") or stripped.startswith("[["):
-                # ANY other TOML table header ends the provider block —
-                # including [[mcp...]], [providers.*] sub-tables, [bot] etc.
+                # ANY other TOML table header ends the provider block
                 current = None
+            elif not stripped or stripped.startswith("#"):
+                current.append(line)  # keep blank/comment lines inside block
             else:
-                current.append(line)
+                field = stripped.split("=", 1)[0].strip()
+                if field == "api_key":
+                    raise OverlayError(
+                        "provider inline api_key refused; use api_key_env "
+                        "(fail-closed: inline secrets are never copied)"
+                    )
+                if field in PROVIDER_FIELD_KEYS:
+                    current.append(line)
+                # unknown provider fields are dropped (not copied)
     if not blocks:
         raise OverlayError("global reasonix config has no [[providers]] blocks")
     out: list[str] = []

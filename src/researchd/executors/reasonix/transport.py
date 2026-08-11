@@ -33,6 +33,50 @@ logger = logging.getLogger("researchd.reasonix")
 ACP_PROTOCOL_VERSION = 1
 STEER_METHOD = "_reasonix.io/session/steer"
 
+# ------------------------------------------------------------------ sandbox
+# The reasonix subprocess runs with the SAME uid as researchd, so `cwd` is NOT
+# a security boundary. When bubblewrap is available we wrap the subprocess in
+# a filesystem namespace: whole root read-only; ONLY the overlay and the
+# project workspace writable; the researchd data dir (DB/socket/logs),
+# ~/.cc-connect (tokens/sessions) and ~/.reasonix (global config incl. .env)
+# masked as empty tmpfs. Network stays shared (reasonix needs the provider
+# gateway). Without bubblewrap the transport FAILS CLOSED — no claim of
+# "workspace-confined" is ever made.
+_SANDBOX_MASKED_HOME_DIRS = (".cc-connect", ".reasonix")
+
+
+def _bwrap_command(binary: str, overlay: Path, cwd: Path) -> list[str] | None:
+    """bubblewrap argv wrapping `binary acp`; None when bwrap is unavailable
+    (callers must fail closed, never silently degrade)."""
+    import shutil
+
+    if shutil.which("bwrap") is None:
+        return None
+    home = Path.home()
+    cmd = [
+        "bwrap",
+        "--ro-bind", "/", "/",  # whole root read-only first
+        "--dev", "/dev",
+        "--proc", "/proc",
+        "--tmpfs", "/tmp",
+        "--share-net",  # model calls need the provider gateway
+        "--unshare-pid",
+    ]
+    data_dir = overlay.parent  # overlay lives at <data_dir>/rx-overlay
+    # researchd data dir (DB, api socket, logs) invisible; overlay itself and
+    # the workspace are re-mounted writable afterwards (later binds win).
+    cmd += ["--tmpfs", str(data_dir)]
+    for name in _SANDBOX_MASKED_HOME_DIRS:
+        target = home / name
+        if target.exists():
+            cmd += ["--tmpfs", str(target)]
+    cmd += ["--bind", str(overlay), str(overlay)]
+    ws = str(cwd)
+    cmd += ["--bind", ws, ws]
+    cmd += ["--chdir", ws]
+    cmd += [binary, "acp"]
+    return cmd
+
 
 class TransportError(RuntimeError):
     pass
@@ -135,14 +179,19 @@ class StdioReasonixTransport(ReasonixTransport):
                 return
             env = overlay_env(self.overlay)
             self.cwd.mkdir(parents=True, exist_ok=True)
+            cmd = _bwrap_command(self.binary, self.overlay, self.cwd)
+            if cmd is None:
+                raise TransportError(
+                    "bubblewrap (bwrap) is not available; refusing to run the "
+                    "reasonix subprocess WITHOUT filesystem isolation "
+                    "(fail-closed: cwd is not a security boundary)"
+                )
             self._proc = await asyncio.create_subprocess_exec(
-                self.binary,
-                "acp",
+                *cmd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
-                cwd=self.cwd,  # project workspace (per run) or restricted fallback
                 start_new_session=True,  # own process group -> killpg reaches the native process
             )
             self._reader = self._proc.stdout

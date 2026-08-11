@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from pydantic import SecretStr
 
 from researchd.config import Settings
 from researchd.integrations.cc_connect.delivery import (
@@ -120,11 +121,11 @@ def test_build_delivery_port_factory(monkeypatch, tmp_path):
     # cc_connect without token fails closed
     settings.scheduler.delivery = "cc_connect"
     settings.cc_connect.project = "proj"
-    settings.cc_connect.token = ""
+    settings.cc_connect.token = SecretStr("")
     with pytest.raises(ValueError, match="TOKEN"):
         _build_delivery_port(settings)
     # fully configured -> real port, token not echoed anywhere
-    settings.cc_connect.token = "supersecret"
+    settings.cc_connect.token = SecretStr("supersecret")
     port = _build_delivery_port(settings)
     assert isinstance(port, CcConnectDeliveryPort)
     assert port.token == "supersecret"
@@ -133,3 +134,34 @@ def test_build_delivery_port_factory(monkeypatch, tmp_path):
     settings.scheduler.delivery = "nope"
     with pytest.raises(ValueError, match="unknown delivery"):
         _build_delivery_port(settings)
+
+
+def test_cc_connect_transport_restrictions(monkeypatch):
+    """Plaintext token may only go to loopback; HTTPS anywhere; UDS is fine."""
+    from pydantic import ValidationError
+
+    def make(url):
+        monkeypatch.setenv("RESEARCHD_CC_CONNECT__BASE_URL", url)
+        return Settings(_env_file=None)
+
+    # loopback HTTP allowed
+    assert make("http://127.0.0.1:9820").cc_connect.base_url == "http://127.0.0.1:9820"
+    assert make("http://localhost:9820").cc_connect.base_url == "http://localhost:9820"
+    # explicit HTTPS allowed to any host
+    assert make("https://cc.example.com").cc_connect.base_url == "https://cc.example.com"
+    # plaintext to non-loopback refused (token would leak)
+    with pytest.raises(ValidationError, match="loopback"):
+        make("http://10.0.0.5:9820")
+    with pytest.raises(ValidationError, match="loopback"):
+        make("http://example.com:9820")
+    # garbage scheme refused
+    with pytest.raises(ValidationError):
+        make("ftp://127.0.0.1")
+
+
+def test_cc_connect_token_is_secret_str():
+    s = Settings(_env_file=None)
+    s.cc_connect.token = SecretStr("hunter2")
+    assert s.cc_connect.token.get_secret_value() == "hunter2"
+    assert "hunter2" not in repr(s.cc_connect.token)
+    assert "hunter2" not in str(s.cc_connect)

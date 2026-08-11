@@ -44,7 +44,7 @@ api_key_env = "CLIPROXY_API_KEY"
 
 [[providers]]
 name = "direct"
-api_key = "DIRECT-KEY"
+api_key_env = "DIRECT_API_KEY"
 """
 
 
@@ -70,11 +70,28 @@ def test_minimal_config_whitelists_keys_and_providers(fake_home):
     for key in TOP_LEVEL_KEYS:
         assert key in out, f"whitelisted key {key} missing"
     assert 'api_key_env = "CLIPROXY_API_KEY"' in out
-    assert 'api_key = "DIRECT-KEY"' in out
+    assert 'api_key_env = "DIRECT_API_KEY"' in out
     # secrets and unrelated config are NOT copied
     for banned in ("BOT-SECRET", "MCP-SECRET", "[bot]", "[[mcp", "telemetry = true", "theme = "):
         assert banned not in out, f"banned content leaked: {banned}"
-    assert "api_key_env = \"CLIPROXY_API_KEY\"" in out  # provider env ref survives
+
+
+def test_minimal_config_refuses_inline_api_key(fake_home):
+    from researchd.executors.reasonix.overlay import OverlayError
+
+    cfg = fake_home / ".reasonix" / "config.toml"
+    cfg.write_text(cfg.read_text() + '\n[[providers]]\nname = "leaky"\napi_key = "SK-LEAKED"\n')
+    with pytest.raises(OverlayError, match="inline api_key refused"):
+        _minimal_config(cfg)
+
+
+def test_minimal_config_drops_unknown_provider_fields(fake_home):
+    cfg = fake_home / ".reasonix" / "config.toml"
+    cfg.write_text(cfg.read_text() + '\n[[providers]]\nname = "extra"\nbase_url = "https://x"\ncustom_field = "not-copied"\n')
+    out = _minimal_config(cfg)
+    assert "custom_field" not in out
+    assert 'name = "extra"' in out
+    assert 'base_url = "https://x"' in out
 
 
 def test_overlay_copies_only_provider_env_keys(fake_home, tmp_path):
@@ -144,3 +161,53 @@ def test_adapter_routes_transports_per_workspace(fake_home, tmp_path, monkeypatc
     assert str(t1a.cwd.resolve()) == str(ws1.resolve())
     assert str(t2.cwd.resolve()) == str(ws2.resolve())
     assert str(fallback.cwd.resolve()) == str((tmp_path / "data" / "rx-overlay" / "work").resolve())
+
+
+def test_bwrap_command_masks_secrets_and_mounts_workspace(tmp_path, monkeypatch):
+    """The sandbox argv: whole root ro, ONLY overlay+workspace writable,
+    data dir / ~/.cc-connect / ~/.reasonix masked tmpfs."""
+    from researchd.executors.reasonix.transport import _bwrap_command
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/bwrap")
+    data = tmp_path / "data"
+    data.mkdir()
+    overlay = data / "rx-overlay"
+    overlay.mkdir()
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    cmd = _bwrap_command("/bin/reasonix-native", overlay, ws)
+    def has(seq, i, n):
+        return any(cmd[i + k:k + n] == seq for k in range(0, len(cmd) - n + 1))
+
+    assert cmd[0] == "bwrap"
+    assert cmd[1:4] == ["--ro-bind", "/", "/"]
+    assert has(["--tmpfs", str(data)], 0, 2)
+    for name in (".cc-connect", ".reasonix"):
+        assert has(["--tmpfs", str(Path.home() / name)], 0, 2)
+    assert has(["--bind", str(overlay), str(overlay)], 0, 3)
+    assert has(["--bind", str(ws), str(ws)], 0, 3)
+    assert has(["--chdir", str(ws)], 0, 2)
+    assert cmd[-2:] == ["/bin/reasonix-native", "acp"]
+
+
+def test_transport_fails_closed_without_bwrap(tmp_path, monkeypatch):
+    """No bwrap -> TransportError, never an unconfined subprocess."""
+    import asyncio
+
+    from researchd.executors.reasonix.transport import StdioReasonixTransport
+
+    monkeypatch.setattr("shutil.which", lambda _: None)
+    data = tmp_path / "data"
+    data.mkdir()
+    overlay = data / "rx-overlay"
+    overlay.mkdir()
+
+    async def go():
+        t = StdioReasonixTransport(overlay, cwd=tmp_path / "ws")
+        try:
+            await t.initialize()
+        finally:
+            await t.close_all()
+
+    with pytest.raises(Exception, match="bubblewrap"):
+        asyncio.run(go())

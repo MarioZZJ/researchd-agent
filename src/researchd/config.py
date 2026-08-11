@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_DATA_DIR = ".data"
@@ -58,10 +58,33 @@ class CcConnectConfig(BaseModel):
 
     base_url: str = "http://127.0.0.1:9820"
     uds: str | None = None  # optional unix domain socket (preferred when set)
-    token: str = ""
+    token: SecretStr = SecretStr("")
     project: str = ""  # cc-connect project name (required, fail-closed)
     session_key: str = ""  # cc-connect session key for card callbacks
     chat_id: str = ""  # explicit staging chat override (delivery test only)
+
+    @field_validator("base_url")
+    @classmethod
+    def _base_url_transport(cls, v: str) -> str:
+        """Only loopback HTTP or explicit HTTPS (IMPLEMENTATION.md §19.2).
+        Never allow sending the token over plaintext to a non-loopback host."""
+        url = v.lower()
+        if url.startswith("https://"):
+            return v
+        if url.startswith("http://"):
+            import urllib.parse
+
+            host = urllib.parse.urlparse(v).hostname or ""
+            if host in ("127.0.0.1", "::1", "localhost"):
+                return v
+            raise ValueError(
+                "cc_connect base_url must be loopback HTTP or explicit HTTPS "
+                f"(got {v!r}); refusing plaintext token to non-loopback host"
+            )
+        raise ValueError(
+            "cc_connect base_url must be http:// (loopback) or https:// "
+            f"(got {v!r})"
+        )
 
 
 class ProfileConfig(BaseModel):

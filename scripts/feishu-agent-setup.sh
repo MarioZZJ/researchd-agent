@@ -110,33 +110,35 @@ PLATFORM=$(printf '%s' "$POLL" | python3 -c "import json,sys; print(json.load(sy
 OWNER=$(printf '%s' "$POLL" | python3 -c "import json,sys; print(json.load(sys.stdin)['data'].get('owner_open_id',''))")
 
 if [ -z "$APP_ID" ] || [ -z "$APP_SECRET" ]; then
-  echo "ERROR: 响应缺少 app_id/app_secret: $POLL" >&2; exit 5
+  # never echo the raw platform body: it may contain the secret
+  echo "ERROR: 扫码响应缺少 app_id/app_secret（响应内容不显示）" >&2; exit 5
 fi
 
 echo
-echo "== 扫码完成：智能体已创建（凭据仅本次显示，请妥善保存）=="
+echo "== 扫码完成：智能体已创建 =="
 echo "  platform       = $PLATFORM"
 echo "  app_id         = $APP_ID"
 echo "  owner_open_id  = $OWNER"
-echo "  app_secret     = $APP_SECRET"
+echo "  app_secret     = 已获取（只写入配置，不在终端/历史/日志显示）"
 echo
 
 # ── save 到项目配置 ──
-SAVE_JSON=$(python3 - "$PROJECT" "$APP_ID" "$APP_SECRET" "$PLATFORM" "$OWNER" <<'PYEOF'
-import json, sys
-project, app_id, app_secret, platform, owner = sys.argv[1:6]
+echo ">> 保存到项目 $PROJECT ..."
+BAK="$CONFIG.bak-$(date +%Y%m%d-%H%M%S)"
+cp "$CONFIG" "$BAK" && chmod 600 "$BAK" && echo "   已备份配置到 $BAK（0600，旧凭据可回滚）"
+# secret passes via env+stdin, never as argv (no ps/history leakage)
+SAVE=$(APP_SECRET="$APP_SECRET" python3 - "$PROJECT" "$APP_ID" "$PLATFORM" "$OWNER" <<'PYEOF' | curl -sS --max-time 20 -X POST -H "$AUTH" -H "Content-Type: application/json" --data-binary @- "$BASE/api/v1/setup/feishu/save"
+import json, os, sys
+project, app_id, platform, owner = sys.argv[1:5]
 print(json.dumps({
-    "project": project, "app_id": app_id, "app_secret": app_secret,
+    "project": project, "app_id": app_id,
+    "app_secret": os.environ["APP_SECRET"],
     "platform_type": platform, "owner_open_id": owner,
 }))
 PYEOF
 )
-echo ">> 保存到项目 $PROJECT ..."
-BAK="$CONFIG.bak-$(date +%Y%m%d-%H%M%S)"
-cp "$CONFIG" "$BAK" && echo "   已备份配置到 $BAK（旧凭据可回滚）"
-SAVE=$(curl -sS --max-time 20 -X POST -H "$AUTH" -H "Content-Type: application/json" \
-  -d "$SAVE_JSON" "$BASE/api/v1/setup/feishu/save")
 echo "   $(printf '%s' "$SAVE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('data', d).get('message', d))")"
+unset APP_SECRET SAVE_JSON 2>/dev/null || true
 
 echo
 echo "== 下一步 =="
