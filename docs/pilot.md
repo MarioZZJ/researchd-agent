@@ -32,8 +32,8 @@ uv run researchd pilot create --project-id interdisciplinary-citation-pilot \
     --question '比较 2017–2019 与 2021–2023 年论文参考文献的学科组成和跨学科引用份额变化，描述疫情前后知识来源结构发生了什么变化。' \
     --import-decision D-001=A
 
-# 3. 观察调度器自动完成：planner → 首批 Task → 并行执行 → 门控 → 报告
-uv run researchctl status
+# 3. 观察调度器自动完成：planner → 首批 Task → 执行 → 独立 Auditor 审查 → 门控 → 报告
+uv run researchctl project status interdisciplinary-citation-pilot
 ```
 
 > 真实模型 Pilot（reasonix executor + 付费模型调用）为**外部付费操作**，
@@ -44,19 +44,22 @@ uv run researchctl status
 
 ## 完成判据（本次开发任务内）
 
-- [x] 确定性黄金路径 22 步全链通过（`tests/e2e/test_golden_path.py`）
+- [x] 确定性黄金路径 22 步全链通过（`tests/e2e/test_golden_path.py`，含
+      独立 Auditor 审查闭环与重启恢复）
 - [ ] 真实模型 Pilot 运行（GATED：B-01 凭据 + B-03 模型付费授权）
-- [ ] 真实飞书/cc-connect 冒烟（GATED：B-01；patch 安装见
-      `integrations/cc-connect/patch/README.md`）
+- [ ] 真实飞书/cc-connect 冒烟（GATED：B-01；patch 已编译验证，安装步骤见
+      `integrations/cc-connect/patch/README.md`；`researchctl delivery test` /
+      `researchctl document test` 为显式探测命令）
 
 ## 精确完成命令（授权解除后）
 
 ```bash
 export RESEARCHD_EXECUTOR=reasonix
-export RESEARCHD_PROFILE_MODEL=gateway/deepseek-v4-flash   # 或授权 profile
+export RESEARCHD_SCHEDULER__EXECUTOR=reasonix
+export RESEARCHD_SCHEDULER__DELIVERY=cc_connect
+export RESEARCHD_CC_CONNECT__TOKEN=...        # 0600 env 文件；绝不进日志
+export RESEARCHD_CC_CONNECT__PROJECT=...
 uv run researchd service
-# 决策卡/报告经 cc-connect Delivery API 送达飞书：
-curl -sS -X POST "http://127.0.0.1:9820/api/v1/projects/dsh/deliveries" \
-  -H "Authorization: Bearer $CC_CONNECT_TOKEN" \
-  -d '{"session_key":"...","message":"...","idempotency_key":"..."}'
+# 决策卡/报告经 cc-connect Delivery API 送达飞书（发送+原地更新实测）：
+uv run researchctl delivery test [--chat-id oc_xxx]
 ```

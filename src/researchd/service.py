@@ -37,6 +37,8 @@ async def run_service(settings: Settings) -> None:
         sys.exit(1)
 
     app = create_app(settings)
+    # delivery port for the explicit ops-test endpoints (delivery test)
+    app.state.delivery_port = _build_delivery_port(settings)
 
     # UDS transport preferred (IMPLEMENTATION.md §18); TCP fallback is
     # localhost-only and requires a bearer token.

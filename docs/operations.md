@@ -88,8 +88,22 @@ uv run researchd export --project-id <id> --out <id>.export.json
 
 ## 9. cc-connect 补丁安装/回滚
 
-见 `integrations/cc-connect/README.md`（patch 文件 + 安装/回滚命令；本机
-无 Go 工具链 → patch 可应用但未安装，见 docs/blockers.md B-06）。
+见 `integrations/cc-connect/README.md`（patch 文件 + 安装/回滚命令）。
+patch 已在独立克隆的 cc-connect v1.4.1（5d4c96d）分支上验证：`git apply` 干净、
+`go build ./core/... ./platform/... ./agent/... ./cmd/...` 通过（`web/embed` 需预构建
+前端 dist，为既有前置）、`go test ./core/ ./platform/feishu/` 全部通过（含新增
+Delivery 幂等存储测试）。回滚 = 删除验证克隆（原仓库只读未动）。
+
+## 9b. 真实投递/文档冒烟（researchctl）
+
+```bash
+# 发送一张真实 interactive card 到 staging chat，并立即 PATCH 原地更新
+uv run researchctl delivery test [--chat-id oc_xxx]      # 服务端需 delivery=cc_connect + token
+# 对显式提供的 staging 飞书文档做块级 create/update/read/delete 往返
+uv run researchctl document test --document-id <docx_id>  # 服务端需 LARK_APP_ID/SECRET
+```
+两个命令都是显式、用户触发的 mutating 探测（Bearer token 保护），不会自动触发；
+目标必须由用户显式提供。
 
 ## 10. 服务与配置权限检查
 
@@ -109,3 +123,7 @@ uv run researchctl doctor
 ```
 只读检查：数据库打开（mode=ro）、WAL/foreign_keys/busy_timeout/synchronous
 PRAGMA、schema 存在、服务 socket 可达、data-dir 锁状态、权限位。
+
+> 所有 mutating 调用（project create / pause / resume / reconcile / delivery test /
+> document test）在 UDS 与 TCP 下都自动携带 Bearer token（B-08 服务端强制，
+> researchctl 端已对齐）。

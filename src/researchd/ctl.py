@@ -134,6 +134,32 @@ def export(project_id: str) -> None:
     click.echo(json.dumps(data, ensure_ascii=False, indent=2))
 
 
+@main.command("delivery")
+@click.argument("action", type=click.Choice(["test"]))
+@click.option("--chat-id", default="", help="explicit staging chat id (default: settings)")
+def delivery_cmd(action: str, chat_id: str) -> None:
+    """delivery test — send + in-place update a real cc-connect card.
+
+    Sends an interactive card to the configured staging chat and PATCH-updates
+    it in place; fails loudly when cc-connect is not configured on the
+    service. The token is read from the service env file, never from args.
+    """
+    if action == "test":
+        click.echo(json.dumps(_call("POST", "/v1/delivery/test", json={"chat_id": chat_id}), ensure_ascii=False, indent=2))
+
+
+@main.command("document")
+@click.argument("action", type=click.Choice(["test"]))
+@click.option("--document-id", required=True, help="staging feishu docx document id")
+def document_cmd(action: str, document_id: str) -> None:
+    """document test --document-id <id> — block-level docx round-trip.
+
+    Creates/updates/reads/deletes one test block in the given staging
+    document (requires RESEARCHD_LARK_APP_ID/SECRET on the service)."""
+    if action == "test":
+        click.echo(json.dumps(_call("POST", "/v1/document/test", json={"document_id": document_id}), ensure_ascii=False, indent=2))
+
+
 @main.command()
 def doctor() -> None:
     """doctor — environment + service diagnostics"""
