@@ -195,20 +195,20 @@ def test_acp_shim_handshake_and_prompt(api_env):
     )
     assert bind.get("error") is None, bind
     assert session.cc_project == "p5"
-    assert "bound" in bind["result"]["message"]["content"][0]["text"]
+    assert "bound" in bind["result"]["message"]["content"]["text"]
 
     # binding an unknown project fails and leaves the session unbound
     bad = __import__("asyncio").run(
         server.handle({"jsonrpc": "2.0", "id": 4, "method": "session/prompt", "params": {"sessionId": sid, "prompt": "/research bind project nope"}})
     )
-    assert "not found" in bad["result"]["message"]["content"][0]["text"]
+    assert "not found" in bad["result"]["message"]["content"]["text"]
 
     # status works through the bound session
     status = __import__("asyncio").run(
         server.handle({"jsonrpc": "2.0", "id": 5, "method": "session/prompt", "params": {"sessionId": sid, "prompt": "/research status"}})
     )
     assert status.get("error") is None, status
-    text = status["result"]["message"]["content"][0]["text"]
+    text = status["result"]["message"]["content"]["text"]
     assert "p5" in text
 
     # model interaction updates the SESSION (never the project policy)
@@ -582,7 +582,7 @@ def test_acp_prompt_uses_real_platform_message_id(factory, monkeypatch):
             )
         )
         assert sent["payload"]["message_id"] == "acp-om_real_123"
-        assert resp["message"]["content"][0]["text"] == "ok"
+        assert resp["message"]["content"]["text"] == "ok"
 
     # WITHOUT messageId the legacy hash-based key is used (back-compat)
     with patch.object(inbound_mod.httpx, "AsyncClient", new=fake_client):

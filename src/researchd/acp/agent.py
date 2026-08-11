@@ -37,12 +37,19 @@ class AcpServer:
     Methods: initialize, session/new, session/prompt, session/close,
     session/list. Prompt text is first parsed as a deterministic command;
     unrecognized input may go through the interaction profile (config-gated).
+
+    Reply text is delivered the way cc-connect expects it: as a
+    session/update notification (agent_message_chunk) — cc-connect ignores
+    the synchronous session/prompt response body for text and aggregates
+    EventText from the update stream. `notify` writes the JSON-RPC
+    notification to stdout (thread-safe).
     """
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, notify: Any = None):
         self.settings = settings
         self.sessions: dict[str, InteractionSession] = {}
         self._seq = 0
+        self._notify = notify
 
     # ------------------------------------------------------------ protocol
     async def handle(self, msg: dict) -> dict | None:
@@ -160,12 +167,31 @@ class AcpServer:
         from .inbound import process_prompt
 
         reply = await process_prompt(self.settings, session, prompt, message_id=message_id)
+        # cc-connect's ACP client aggregates reply text from the
+        # session/update notification stream (agent_message_chunk) — the
+        # synchronous response body is ignored for text. Send the update
+        # BEFORE returning so the engine gets the text.
+        if self._notify is not None:
+            self._notify(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session.session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": reply.text},
+                        },
+                    },
+                }
+            )
+        # keep a minimal synchronous result for spec compliance
         return {
             "sessionId": session.session_id,
             "requestId": f"REQ-{session.request_counter()}",
             "message": {
                 "role": "assistant",
-                "content": [{"type": "text", "text": reply.text}],
+                "content": {"type": "text", "text": reply.text},
             },
         }
 
@@ -177,7 +203,6 @@ class AcpServer:
 
 async def run_acp_stdio(settings: Settings) -> None:
     """Read JSON-RPC lines from stdin, write responses to stdout."""
-    server = AcpServer(settings)
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
@@ -186,6 +211,18 @@ async def run_acp_stdio(settings: Settings) -> None:
         lambda: asyncio.streams.FlowControlMixin(), sys.stdout  # type: ignore[arg-type]
     )
     writer = asyncio.StreamWriter(writer_transport, writer_protocol, None, loop)
+    write_lock = asyncio.Lock()
+
+    async def _write_line(obj: dict) -> None:
+        async with write_lock:
+            writer.write((json.dumps(obj) + "\n").encode())
+            await writer.drain()
+
+    def _notify(obj: dict) -> None:
+        # called from _session_prompt (same event loop): schedule the write
+        asyncio.ensure_future(_write_line(obj))
+
+    server = AcpServer(settings, notify=_notify)
 
     while True:
         line = await reader.readline()
