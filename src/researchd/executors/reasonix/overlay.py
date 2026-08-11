@@ -192,11 +192,25 @@ def _provider_env_keys(global_config: Path) -> list[str]:
 
 def _copy_provider_env(global_env: Path, overlay: Path, keys: list[str]) -> None:
     """Copy ONLY the whitelisted provider env keys from the global reasonix
-    .env into the overlay .env (0600). The overlay is otherwise hermetic."""
+    .env into the overlay .env (0600). The overlay is otherwise hermetic.
+
+    Fail-fast when the global .env exists but is NOT readable: the overlay
+    would silently lack every provider credential and every real model call
+    would fail with a confusing transport error. A masked/unreadable .env
+    (e.g. a character-device placeholder) is reported explicitly so the
+    operator knows the environment cannot reach the provider."""
     if not keys or not global_env.exists():
         return
+    try:
+        raw_text = global_env.read_text()
+    except PermissionError as exc:
+        raise OverlayError(
+            f"global reasonix .env {global_env} exists but is not readable "
+            "(masked/credential-protected?) — provider credentials unavailable; "
+            "run the real smoke outside the sandbox"  # noqa: TRY003
+        ) from exc
     lines: list[str] = []
-    for raw in global_env.read_text().splitlines():
+    for raw in raw_text.splitlines():
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
             continue
