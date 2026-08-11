@@ -161,6 +161,32 @@ async def test_denied_revoke_keeps_marker_for_retry(db, project):
 
 
 @pytest.mark.asyncio
+async def test_denied_grant_not_marked_then_replayed_after_recovery(db, project):
+    """A denied grant is NOT recorded as shared; once the scope is granted,
+    a replay grants and marks the principal."""
+    platform = FakeDocPlatform()
+    platform.deny_collaborator = True
+    with db() as session:
+        await _ensure(session, platform, project, pi_open_id="ou_pi_1")
+        session.commit()
+    with db() as session:
+        project2 = ProjectRepo(session).get_by_project_id("proj-doc-1")
+        shared = (project2.metadata or {}).get("feishu_document_shared", "")
+        assert "openid:ou_pi_1" not in shared  # denied: not marked
+    # scope granted later: replay grants and marks
+    platform.deny_collaborator = False
+    with db() as session:
+        await _ensure(session, platform, project, pi_open_id="ou_pi_1")
+        session.commit()
+    doc = platform.documents["doc-1"]
+    assert any(m["member_id"] == "ou_pi_1" for m in doc["members"])
+    with db() as session:
+        project3 = ProjectRepo(session).get_by_project_id("proj-doc-1")
+        shared = (project3.metadata or {}).get("feishu_document_shared", "")
+        assert "openid:ou_pi_1" in shared
+
+
+@pytest.mark.asyncio
 async def test_first_projection_flows_through_outbox(db, project):
     """ensure + sync: the queued doc_block rows are the same content the
     projection would enqueue; after the outbox sender runs, blocks exist."""
