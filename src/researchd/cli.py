@@ -79,17 +79,18 @@ def version(ctx: click.Context) -> None:
     click.echo(f"researchd {__version__}")
 
 
-if __name__ == "__main__":
-    main()
+@main.group()
+def pilot() -> None:
+    """pilot — bootstrap pilot projects (idempotent)."""
 
 
-@main.command()
-@click.option("--project-id", required=True, help="pilot project id (default: interdisciplinary-citation-pilot)")
+@pilot.command("create")
+@click.option("--project-id", required=True, help="pilot project id")
 @click.option("--question", default="", help="research question")
 @click.option("--import-decision", default="", help="import a decision as <id>=<answer> (e.g. D-001=A)")
 @click.option("--db", "db_path", default=None, help="database path (default: settings)")
 @click.pass_context
-def pilot(ctx: click.Context, project_id: str, question: str, import_decision: str, db_path: str | None) -> None:
+def pilot_create(ctx: click.Context, project_id: str, question: str, import_decision: str, db_path: str | None) -> None:
     """Bootstrap the pilot project (idempotent). Creates the ACTIVE project
     and optionally imports a pre-decided decision (IMPLEMENTATION.md §24)."""
     from .domain.decision import Decision, DecisionOption
@@ -246,3 +247,7 @@ def export_cmd(ctx: click.Context, project_id: str, out: str | None) -> None:
     target = out or f"{project_id}.export.json"
     path = export_project_file(settings.db_path, project_id, target)
     print(f"exported {project_id} -> {path}")
+
+
+if __name__ == "__main__":
+    main()

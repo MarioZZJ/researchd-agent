@@ -19,7 +19,7 @@ def _base_url() -> str:
     settings = default_settings()
     if settings.api.socket_path:
         return f"http+unix://{settings.api.socket_path}"
-    return f"http://{settings.api.host}:{settings.api.port}"
+    return f"http://{settings.api.tcp_host}:{settings.api.tcp_port}"
 
 
 def _client() -> httpx.Client:
@@ -29,8 +29,10 @@ def _client() -> httpx.Client:
         transport = httpx.HTTPTransport(
             uds=str(settings.api.socket_path),
         )
+    # the bearer token is REQUIRED on every transport (server-side B-08
+    # enforcement incl. UDS), so send it whenever it is configured
     headers = {}
-    if not settings.api.socket_path and settings.api.token:
+    if settings.api.token:
         headers["Authorization"] = f"Bearer {settings.api.token}"
     return httpx.Client(transport=transport, headers=headers, base_url="http://localhost", timeout=10.0)
 
