@@ -181,7 +181,7 @@ def test_acp_shim_handshake_and_prompt(api_env):
     assert "interaction_profile" in init["result"]["configOptions"]
 
     new = __import__("asyncio").run(
-        server.handle({"jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {"sessionConfig": {"interaction_profile": "fast", "cc_user_id": "ou_pi"}}})
+        server.handle({"jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {"sessionConfig": {"interaction_profile": "fast", "cc_project": "proj", "cc_session_key": "feishu:oc:ou_pi", "cc_user_id": "ou_pi"}}})
     )
     sid = new["result"]["sessionId"]
     session = server.sessions[sid]

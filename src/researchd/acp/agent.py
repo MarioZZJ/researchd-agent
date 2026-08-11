@@ -99,16 +99,47 @@ class AcpServer:
         profile = config.get("interaction_profile")
         if profile not in (None, "fast", "deep", "deterministic"):
             raise AcpError(-32602, f"invalid interaction_profile {profile!r}")
+        # identity is REQUIRED and must come from cc-connect (env injection
+        # CC_PROJECT/CC_SESSION_KEY/CC_USER_ID, or explicit sessionConfig).
+        # Fail closed: an anonymous session can never be mapped to the PI,
+        # and unknown users must not be auto-mapped to anything.
+        identity = self._resolve_identity(config)
+        if identity["cc_project"] is None or identity["cc_session_key"] is None or identity["cc_user_id"] is None:
+            raise AcpError(
+                -32602,
+                "cc-connect identity missing: sessionConfig (cc_project/cc_session_key/"
+                "cc_user_id) or env (CC_PROJECT/CC_SESSION_KEY/CC_USER_ID) must be provided; "
+                "refusing anonymous session (never auto-mapping unknown users to PI)",
+            )
         self._seq += 1
         session = InteractionSession(
             session_id=f"SES-{self._seq:04d}",
             interaction_profile=profile or "fast",
-            cc_project=config.get("cc_project"),
-            cc_session_key=config.get("cc_session_key"),
-            cc_user_id=config.get("cc_user_id"),
+            cc_project=identity["cc_project"],
+            cc_session_key=identity["cc_session_key"],
+            cc_user_id=identity["cc_user_id"],
         )
         self.sessions[session.session_id] = session
         return {"sessionId": session.session_id, "sessionConfig": config}
+
+    @staticmethod
+    def _resolve_identity(config: dict) -> dict:
+        """Identity precedence: explicit sessionConfig > cc-connect env
+        injection (CC_PROJECT/CC_SESSION_KEY/CC_USER_ID)."""
+        import os
+
+        def _pick(config_key: str, env_key: str) -> str | None:
+            value = config.get(config_key)
+            if value:
+                return str(value)
+            env_value = os.environ.get(env_key)
+            return env_value if env_value else None
+
+        return {
+            "cc_project": _pick("cc_project", "CC_PROJECT"),
+            "cc_session_key": _pick("cc_session_key", "CC_SESSION_KEY"),
+            "cc_user_id": _pick("cc_user_id", "CC_USER_ID"),
+        }
 
     async def _session_prompt(self, params: dict) -> dict:
         session_id = params.get("sessionId")

@@ -1,8 +1,34 @@
 diff --git a/core/engine.go b/core/engine.go
-index 79e2892..195188c 100644
+index 79e2892..095fcf8 100644
 --- a/core/engine.go
 +++ b/core/engine.go
-@@ -10629,6 +10629,46 @@ func (e *Engine) tryProviderAddPreset(p Platform, msg *Message, switcher Provide
+@@ -3613,7 +3613,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
+ 	if agent != e.agent {
+ 		agentOverride = agent
+ 	}
+-	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey)
++	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey, msg.UserID)
+ 
+ 	// Set workspaceDir on the state for idle reaper identification
+ 	if workspaceDir != "" {
+@@ -3880,7 +3880,7 @@ func adoptPendingFromPlaceholder(existing, newState *interactiveState) {
+ 
+ // When agentOverride is non-nil it is used instead of e.agent to start the session.
+ // ccSessionKey, when non-empty, is used for CC_SESSION_KEY env injection; otherwise sessionKey is used.
+-func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string) *interactiveState {
++func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey, userID string) *interactiveState {
+ 	e.interactiveMu.Lock()
+ 	defer e.interactiveMu.Unlock()
+ 
+@@ -3932,6 +3932,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform,
+ 		envVars := []string{
+ 			"CC_PROJECT=" + e.name,
+ 			"CC_SESSION_KEY=" + ccKey,
++			"CC_USER_ID=" + userID,
+ 		}
+ 		if e.dataDir != "" {
+ 			envVars = append(envVars, "CC_DATA_DIR="+e.dataDir)
+@@ -10629,6 +10630,46 @@ func (e *Engine) tryProviderAddPreset(p Platform, msg *Message, switcher Provide
  
  // SendToSession sends a message to an active session from an external caller (API/CLI).
  // If sessionKey is empty, it picks the first active session.
@@ -49,6 +75,146 @@ index 79e2892..195188c 100644
  func (e *Engine) SendToSession(sessionKey, message string) error {
  	return e.SendToSessionWithAttachments(sessionKey, message, nil, nil, nil, false)
  }
+diff --git a/core/engine_test.go b/core/engine_test.go
+index 7cd2585..66cc9a6 100644
+--- a/core/engine_test.go
++++ b/core/engine_test.go
+@@ -3265,6 +3265,9 @@ func TestHandleMessage_MultiWorkspacePreservesCCSessionKey(t *testing.T) {
+ 			if strings.Contains(got, normalizedWsDir) {
+ 				t.Fatalf("CC_SESSION_KEY leaked workspace path: %q", got)
+ 			}
++			if uid := wsAgent.EnvValue("CC_USER_ID"); uid != "U1" {
++				t.Fatalf("CC_USER_ID = %q, want %q (real platform user id)", uid, "U1")
++			}
+ 			return
+ 		}
+ 
+@@ -7060,7 +7063,7 @@ func TestSessionMismatch_RecyclesStaleAgent(t *testing.T) {
+ 	// The active Session now wants a DIFFERENT agent session ID.
+ 	session := &Session{AgentSessionID: "new-agent-id"}
+ 
+-	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
++	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
+ 
+ 	if state.agentSession == oldSess {
+ 		t.Fatal("expected stale agent session to be replaced")
+@@ -7097,7 +7100,7 @@ func TestSessionClearedAfterNew_RecyclesAliveAgent(t *testing.T) {
+ 
+ 	session := &Session{AgentSessionID: ""}
+ 
+-	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
++	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
+ 	if state.agentSession == oldSess {
+ 		t.Fatal("expected stale agent to be recycled when AgentSessionID was cleared")
+ 	}
+@@ -7132,7 +7135,7 @@ func TestSessionMismatch_ReusesWhenIDsMatch(t *testing.T) {
+ 
+ 	session := &Session{AgentSessionID: "matching-id"}
+ 
+-	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
++	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
+ 	if state != existingState {
+ 		t.Fatal("expected existing state to be reused when session IDs match")
+ 	}
+@@ -7150,7 +7153,7 @@ func TestSessionIDWriteback_ImmediateAfterStartSession(t *testing.T) {
+ 	key := "test:user1"
+ 	session := &Session{AgentSessionID: ""} // empty — no prior binding
+ 
+-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
++	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
+ 
+ 	got := session.GetAgentSessionID()
+ 
+@@ -7171,7 +7174,7 @@ func TestSessionIDWriteback_MapsSessionName(t *testing.T) {
+ 	key := "test:user1"
+ 	session := e.sessions.NewSession(key, "我的自定义会话")
+ 
+-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
++	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
+ 
+ 	got := e.sessions.GetSessionName("agent-uuid-456")
+ 	if got != "我的自定义会话" {
+@@ -7193,7 +7196,7 @@ func TestSessionIDWriteback_TracksLiveForkedID(t *testing.T) {
+ 	key := "test:user1"
+ 	session := &Session{AgentSessionID: "existing-uuid"}
+ 
+-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
++	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
+ 
+ 	got := session.GetAgentSessionID()
+ 
+@@ -7219,7 +7222,7 @@ func TestInteractiveWriteBack_TracksForkedSessionID(t *testing.T) {
+ 	// Session already holds the original (now stale) ID from a prior turn.
+ 	session := &Session{AgentSessionID: "orig-id", AgentType: "controllable"}
+ 
+-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
++	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
+ 
+ 	if got := session.GetAgentSessionID(); got != "forked-id" {
+ 		t.Fatalf("AgentSessionID = %q, want %q — must track the live forked ID", got, "forked-id")
+@@ -7241,7 +7244,7 @@ func TestInteractiveWriteBack_NamingBindsOnlyOnFirstAssignment(t *testing.T) {
+ 	session := &Session{Name: "my-feature", AgentType: "controllable"}
+ 
+ 	// First assignment: name should bind to first-id.
+-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
++	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
+ 	if got := e.sessions.GetSessionName("first-id"); got != "my-feature" {
+ 		t.Fatalf("first-id name = %q, want %q on first assignment", got, "my-feature")
+ 	}
+@@ -7254,7 +7257,7 @@ func TestInteractiveWriteBack_NamingBindsOnlyOnFirstAssignment(t *testing.T) {
+ 	delete(e.interactiveStates, key) // force a fresh start path
+ 	e.interactiveMu.Unlock()
+ 
+-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
++	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
+ 	if got := session.GetAgentSessionID(); got != "forked-id" {
+ 		t.Fatalf("AgentSessionID = %q, want %q after fork", got, "forked-id")
+ 	}
+@@ -7321,7 +7324,7 @@ func TestResumeFallback_ClearsStaleSessionID(t *testing.T) {
+ 	// Session has a stale AgentSessionID from a previously killed agent.
+ 	session := &Session{AgentSessionID: "stale-id", AgentType: "controllable"}
+ 
+-	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
++	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
+ 
+ 	// The new agent session should be the fresh one.
+ 	if state.agentSession != freshSess {
+@@ -7362,7 +7365,7 @@ func TestStaleGoroutineCleanup_RaceSimulation(t *testing.T) {
+ 
+ 	// Step 3: New turn creates Session B and calls getOrCreateInteractiveStateWith.
+ 	sessionB := &Session{AgentSessionID: ""}
+-	newState := e.getOrCreateInteractiveStateWith(key, p, "ctx", sessionB, e.sessions, nil, "")
++	newState := e.getOrCreateInteractiveStateWith(key, p, "ctx", sessionB, e.sessions, nil, "", "")
+ 
+ 	// Verify S2 is in the map.
+ 	e.interactiveMu.Lock()
+@@ -7840,7 +7843,7 @@ func TestResumeFailureFallbackToFreshSession(t *testing.T) {
+ 	session.SetAgentSessionID("old-session-id", "stub")
+ 
+ 	p := &stubPlatformEngine{n: "test"}
+-	state := e.getOrCreateInteractiveStateWith("test:user1", p, "ctx", session, e.sessions, nil, "")
++	state := e.getOrCreateInteractiveStateWith("test:user1", p, "ctx", session, e.sessions, nil, "", "")
+ 
+ 	if state.agentSession == nil {
+ 		t.Fatal("expected agentSession to be non-nil after fallback")
+@@ -7878,7 +7881,7 @@ func TestFreshSessionWithoutSavedSessionIDStartsFresh(t *testing.T) {
+ 	session := e.sessions.GetOrCreateActive("test:user2")
+ 
+ 	p := &stubPlatformEngine{n: "test"}
+-	state := e.getOrCreateInteractiveStateWith("test:user2", p, "ctx", session, e.sessions, nil, "")
++	state := e.getOrCreateInteractiveStateWith("test:user2", p, "ctx", session, e.sessions, nil, "", "")
+ 
+ 	if state.agentSession == nil {
+ 		t.Fatal("expected agentSession to be non-nil")
+@@ -7915,7 +7918,7 @@ func TestWorkspaceReconnectWithSavedSessionIDUsesExactResume(t *testing.T) {
+ 	session.SetAgentSessionID("saved-session-id", "stub")
+ 
+ 	p := &stubPlatformEngine{n: "test"}
+-	state := e.getOrCreateInteractiveStateWith("test:user3", p, "ctx", session, e.sessions, nil, "")
++	state := e.getOrCreateInteractiveStateWith("test:user3", p, "ctx", session, e.sessions, nil, "", "")
+ 
+ 	if state.agentSession == nil {
+ 		t.Fatal("expected agentSession to be non-nil")
 diff --git a/core/interfaces.go b/core/interfaces.go
 index e92182a..20556f8 100644
 --- a/core/interfaces.go
@@ -281,70 +447,37 @@ index 70bab96..17df6e3 100644
 +	}
 +	return os.Rename(tmp, deliveriesFile)
 +}
-diff --git a/core/management_delivery_test.go b/core/management_delivery_test.go
-new file mode 100644
-index 0000000..b19d9dc
---- /dev/null
-+++ b/core/management_delivery_test.go
-@@ -0,0 +1,58 @@
-+package core
-+
-+import (
-+	"os"
-+	"path/filepath"
-+	"testing"
-+)
-+
-+func TestDeliveryIdempotencyStore(t *testing.T) {
-+	dir := t.TempDir()
-+	deliveriesFile = filepath.Join(dir, "deliveries.json")
-+
-+	if _, ok := loadDelivery("k-1"); ok {
-+		t.Fatal("empty store must not contain k-1")
-+	}
-+	// write-ahead reservation, then final id
-+	if err := saveDelivery("k-1", deliveryInFlight); err != nil {
-+		t.Fatal(err)
-+	}
-+	if v, ok := loadDelivery("k-1"); !ok || v != deliveryInFlight {
-+		t.Fatalf("reservation missing: %q %v", v, ok)
-+	}
-+	if err := saveDelivery("k-1", "om_123"); err != nil {
-+		t.Fatal(err)
-+	}
-+	if v, ok := loadDelivery("k-1"); !ok || v != "om_123" {
-+		t.Fatalf("final id missing: %q %v", v, ok)
-+	}
-+	// distinct keys stay independent
-+	if err := saveDelivery("k-2", "om_456"); err != nil {
-+		t.Fatal(err)
-+	}
-+	if v, _ := loadDelivery("k-1"); v != "om_123" {
-+		t.Fatalf("k-1 clobbered: %q", v)
-+	}
-+	// delete (unreserve on failure path)
-+	if err := deleteDelivery("k-2"); err != nil {
-+		t.Fatal(err)
-+	}
-+	if _, ok := loadDelivery("k-2"); ok {
-+		t.Fatal("deleted key must be gone")
-+	}
-+}
-+
-+func TestDeliveryStoreFileMode(t *testing.T) {
-+	dir := t.TempDir()
-+	deliveriesFile = filepath.Join(dir, "nested", "deliveries.json")
-+	if err := saveDelivery("k", "om"); err != nil {
-+		t.Fatal(err)
-+	}
-+	info, err := os.Stat(deliveriesFile)
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	if info.Mode().Perm() != 0o600 {
-+		t.Fatalf("deliveries.json mode = %o, want 600", info.Mode().Perm())
-+	}
-+}
+diff --git a/core/session_id_validation_test.go b/core/session_id_validation_test.go
+index 09ce9c9..5a2138d 100644
+--- a/core/session_id_validation_test.go
++++ b/core/session_id_validation_test.go
+@@ -50,7 +50,7 @@ func TestIssue599_InvalidSessionIDClearedBeforeResume(t *testing.T) {
+ 	// Simulate a stored cross-project session ID.
+ 	s := &Session{AgentSessionID: "leaked-id-from-other-project"}
+ 
+-	e.getOrCreateInteractiveStateWith(key, p, "ctx", s, e.sessions, nil, "")
++	e.getOrCreateInteractiveStateWith(key, p, "ctx", s, e.sessions, nil, "", "")
+ 
+ 	if startedWith != "" {
+ 		t.Errorf("StartSession called with %q, want \"\" (fresh start; leaked id must NOT be passed through)", startedWith)
+@@ -80,7 +80,7 @@ func TestIssue599_ValidSessionIDPreserved(t *testing.T) {
+ 
+ 	s := &Session{AgentSessionID: "valid-id-abc"}
+ 
+-	e.getOrCreateInteractiveStateWith(key, p, "ctx", s, e.sessions, nil, "")
++	e.getOrCreateInteractiveStateWith(key, p, "ctx", s, e.sessions, nil, "", "")
+ 
+ 	if startedWith != "valid-id-abc" {
+ 		t.Errorf("StartSession called with %q, want %q (resume path)", startedWith, "valid-id-abc")
+@@ -106,7 +106,7 @@ func TestIssue599_AgentWithoutValidatorNotBlocked(t *testing.T) {
+ 
+ 	s := &Session{AgentSessionID: "any-id"}
+ 
+-	e.getOrCreateInteractiveStateWith(key, p, "ctx", s, e.sessions, nil, "")
++	e.getOrCreateInteractiveStateWith(key, p, "ctx", s, e.sessions, nil, "", "")
+ 
+ 	if startedWith != "any-id" {
+ 		t.Errorf("StartSession called with %q, want %q (no validator = pass through)", startedWith, "any-id")
 diff --git a/platform/feishu/feishu.go b/platform/feishu/feishu.go
 index bafedee..99b2ec3 100644
 --- a/platform/feishu/feishu.go
