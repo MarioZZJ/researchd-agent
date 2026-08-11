@@ -190,6 +190,26 @@ def _get_project(uow: UnitOfWork, project_id: str) -> Project:
     return project
 
 
+@router.get("/projects/{project_id}/members/{user_id}", dependencies=[Depends(require_token)])
+def check_membership(project_id: str, user_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
+    """Membership check for the ACP bind path (fail-closed: a project with no
+    member rows refuses everything; a non-member gets 403)."""
+    from sqlalchemy import select
+
+    from ...persistence.models import ProjectMemberRow
+
+    if not _PROJECT_ID_RE.fullmatch(project_id) or len(user_id) > 128:
+        raise HTTPException(status_code=400, detail="bad project_id or user_id")
+    rows = uow.session.execute(
+        select(ProjectMemberRow).where(ProjectMemberRow.project_id == project_id)
+    ).scalars().all()
+    if not rows:
+        raise HTTPException(status_code=403, detail="project has no members provisioned")
+    if any(r.platform_user_id == user_id for r in rows):
+        return {"project_id": project_id, "member": True}
+    raise HTTPException(status_code=403, detail="not a member")
+
+
 @router.get("/projects/{project_id}/status", dependencies=[Depends(require_token)])
 def project_status(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
     project = _get_project(uow, project_id)

@@ -43,14 +43,20 @@ if [ -z "$PROJECT" ]; then
   exit 2
 fi
 
-AUTH="Authorization: Bearer $TOKEN"
+# the management token NEVER appears in argv (ps-readable): a 0600 curl
+# config file carries the Authorization header instead
+CURL_CFG=$(mktemp /tmp/cc-setup-curl.XXXXXX)
+chmod 600 "$CURL_CFG"
+printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" > "$CURL_CFG"
+trap 'rm -f "$CURL_CFG"' EXIT
+unset TOKEN
 DEVICE_CODE="${2:-}"
 
 echo "== cc-connect setup: project=$PROJECT base=$BASE =="
 
 if [ -z "$DEVICE_CODE" ]; then
   echo ">> 请求飞书账号服务注册（PersonalAgent / client_secret / open_id）..."
-  BEGIN=$(curl -sS --max-time 20 -X POST -H "$AUTH" "$BASE/api/v1/setup/feishu/begin")
+  BEGIN=$(curl -sS --max-time 20 --config "$CURL_CFG" -X POST "$BASE/api/v1/setup/feishu/begin")
   DEVICE_CODE=$(printf '%s' "$BEGIN" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['device_code'])")
   QR_URL=$(printf '%s' "$BEGIN" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['qr_url'])")
   INTERVAL=$(printf '%s' "$BEGIN" | python3 -c "import json,sys; print(json.load(sys.stdin)['data'].get('interval', 5))")
@@ -88,7 +94,7 @@ DEADLINE=$((SECONDS + 900))
 while [ "$STATUS" = "pending" ]; do
   [ "$SECONDS" -ge "$DEADLINE" ] && { echo "ERROR: 轮询超时（15 分钟）。可重跑: $0 $PROJECT $DEVICE_CODE" >&2; exit 4; }
   sleep "$INTERVAL"
-  POLL=$(curl -sS --max-time 20 -X POST -H "$AUTH" -H "Content-Type: application/json" \
+  POLL=$(curl -sS --max-time 20 --config "$CURL_CFG" -H "Content-Type: application/json" \
     -d "{\"device_code\": \"$DEVICE_CODE\"}" "$BASE/api/v1/setup/feishu/poll")
   STATUS=$(printf '%s' "$POLL" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['status'])")
   echo "   ... status=$STATUS ($(date +%H:%M:%S))"
@@ -126,19 +132,26 @@ echo
 echo ">> 保存到项目 $PROJECT ..."
 BAK="$CONFIG.bak-$(date +%Y%m%d-%H%M%S)"
 cp "$CONFIG" "$BAK" && chmod 600 "$BAK" && echo "   已备份配置到 $BAK（0600，旧凭据可回滚）"
-# secret passes via env+stdin, never as argv (no ps/history leakage)
-SAVE=$(APP_SECRET="$APP_SECRET" python3 - "$PROJECT" "$APP_ID" "$PLATFORM" "$OWNER" <<'PYEOF' | curl -sS --max-time 20 -X POST -H "$AUTH" -H "Content-Type: application/json" --data-binary @- "$BASE/api/v1/setup/feishu/save"
-import json, os, sys
-project, app_id, platform, owner = sys.argv[1:5]
+# secret passes via a 0600 temp file (no argv, no env, no ps/history
+# leakage): same-uid observers cannot read another process's file with
+# 0600 perms; the file is removed immediately after use
+SEC_FILE=$(mktemp /tmp/cc-setup-secret.XXXXXX)
+chmod 600 "$SEC_FILE"
+printf '%s' "$APP_SECRET" > "$SEC_FILE"
+SAVE=$(python3 - "$PROJECT" "$APP_ID" "$PLATFORM" "$OWNER" "$SEC_FILE" <<'PYEOF' | curl -sS --max-time 20 --config "$CURL_CFG" -H "Content-Type: application/json" --data-binary @- "$BASE/api/v1/setup/feishu/save"
+import json, sys
+project, app_id, platform, owner, sec_file = sys.argv[1:6]
+app_secret = open(sec_file).read().strip()
 print(json.dumps({
     "project": project, "app_id": app_id,
-    "app_secret": os.environ["APP_SECRET"],
+    "app_secret": app_secret,
     "platform_type": platform, "owner_open_id": owner,
 }))
 PYEOF
 )
+rm -f "$SEC_FILE"
 echo "   $(printf '%s' "$SAVE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('data', d).get('message', d))")"
-unset APP_SECRET SAVE_JSON 2>/dev/null || true
+unset APP_SECRET 2>/dev/null || true
 
 echo
 echo "== 下一步 =="

@@ -37,18 +37,24 @@ def test_bwrap_masks_researchd_secrets_keeps_workspace(tmp_path):
         "/bin/sh",
         "-c",
         "echo DB=$(cat %s/researchd.db 2>&1); "
-        "echo CC=$(ls %s 2>&1 | head -1); "
-        "echo RX=$(ls %s 2>&1 | head -1); "
-        "echo SSH=$(ls %s 2>&1 | head -1); "
+        "echo HOME_RX=$(ls %s 2>&1 | head -1); "
+        "echo HOME_SSH=$(ls %s 2>&1 | head -1); "
+        "echo DOCS=$(ls %s 2>&1 | head -1); "
+        "echo ETC=$(ls /etc 2>&1 | head -1); "
         "echo WS=$(cat %s/marker.txt 2>&1); "
-        "echo OV=$(ls %s 2>&1 | wc -l)" % (data, home / ".cc-connect", home / ".reasonix", home / ".ssh", ws, overlay),
+        "echo OV=$(ls %s 2>&1 | wc -l)" % (data, home / ".reasonix", home / ".ssh", home / "Documents", ws, overlay),
     ]
     r = subprocess.run(probe, capture_output=True, text=True, timeout=60)
     out = r.stdout
     assert "DB-SECRET-MARKER" not in out, "researchd DB leaked into executor namespace"
     db_line = [ln for ln in out.splitlines() if ln.startswith("DB=")]
     assert db_line and "No such file" in db_line[0], f"DB not masked: {out}"
-    for prefix in ("CC=", "RX=", "SSH="):
+    # the whole home is masked: reasonix home, ssh, and Documents (which
+    # holds the researchd repo incl. .env) are ALL invisible
+    for prefix in ("HOME_RX=", "HOME_SSH=", "DOCS="):
         line = [ln for ln in out.splitlines() if ln.startswith(prefix)][0]
-        assert line == prefix, f"{prefix} mask failed: {out}"
+        assert "No such file" in line, f"{prefix} mask failed: {out}"
+    # the minimal runtime allowlist IS readable (tools can run)
+    etc_line = [ln for ln in out.splitlines() if ln.startswith("ETC=")][0]
+    assert etc_line != "ETC=", f"/etc not readable: {out}"
     assert any(ln == "WS=WS-VISIBLE" for ln in out.splitlines()), f"workspace unusable: {out}"

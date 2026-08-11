@@ -179,10 +179,29 @@ class CommandHandler:
         )
 
     # ------------------------------------------------------------ commands
+    # commands that are project-agnostic (binding/help/session config): no
+    # membership check — everything else REQUIRES project membership so the
+    # gateway token can never be a confused deputy for reads either
+    _PUBLIC_COMMANDS = frozenset({"bind", "help", "model", "role"})
+
     def dispatch(self, cmd: ParsedCommand) -> CommandReply:
         method = getattr(self, f"cmd_{cmd.name}", None)
         if method is None:
             raise UnknownCommand(cmd.raw)
+        if cmd.name not in self._PUBLIC_COMMANDS:
+            if not self.project_id:
+                raise HandlerError(
+                    f"command /{cmd.name} requires a bound project (use /bind project <id> first)",
+                    403,
+                )
+            if self.actor.type == "human":
+                # membership gate on READS too (confused-deputy protection):
+                # a non-member who somehow reaches the handler must not read
+                # the project's state; mutating commands additionally require
+                # can_approve_decisions where applicable (cmd_decision)
+                _require_actor_authorized(
+                    self.session, self.project_id, self.actor, require_approval=False
+                )
         return method(cmd)
 
     def cmd_status(self, cmd: ParsedCommand) -> CommandReply:

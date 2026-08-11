@@ -180,18 +180,16 @@ def test_bwrap_command_masks_secrets_and_mounts_workspace(tmp_path, monkeypatch)
         return any(cmd[i + k:k + n] == seq for k in range(0, len(cmd) - n + 1))
 
     assert cmd[0] == "bwrap"
-    assert cmd[1:4] == ["--ro-bind", "/", "/"]
-    assert has(["--tmpfs", str(data)], 0, 2)
-    from researchd.executors.reasonix.transport import _SANDBOX_MASKED_HOME_DIRS
-
-    for name in _SANDBOX_MASKED_HOME_DIRS:
-        target = Path.home() / name
-        if target.is_dir():
-            assert has(["--tmpfs", str(target)], 0, 2), name
-        elif target.exists():
-            # files are masked via /dev/null (tmpfs cannot mount over a file)
-            assert has(["--ro-bind", "/dev/null", str(target)], 0, 3), name
-    assert has(["--bind", str(overlay), str(overlay)], 0, 3)
+    # NEVER --ro-bind / / : the sandbox is a minimal read-only allowlist
+    assert not has(["--ro-bind", "/", "/"], 0, 3)
+    for allow in ("/usr", "/bin", "/etc", "/opt", "/proc"):
+        assert has(["--ro-bind", allow, allow], 0, 3), allow
+    # whole home masked, then ONLY overlay (ro) + sessions (rw) + workspace
+    assert has(["--tmpfs", str(Path.home())], 0, 2)
+    assert has(["--ro-bind", str(overlay), str(overlay)], 0, 3)
+    sessions = overlay / "sessions"
+    if sessions.is_dir():
+        assert has(["--bind", str(sessions), str(sessions)], 0, 3)
     assert has(["--bind", str(ws), str(ws)], 0, 3)
     assert has(["--chdir", str(ws)], 0, 2)
     assert cmd[-2:] == ["/bin/reasonix-native", "acp"]

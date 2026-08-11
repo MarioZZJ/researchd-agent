@@ -80,8 +80,36 @@ async def _bind_project(settings: Settings, session: InteractionSession, cmd) ->
     ok, detail = await _service_check(settings, project_id)
     if not ok:
         return PromptReply(text=f"bind failed: {detail}", intent="bind")
+    # membership check (fail-closed like the handler gates): a non-member
+    # must NOT be able to bind — the gateway token is never a confused
+    # deputy. Projects with no members yet refuse binding until the owner
+    # is provisioned (researchd pilot create --owner-open-id).
+    user_id = session.cc_user_id
+    if user_id:
+        ok, detail = await _membership_check(settings, project_id, user_id)
+        if not ok:
+            return PromptReply(text=f"bind failed: {detail}", intent="bind")
     session.cc_project = project_id
     return PromptReply(text=f"bound to project {project_id}", intent="bind", command="bind")
+
+
+async def _membership_check(settings: Settings, project_id: str, user_id: str) -> tuple[bool, str]:
+    """True when user_id is a member of the project (or the project has no
+    member rows at all -> 403 with a provisioning hint, fail-closed)."""
+    transport = httpx.AsyncHTTPTransport(uds=settings.api.socket_path) if settings.api.socket_path else None
+    headers = _auth_headers(settings)
+    try:
+        async with httpx.AsyncClient(transport=transport, headers=headers, timeout=10.0) as client:
+            resp = await client.get(
+                f"http://localhost/v1/projects/{project_id}/members/{user_id}"
+            )
+        if resp.status_code == 200:
+            return True, ""
+        if resp.status_code == 403:
+            return False, "project has no members provisioned (owner must be provisioned first)"
+        return False, f"not a member of project {project_id}"
+    except httpx.HTTPError as exc:
+        return False, f"service unreachable: {exc}"
 
 
 async def _service_check(settings: Settings, project_id: str) -> tuple[bool, str]:

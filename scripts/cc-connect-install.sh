@@ -43,10 +43,14 @@ if ! systemctl --user is-active --quiet cc-connect; then
   bash "$(dirname "$0")/cc-connect-rollback.sh"
   exit 3
 fi
-TOKEN=$(sed -n '/\[management\]/,/^\[/p' "$HOME/.cc-connect/config.toml" | sed -n 's/^[[:space:]]*token[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+# the token never enters curl argv: a 0600 curl config file carries it
+CURL_CFG=$(mktemp /tmp/cc-install-curl.XXXXXX)
+chmod 600 "$CURL_CFG"
+trap 'rm -f "$CURL_CFG"' EXIT
+sed -n '/\[management\]/,/^\[/p' "$HOME/.cc-connect/config.toml" | sed -n 's/^[[:space:]]*token[[:space:]]*=[[:space:]]*"\([^"]*\)".*/header = "Authorization: Bearer \1"/p' | head -1 > "$CURL_CFG"
 PORT=$(sed -n '/\[management\]/,/^\[/p' "$HOME/.cc-connect/config.toml" | sed -n 's/^[[:space:]]*port[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' | head -1)
 PORT="${PORT:-9820}"
-CODE=$(curl -sS --max-time 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/api/v1/status")
+CODE=$(curl -sS --max-time 5 --config "$CURL_CFG" -o /dev/null -w "%{http_code}" "http://127.0.0.1:$PORT/api/v1/status")
 echo ">> management api /status -> HTTP $CODE"
 [ "$CODE" = "200" ] || { echo "ERROR: management api not healthy (HTTP $CODE)" >&2; exit 3; }
 echo "== installed OK (rollback: bash scripts/cc-connect-rollback.sh) =="

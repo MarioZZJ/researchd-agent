@@ -62,7 +62,17 @@ _SANDBOX_MASKED_HOME_DIRS = (
 
 def _bwrap_command(binary: str, overlay: Path, cwd: Path) -> list[str] | None:
     """bubblewrap argv wrapping `binary acp`; None when bwrap is unavailable
-    (callers must fail closed, never silently degrade)."""
+    (callers must fail closed, never silently degrade).
+
+    The sandbox is built from a MINIMAL read-only runtime allowlist (NOT
+    --ro-bind / /): /usr /bin /sbin /lib* /etc /opt /proc /dev plus the
+    binary's own directory tree (~/.nvm) and ~/.cache — everything else on
+    the host is simply NOT MOUNTED (invisible), which covers repository
+    .env files, .kube/.docker configs, other users' homes, and runtime
+    sockets without needing an exhaustive mask list. The whole user home is
+    then explicitly masked as empty tmpfs and ONLY the overlay (read-only
+    config/env, writable sessions) and the project workspace are re-mounted.
+    """
     import shutil
 
     if shutil.which("bwrap") is None:
@@ -70,26 +80,41 @@ def _bwrap_command(binary: str, overlay: Path, cwd: Path) -> list[str] | None:
     home = Path.home()
     cmd = [
         "bwrap",
-        "--ro-bind", "/", "/",  # whole root read-only first
+        "--die-with-parent",
+        # minimal read-only runtime allowlist — NO --ro-bind / /
+        "--ro-bind", "/usr", "/usr",
+        "--ro-bind", "/bin", "/bin",
+        "--ro-bind", "/sbin", "/sbin",
+        "--ro-bind", "/etc", "/etc",
+        "--ro-bind", "/opt", "/opt",
+        "--ro-bind", "/proc", "/proc",
         "--dev", "/dev",
-        "--proc", "/proc",
         "--tmpfs", "/tmp",
         "--share-net",  # model calls need the provider gateway
         "--unshare-pid",
+        "--unshare-ipc",
     ]
-    data_dir = overlay.parent  # overlay lives at <data_dir>/rx-overlay
-    # researchd data dir (DB, api socket, logs) invisible; overlay itself and
-    # the workspace are re-mounted writable afterwards (later binds win).
-    cmd += ["--tmpfs", str(data_dir)]
-    for name in _SANDBOX_MASKED_HOME_DIRS:
-        target = home / name
-        if target.is_dir():
-            cmd += ["--tmpfs", str(target)]
-        elif target.exists():
-            # a FILE (e.g. ~/.gitconfig, ~/.netrc): tmpfs cannot mount over a
-            # file — bind /dev/null over it so its content is unreachable
-            cmd += ["--ro-bind", "/dev/null", str(target)]
-    cmd += ["--bind", str(overlay), str(overlay)]
+    for libdir in ("/lib", "/lib64"):
+        if Path(libdir).is_dir():
+            cmd += ["--ro-bind", libdir, libdir]
+    # the native binary lives under ~/.nvm (and may need ~/.cache at runtime):
+    # bind those read-only BEFORE masking the rest of the home
+    for keep in ("/home",):
+        pass
+    nvm = home / ".nvm"
+    cache = home / ".cache"
+    if nvm.is_dir():
+        cmd += ["--ro-bind", str(nvm), str(nvm)]
+    if cache.is_dir():
+        cmd += ["--ro-bind", str(cache), str(cache)]
+    # whole user home masked (empty tmpfs): ~/.ssh ~/.aws ~/.reasonix
+    # ~/.cc-connect, repository .env, everything — then re-mount ONLY the
+    # overlay (config/.env READ-ONLY; sessions writable) and the workspace
+    cmd += ["--tmpfs", str(home)]
+    cmd += ["--ro-bind", str(overlay), str(overlay)]
+    sessions = overlay / "sessions"
+    if sessions.is_dir():
+        cmd += ["--bind", str(sessions), str(sessions)]
     ws = str(cwd)
     cmd += ["--bind", ws, ws]
     cmd += ["--chdir", ws]
@@ -370,7 +395,7 @@ class StdioReasonixTransport(ReasonixTransport):
             # assistant block from the transcript file
             tp = result.get("transcriptPath")
             if tp:
-                text_out = self._last_assistant_text(tp)
+                text_out = self._last_assistant_text(tp, overlay_root=self.overlay)
         if not text_out.strip():
             raise TransportError(
                 f"reasonix acp session/prompt returned no text (result keys: {sorted(result.keys())})"
@@ -382,11 +407,34 @@ class StdioReasonixTransport(ReasonixTransport):
         return text_out
 
     @staticmethod
-    def _last_assistant_text(transcript_path: str) -> str:
+    def _last_assistant_text(transcript_path: str, *, overlay_root: Path | None = None, max_bytes: int = 8 * 1024 * 1024) -> str:
         """Extract the last assistant text block from a reasonix transcript
-        jsonl (message content may be a string or a list of blocks)."""
+        jsonl (message content may be a string or a list of blocks).
+
+        CONTAINMENT: the transcript must live under the overlay sessions dir
+        (the sandbox can only write there); it must be a REGULAR file, not a
+        symlink, not a device, and bounded in size — a sandbox-controlled
+        path is never trusted blindly (a hostile/compromised reasonix could
+        otherwise point us at /dev/zero or any readable host file)."""
         from pathlib import Path
 
+        path = Path(transcript_path)
+        if overlay_root is not None:
+            sessions_dir = (overlay_root / "sessions").resolve()
+            resolved = path.resolve()
+            try:
+                resolved.relative_to(sessions_dir)
+            except ValueError:
+                return ""  # outside the sessions dir: not ours, refuse
+        try:
+            st = path.stat()  # follows symlinks; the resolve() above already
+            #  pinned the target inside sessions_dir
+        except OSError:
+            return ""
+        if not Path(path).is_file() or not st.st_mode & 0o100000:  # S_IFREG
+            return ""
+        if st.st_size > max_bytes:
+            return ""
         try:
             lines = Path(transcript_path).read_text(encoding="utf-8").splitlines()
         except OSError:
