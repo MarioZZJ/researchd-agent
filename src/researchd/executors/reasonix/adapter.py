@@ -34,7 +34,7 @@ from ..base import (
     validate_planner_result,
     validate_work_result,
 )
-from .overlay import ensure_overlay, installed_skills, overlay_workdir
+from .overlay import OverlayError, ensure_overlay, installed_skills, overlay_workdir
 from .transport import FakeReasonixTransport, ReasonixTransport, StdioReasonixTransport, TransportError
 
 MAX_REPAIRS = 2
@@ -160,7 +160,16 @@ class ReasonixAdapter(ExecutorAdapter):
         project share one process and different projects never share cwd."""
         if self._explicit:
             return self._transports["<explicit>"]
-        key = str(Path(workspace_root).resolve()) if workspace_root else "<fallback>"
+        if workspace_root:
+            resolved = Path(workspace_root).resolve()
+            if not resolved.is_dir():
+                raise OverlayError(
+                    f"workspace root {workspace_root!r} does not exist; refusing to create "
+                    "arbitrary directories for executor cwd (fail-closed)"
+                )
+            key = str(resolved)
+        else:
+            key = "<fallback>"
         if key not in self._transports:
             overlay = ensure_overlay(self._overlay_dir)
             self._skills = installed_skills(overlay)

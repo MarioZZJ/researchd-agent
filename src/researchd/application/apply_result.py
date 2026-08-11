@@ -72,6 +72,11 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
     #    project root, no '..' / symlink escape — any violation rejects the
     #    whole result (the transaction rolls back).
     project = ProjectRepo(session).get_by_project_id(project_id)
+    if project is None:
+        # fail-closed: without the persisted project (and its workspace root)
+        # there is no trusted boundary to register artifacts against — reject
+        # the WHOLE result instead of silently dropping provenance
+        raise ValueError(f"run {run.run_id}: project {project_id!r} not found; result rejected (fail-closed)")
     for art in result.artifacts:
         artifact_id = art.local_ref
         existing_artifact = ArtifactRepo(session).get_by_artifact_id(artifact_id)
@@ -141,8 +146,6 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
     #    never claim VERIFIED, and provenance is re-checked at audit time.
     for cand in result.evidence_candidates:
         evidence_id = cand.local_ref
-        if EvidenceRepo(session).get_by_evidence_id(evidence_id):
-            continue  # idempotent
         lit = None
         if cand.literature and (cand.literature.get("source_id") or cand.literature.get("doi")):
             lit = LiteratureProvenance(
@@ -160,6 +163,26 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
                 uncertainty=cand.computational.get("uncertainty") or {},
                 interpretation_limits=cand.computational.get("interpretation_limits") or [],
             )
+        existing_ev = EvidenceRepo(session).get_by_evidence_id(evidence_id)
+        if existing_ev is not None:
+            if existing_ev.status.value == "VERIFIED":
+                continue  # verified evidence is never overwritten
+            if existing_ev.run_id != run.run_id:
+                # a previous (REVISE-cycle) candidate with the same id: this
+                # round's candidate SUPERSEDES it (id stays stable; the
+                # candidate was never verified)
+                existing_ev.statement = cand.statement
+                existing_ev.type = cand.type
+                existing_ev.run_id = run.run_id
+                existing_ev.task_id = run.task_id
+                existing_ev.artifact_refs = cand.artifact_refs
+                existing_ev.literature = lit
+                existing_ev.computational = comp
+                existing_ev.limitations = cand.limitations
+                EvidenceRepo(session).save(existing_ev)
+                counts["evidence"] += 1
+                continue
+            continue  # same run replay (idempotent)
         evidence = Evidence(
             evidence_id=evidence_id,
             project_id=project_id,

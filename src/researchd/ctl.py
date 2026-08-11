@@ -136,16 +136,15 @@ def export(project_id: str) -> None:
 
 @main.command("delivery")
 @click.argument("action", type=click.Choice(["test"]))
-@click.option("--chat-id", default="", help="explicit staging chat id (default: settings)")
-def delivery_cmd(action: str, chat_id: str) -> None:
+def delivery_cmd(action: str) -> None:
     """delivery test — send + in-place update a real cc-connect card.
 
-    Sends an interactive card to the configured staging chat and PATCH-updates
-    it in place; fails loudly when cc-connect is not configured on the
-    service. The token is read from the service env file, never from args.
+    Sends an interactive card to the service's CONFIGURED staging target
+    (delivery=cc_connect + token/project/session_key from the env file) and
+    PATCH-updates it in place; fails loudly when cc-connect is not configured.
     """
     if action == "test":
-        click.echo(json.dumps(_call("POST", "/v1/delivery/test", json={"chat_id": chat_id}), ensure_ascii=False, indent=2))
+        click.echo(json.dumps(_call("POST", "/v1/delivery/test", json={}), ensure_ascii=False, indent=2))
 
 
 @main.command("document")

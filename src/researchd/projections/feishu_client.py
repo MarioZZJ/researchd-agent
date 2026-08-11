@@ -167,12 +167,17 @@ class FeishuDocClient:
             Block,
             CreateDocumentBlockChildrenRequestBodyBuilder,
             CreateDocumentBlockChildrenRequestBuilder,
-            Text,
-            TextElement,
-            TextRun,
         )
 
         client = self._client()
+        # idempotent create: if the marked block already exists (crash after
+        # a successful create + retry), treat it as done — never duplicate
+        try:
+            await self._find_block_id(document_id, section_key)
+            await self.update_block(document_id, section_key, text)
+            return
+        except FeishuDocError:
+            pass  # not present -> create below
         root_id = await self._root_block_id(document_id)
         content = f"{SECTION_MARKER_PREFIX}{section_key}-->\n{text}"
         block = Block(
@@ -260,3 +265,69 @@ class FeishuDocClient:
                 break
             page_token = resp.data.page_token
         raise FeishuDocError(f"document {document_id}: section block {section_key!r} not found (create it first)")
+
+    async def delete_block(self, document_id: str, section_key: str) -> None:
+        """Delete the section block. batch_delete_children removes children of
+        a parent block BY INDEX, so we locate the page (root) block and the
+        section block in document order and delete the section as the page's
+        child at that index."""
+        from lark_oapi.api.docx.v1 import (
+            BatchDeleteDocumentBlockChildrenRequest,
+            BatchDeleteDocumentBlockChildrenRequestBuilder,
+            ListDocumentBlockRequest,
+            ListDocumentBlockRequestBuilder,
+        )
+
+        client = self._client()
+        page_id = None
+        blocks = []
+        page_token: str | None = None
+        while True:
+            builder = (
+                ListDocumentBlockRequestBuilder()
+                .document_id(document_id)
+                .page_size(500)
+            )
+            if page_token:
+                builder.page_token(page_token)
+            req: ListDocumentBlockRequest = builder.build()
+            resp = await self._call(
+                lambda: client.docx.v1.document_block.list(req),
+                "docx list for delete",
+            )
+            blocks.extend(resp.data.items or [])
+            if not resp.data.has_more or not resp.data.page_token:
+                break
+            page_token = resp.data.page_token
+        target_index = None
+        for i, block in enumerate(blocks):
+            if block.block_type == 1 and page_id is None:
+                page_id = block.block_id
+                continue
+            if block.block_type not in _TEXT_BLOCK_TYPES:
+                continue
+            key, _ = self._parse_section(self._block_text(block))
+            if key == section_key:
+                # child index of the page block == document order offset
+                target_index = i - 1
+                break
+        if page_id is None or target_index is None:
+            raise FeishuDocError(f"document {document_id}: section {section_key!r} not found for delete")
+        from lark_oapi.api.docx.v1 import BatchDeleteDocumentBlockChildrenRequestBodyBuilder
+
+        req = (
+            BatchDeleteDocumentBlockChildrenRequestBuilder()
+            .document_id(document_id)
+            .block_id(page_id)
+            .request_body(
+                BatchDeleteDocumentBlockChildrenRequestBodyBuilder()
+                .start_index(target_index)
+                .end_index(target_index + 1)
+                .build()
+            )
+            .build()
+        )
+        await self._call(
+            lambda: client.docx.v1.document_block.batch_delete_children(req),
+            f"docx delete block {section_key}",
+        )

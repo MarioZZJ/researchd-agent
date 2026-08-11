@@ -309,11 +309,13 @@ class ContextPackageBuilder:
         return self._finalize(pkg, objects, content)
 
     # ------------------------------------------------------------ auditor
-    def auditor(self, task, run) -> ContextPackage:  # noqa: ANN001
-        """INDEPENDENT audit package: built from persisted run result
-        (structured evidence candidates + real artifacts), NOT from the
-        worker's free-text self-assessment."""
+    def auditor(self, task, worker_run, *, audit_run_id: str | None = None) -> ContextPackage:  # noqa: ANN001
+        """INDEPENDENT audit package: built from the WORKER run's persisted
+        structured result (evidence candidates + real artifacts), NOT from the
+        worker's free-text self-assessment. `worker_run` is the run under
+        review; `audit_run_id` (the audit run) is recorded for traceability."""
         project_id = task.project_id
+        run = worker_run
         result = run.result or {}
         candidates = result.get("evidence_candidates", [])
         artifacts = result.get("artifacts", [])
@@ -377,7 +379,7 @@ class ContextPackageBuilder:
             role="auditor",
             project_id=project_id,
             task_id=task.task_id,
-            run_id=run.run_id,
+            run_id=audit_run_id or run.run_id,
             created_by="auditor",
         )
         if project is not None and project.workspace_root:

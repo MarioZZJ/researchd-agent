@@ -203,7 +203,6 @@ def test_real_reasonix_live_smoke(factory, tmp_path):
     if not os.environ.get("RESEARCHD_RUN_REAL_SMOKE") == "1":
         pytest.skip("real reasonix smoke requires RESEARCHD_RUN_REAL_SMOKE=1 (paid model authorization)")
     from researchd.executors.reasonix.adapter import ReasonixAdapter
-    from researchd.executors.reasonix.overlay import ensure_overlay
 
     ws = _setup(factory, tmp_path)
     settings = Settings()
@@ -211,7 +210,25 @@ def test_real_reasonix_live_smoke(factory, tmp_path):
     adapter = ReasonixAdapter(settings, overlay_dir=str(tmp_path / "data"))
     port = FakeDeliveryPort()
     loop = SchedulerLoop(settings, factory, adapter, port, max_parallel=1)
-    _tick(loop, 40)
+
+    async def _scenario(timeout_s: float = 480.0):
+        import time
+
+        deadline = time.monotonic() + timeout_s
+        last = ""
+        while time.monotonic() < deadline:
+            await loop.tick()
+            with UnitOfWork(factory) as uow:
+                task = TaskRepo(uow.session).get_by_task_id("T-SMOKE-1")
+                if task is not None and task.status.value in ("COMPLETED", "FAILED"):
+                    return task.status.value
+            await asyncio.sleep(3)
+        return last
+
+    import asyncio as _aio
+
+    final = _aio.run(_scenario())
+    assert final == "COMPLETED", f"real smoke ended {final!r}"
     with UnitOfWork(factory) as uow:
         task = TaskRepo(uow.session).get_by_task_id("T-SMOKE-1")
         assert task.status.value == "COMPLETED"

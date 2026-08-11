@@ -104,10 +104,16 @@ def installed_skills(overlay: Path) -> list[str]:
     return sorted(p.name for p in skills_dir.iterdir() if (p / SKILL_MANIFEST).is_file())
 
 
+# files allowed inside a mounted skill (everything else is dropped —
+# skill folders may contain credentials, notes, or other unvetted files)
+ALLOWED_SKILL_FILES = ("SKILL.md", "README.md")
+
+
 def _install_skills(overlay: Path, global_skills: Path) -> list[str]:
-    """Copy whitelisted user skills into the overlay. Returns the mounted
-    names. Missing skills are skipped (never fail the whole overlay: a skill
-    is an enhancement, providers are required)."""
+    """Copy whitelisted user skills into the overlay — WHITELIST FILES ONLY
+    (SKILL.md/README.md); any other file inside a skill folder is dropped so
+    unvetted content (secrets, notes) never reaches the executor. Returns the
+    mounted names. Missing skills are skipped."""
     skills_dir = overlay / "skills"
     skills_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(skills_dir, 0o700)
@@ -119,11 +125,12 @@ def _install_skills(overlay: Path, global_skills: Path) -> list[str]:
         dst = skills_dir / name
         if dst.exists():
             shutil.rmtree(dst)
-        shutil.copytree(src, dst, symlinks=False)
-        # drop anything that might carry secrets/metadata we did not whitelist
-        for p in dst.rglob("*"):
-            if p.is_file():
-                os.chmod(p, 0o600)
+        dst.mkdir()
+        for fname in ALLOWED_SKILL_FILES:
+            f = src / fname
+            if f.is_file():
+                shutil.copy2(f, dst / fname)
+                os.chmod(dst / fname, 0o600)
         mounted.append(name)
     return mounted
 

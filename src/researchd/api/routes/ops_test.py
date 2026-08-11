@@ -25,7 +25,10 @@ router = APIRouter(prefix="/v1", tags=["ops-test"])
 
 
 class DeliveryTestRequest(BaseModel):
-    chat_id: str = Field(default="", description="explicit staging chat (optional override)")
+    """No target fields: delivery test ALWAYS uses the service's configured
+    cc-connect staging target (delivery=cc_connect + token/project/session_key
+    from the env file). A stray chat_id can never redirect the test card to a
+    production session."""
 
 
 class DeliveryTestResponse(BaseModel):
@@ -35,7 +38,7 @@ class DeliveryTestResponse(BaseModel):
 
 
 @router.post("/delivery/test", dependencies=[Depends(require_token)])
-async def delivery_test(request: Request, body: DeliveryTestRequest) -> DeliveryTestResponse:
+async def delivery_test(request: Request, body: DeliveryTestRequest | None = None) -> DeliveryTestResponse:
     settings = request.app.state.settings
     port = getattr(request.app.state, "delivery_port", None)
     if port is None or settings.scheduler.delivery != "cc_connect":
@@ -97,31 +100,8 @@ async def document_test(request: Request, body: DocumentTestRequest) -> Document
         after_update = await client.list_blocks(body.document_id)
         if after_update.get(section) != "researchd document test: 更新内容":
             raise HTTPException(status_code=502, detail="update_block round-trip mismatch")
-        # cleanup: delete our own block
-        from lark_oapi.api.docx.v1 import (
-            BatchDeleteDocumentBlockChildrenRequestBodyBuilder,
-            BatchDeleteDocumentBlockChildrenRequestBuilder,
-        )
-
-        block_id = await client._find_block_id(body.document_id, section)
-        req = (
-            BatchDeleteDocumentBlockChildrenRequestBuilder()
-            .document_id(body.document_id)
-            .block_id(block_id)
-            .body(
-                BatchDeleteDocumentBlockChildrenRequestBodyBuilder()
-                .start_index(0)
-                .end_index(1)
-                .build()
-            )
-            .build()
-        )
-        resp = await client._call(
-            lambda: client._client().docx.v1.document_block.batch_delete_children(req),
-            "docx delete test block",
-        )
-        if not resp.success():
-            raise HTTPException(status_code=502, detail=f"cleanup failed code={resp.code} msg={resp.msg}")
+        # cleanup: delete our own block (child-of-page by index)
+        await client.delete_block(body.document_id, section)
         remaining = await client.list_blocks(body.document_id)
         if section in remaining:
             raise HTTPException(status_code=502, detail="cleanup did not remove the test block")

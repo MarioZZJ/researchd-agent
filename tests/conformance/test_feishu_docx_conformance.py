@@ -88,6 +88,21 @@ class FakeDocxApi:
 
         return SimpleNamespace(success=lambda: True, code=0, msg="", data=SimpleNamespace(block=block))
 
+    def batch_delete_children(self, req):
+        fail = self._fail("delete")
+        if fail:
+            return fail
+        parent = self.blocks[req.block_id]
+        # child blocks are stored in insertion order; drop the index range
+        children = [b for b in self.blocks.values() if b is not parent]
+        order = list(self.blocks.keys())
+        parent_pos = order.index(req.block_id)
+        target = order[parent_pos + 1 + req.body.start_index]
+        del self.blocks[target]
+        from types import SimpleNamespace
+
+        return SimpleNamespace(success=lambda: True, code=0, msg="", data=SimpleNamespace(block=parent))
+
 
 class FakeClient:
     def __init__(self, api):
@@ -199,32 +214,8 @@ def test_real_feishu_docx_round_trip():
         assert remote[section] != "更新内容 v2"  # system never clobbers
         # PI Notes protection: the pi-notes section is never created by us
         assert "pi-notes" not in await client.list_blocks(doc_id)
-        # cleanup: delete our own test block
-        from lark_oapi.api.docx.v1 import (
-            BatchDeleteDocumentBlockChildrenRequest,
-            BatchDeleteDocumentBlockChildrenRequestBody,
-            BatchDeleteDocumentBlockChildrenRequestBodyBuilder,
-            BatchDeleteDocumentBlockChildrenRequestBuilder,
-        )
-
-        block_id = await client._find_block_id(doc_id, section)
-        req = (
-            BatchDeleteDocumentBlockChildrenRequestBuilder()
-            .document_id(doc_id)
-            .block_id(block_id)
-            .body(
-                BatchDeleteDocumentBlockChildrenRequestBodyBuilder()
-                .start_index(0)
-                .end_index(1)
-                .build()
-            )
-            .build()
-        )
-        resp = await client._call(
-            lambda: client._client().docx.v1.document_block.batch_delete_children(req),
-            "docx delete conformance block",
-        )
-        assert resp.success()
+        # cleanup: delete our own test block (child-of-page by index)
+        await client.delete_block(doc_id, section)
         assert section not in await client.list_blocks(doc_id)
 
     run(scenario())

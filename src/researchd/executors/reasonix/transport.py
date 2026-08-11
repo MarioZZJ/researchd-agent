@@ -243,7 +243,12 @@ class StdioReasonixTransport(ReasonixTransport):
         return result.get("sessionId") or result.get("session", {}).get("sessionId", "")
 
     async def prompt(self, session_id: str, text: str, *, request_id: str | None = None) -> str:
-        params = {"sessionId": session_id, "prompt": text}
+        params = {
+            "sessionId": session_id,
+            # ACP spec: prompt is a content-block ARRAY (reasonix v1.21.2
+            # rejects a bare string with -32602)
+            "prompt": [{"type": "text", "text": text}],
+        }
         if request_id:
             params["requestId"] = request_id
         result = await self._call("session/prompt", params)

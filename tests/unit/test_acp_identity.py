@@ -71,7 +71,9 @@ def test_session_new_accepts_env_injection(monkeypatch):
     assert session.cc_user_id == "ou_2"
 
 
-def test_explicit_session_config_beats_env(monkeypatch):
+def test_partial_session_config_is_rejected(monkeypatch):
+    """An identity is ATOMIC: overriding only cc_user_id while inheriting the
+    env project/session key is rejected (half-spoofing impossible)."""
     monkeypatch.setenv("CC_PROJECT", "proj-env")
     monkeypatch.setenv("CC_SESSION_KEY", "k-env")
     monkeypatch.setenv("CC_USER_ID", "ou-env")
@@ -79,12 +81,26 @@ def test_explicit_session_config_beats_env(monkeypatch):
     resp = _call(
         server,
         "session/new",
-        {"sessionConfig": {"cc_project": "p-explicit", "cc_user_id": "ou-explicit"}},
+        {"sessionConfig": {"cc_user_id": "ou-spoof"}},
+    )
+    assert "error" in resp
+    assert "cc-connect identity missing" in resp["error"]["message"]
+    assert server.sessions == {}
+
+
+def test_full_session_config_wins_over_env(monkeypatch):
+    monkeypatch.setenv("CC_PROJECT", "proj-env")
+    monkeypatch.setenv("CC_SESSION_KEY", "k-env")
+    monkeypatch.setenv("CC_USER_ID", "ou-env")
+    server = _server()
+    resp = _call(
+        server,
+        "session/new",
+        {"sessionConfig": {"cc_project": "p-explicit", "cc_session_key": "k-explicit", "cc_user_id": "ou-explicit"}},
     )
     assert "result" in resp, resp
     sid = resp["result"]["sessionId"]
     session = server.sessions[sid]
     assert session.cc_project == "p-explicit"
+    assert session.cc_session_key == "k-explicit"
     assert session.cc_user_id == "ou-explicit"
-    # missing explicit value falls back to env (session key)
-    assert session.cc_session_key == "k-env"

@@ -444,10 +444,12 @@ class SchedulerLoop:
         name = task.contract.executor_profile
         source = "contract"
         role = role or (task.contract.role.value if hasattr(task.contract.role, "value") else str(task.contract.role))
-        if not name and role != "auditor":
-            # the auditor is NEVER the worker's own profile: an explicit
-            # auditor contract profile wins, then the project override, then
-            # the role default (auditor). Independent reviewer by construction.
+        if role == "auditor":
+            # the auditor is NEVER the worker's own profile: a contract
+            # profile belongs to the worker role. Independent reviewer by
+            # construction: project auditor override > auditor default.
+            name = None
+        if not name:
             project = ProjectRepo(session).get_by_project_id(task.project_id)
             name = (project.policy.role_overrides or {}).get(role) if project else None
             source = "project_role_override" if name else "default"
@@ -551,7 +553,16 @@ class SchedulerLoop:
 
                 builder = ContextPackageBuilder(session)
                 if role == "auditor":
-                    pkg = builder.persist(builder.auditor(task, run))
+                    # the audit package is built from the WORKER run under
+                    # review (its structured result + real artifacts), never
+                    # from the audit run itself (which has no result yet)
+                    worker_run_id = (run.metadata or {}).get("worker_run_id") or task.current_run_id
+                    worker_run = RunRepo(session).get_by_run_id(worker_run_id) if worker_run_id else None
+                    if worker_run is None:
+                        raise RuntimeError(
+                            f"audit run {run.run_id}: worker run {worker_run_id!r} not found; cannot audit"
+                        )
+                    pkg = builder.persist(builder.auditor(task, worker_run, audit_run_id=run.run_id))
                 else:
                     pkg = builder.persist(builder.worker(task, run=run))
                 context = builder.to_context_dict(pkg, objective=task.contract.objective)

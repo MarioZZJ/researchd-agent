@@ -24,6 +24,18 @@ def env(tmp_path):
     engine = make_engine(tmp_path / "test.db")
     init_db(engine)
     factory = make_session_factory(engine)
+    # every task needs a persisted project (apply_work_result fails closed
+    # without one); give P-TEST a real workspace dir
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    with UnitOfWork(factory) as uow:
+        from researchd.domain.project import Project
+        from researchd.persistence.repositories import ProjectRepo
+
+        ProjectRepo(uow.session).save(
+            Project(project_id="P-TEST", name="test", description="d", workspace_root=str(ws))
+        )
+        uow.commit()
     yield {"factory": factory, "tmp": tmp_path}
     engine.dispose()
 
@@ -203,15 +215,21 @@ def test_scheduler_dispatch_and_collect(env):
         runs = RunRepo(uow.session).list_active()
         # independent auditor accepted -> task COMPLETED (never RUNNING->COMPLETED)
         assert task.status.value == "COMPLETED"
-        assert len(port.deliveries) == 1
-        assert port.deliveries[0]["idempotency_key"] == "out-1"
+        # out-1 delivered once + the real milestone (first completed task)
+        keys = [d["idempotency_key"] for d in port.deliveries]
+        assert keys.count("out-1") == 1
+        assert any(k.startswith("milestone:") for k in keys)
+        assert any("MILESTONE" in d["payload"].get("body", "") for d in port.deliveries)
         # a second round of ticks does NOT redeliver (idempotent)
     async def run_ticks2():
         for _ in range(3):
             await loop.tick()
             await asyncio.sleep(0.05)
     asyncio.run(run_ticks2())
-    assert len(port.deliveries) == 1
+    # nothing redelivered (out-1 and the milestone each exactly once)
+    keys = [d["idempotency_key"] for d in port.deliveries]
+    assert keys.count("out-1") == 1
+    assert len([k for k in keys if k.startswith("milestone:")]) == 1
 
 
 def test_outbox_crash_recovery_no_duplicate(env):

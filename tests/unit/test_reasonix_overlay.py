@@ -57,7 +57,7 @@ def fake_home(tmp_path, monkeypatch):
         d = home / ".reasonix" / "skills" / skill
         d.mkdir()
         (d / "SKILL.md").write_text(f"# {skill}\n")
-        (d / "secret.toml").write_text("token=SECRET")
+        (d / "secret.toml").write_text("token=SECRET")  # must NOT be copied
     monkeypatch.setattr(Path, "home", lambda: home)
     return home
 
@@ -81,9 +81,10 @@ def test_overlay_installs_whitelisted_skills_only(fake_home, tmp_path):
     assert (cfg.stat().st_mode & 0o777) == 0o600
     assert (overlay.stat().st_mode & 0o777) == 0o700
     assert (overlay / "sessions").is_dir()
-    # skill files are 0600
+    # skill files are 0600 and NON-whitelisted files are dropped
     for skill in ALLOWED_SKILLS:
         assert (overlay / "skills" / skill / "SKILL.md").stat().st_mode & 0o777 == 0o600
+        assert not (overlay / "skills" / skill / "secret.toml").exists()
 
 
 def test_overlay_env_whitelist(fake_home, tmp_path, monkeypatch):

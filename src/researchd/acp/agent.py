@@ -124,22 +124,25 @@ class AcpServer:
 
     @staticmethod
     def _resolve_identity(config: dict) -> dict:
-        """Identity precedence: explicit sessionConfig > cc-connect env
-        injection (CC_PROJECT/CC_SESSION_KEY/CC_USER_ID)."""
+        """Identity is ATOMIC: either the caller provides all three fields in
+        sessionConfig, or all three come from the cc-connect env injection
+        (CC_PROJECT/CC_SESSION_KEY/CC_USER_ID). Mixing (e.g. overriding only
+        cc_user_id while inheriting the env project) is rejected so an
+        identity can never be half-spoofed."""
         import os
 
-        def _pick(config_key: str, env_key: str) -> str | None:
-            value = config.get(config_key)
-            if value:
-                return str(value)
-            env_value = os.environ.get(env_key)
-            return env_value if env_value else None
-
-        return {
-            "cc_project": _pick("cc_project", "CC_PROJECT"),
-            "cc_session_key": _pick("cc_session_key", "CC_SESSION_KEY"),
-            "cc_user_id": _pick("cc_user_id", "CC_USER_ID"),
+        configured = {k: config.get(k) for k in ("cc_project", "cc_session_key", "cc_user_id")}
+        provided = [v for v in configured.values() if v]
+        if provided:
+            if len(provided) != 3:
+                return {"cc_project": None, "cc_session_key": None, "cc_user_id": None}
+            return {k: str(v) for k, v in configured.items()}
+        env = {
+            "cc_project": os.environ.get("CC_PROJECT"),
+            "cc_session_key": os.environ.get("CC_SESSION_KEY"),
+            "cc_user_id": os.environ.get("CC_USER_ID"),
         }
+        return {k: (v if v else None) for k, v in env.items()}
 
     async def _session_prompt(self, params: dict) -> dict:
         session_id = params.get("sessionId")

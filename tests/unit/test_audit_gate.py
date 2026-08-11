@@ -16,10 +16,15 @@ from researchd.persistence.transaction import UnitOfWork
 from researchd.domain.enums import EvidenceStatus, TaskStatus
 
 
-def make_env(factory, *, criteria="PASS", evidence_candidates=None):
+def make_env(factory, tmp_path, *, criteria="PASS", evidence_candidates=None):
     from researchd.application.apply_result import apply_work_result
+    from researchd.domain.project import Project
+    from researchd.persistence.repositories import ProjectRepo
 
     with UnitOfWork(factory) as uow:
+        ws = tmp_path / "ws-aud"
+        ws.mkdir()
+        ProjectRepo(uow.session).save(Project(project_id="P-AUD", name="aud", description="d", workspace_root=str(ws)))
         task = Task(
             task_id="T-AUD-1",
             project_id="P-AUD",
@@ -42,12 +47,15 @@ def make_env(factory, *, criteria="PASS", evidence_candidates=None):
             artifacts=[
                 {"local_ref": "A-1", "kind": "document", "path": "out/r.json", "description": "d"}
             ],
+
             evidence_candidates=evidence_candidates or [],
             claim_changes=[],
             issues=[],
             decision_candidates=[],
             next_task_proposals=[],
         )
+        (ws / "out").mkdir(parents=True, exist_ok=True)
+        (ws / "out" / "r.json").write_text("{}")
         work_run = Run(
             run_id="R-WORK",
             task_id="T-AUD-1",
@@ -87,8 +95,8 @@ def _audit_run(factory, *, verdict="ACCEPT", revision=None) -> Run:
     return run, result
 
 
-def test_accept_completes_task_and_verifies_literature_evidence(factory):
-    make_env(factory, evidence_candidates=[
+def test_accept_completes_task_and_verifies_literature_evidence(factory, tmp_path):
+    make_env(factory, tmp_path, evidence_candidates=[
         {"local_ref": "E-1", "type": "literature", "statement": "文献支持",
          "literature": {"source_id": "doi:10.1/x"}},
     ])
@@ -103,10 +111,10 @@ def test_accept_completes_task_and_verifies_literature_evidence(factory):
         assert ev.status is EvidenceStatus.VERIFIED
 
 
-def test_accept_without_provenance_keeps_candidate(factory):
+def test_accept_without_provenance_keeps_candidate(factory, tmp_path):
     """Auditor opinion is necessary but NOT sufficient: real provenance is a
     hard gate, so a candidate whose artifact does not exist stays CANDIDATE."""
-    make_env(factory, evidence_candidates=[
+    make_env(factory, tmp_path, evidence_candidates=[
         {"local_ref": "E-1", "type": "human", "statement": "PI 陈述"},
     ])
     run, result = _audit_run(factory, verdict="ACCEPT")
@@ -119,8 +127,8 @@ def test_accept_without_provenance_keeps_candidate(factory):
         assert ev.status is EvidenceStatus.CANDIDATE
 
 
-def test_revise_requeues_task(factory):
-    make_env(factory)
+def test_revise_requeues_task(factory, tmp_path):
+    make_env(factory, tmp_path)
     run, result = _audit_run(factory, verdict="REVISE", revision={"note": "需要补充方法"})
     with UnitOfWork(factory) as uow:
         counts = apply_audit_result(uow.session, run, TaskRepo(uow.session).get_by_task_id("T-AUD-1"), result)
@@ -131,8 +139,8 @@ def test_revise_requeues_task(factory):
         assert "需要补充方法" in (task.error_message or "")
 
 
-def test_reject_fails_task(factory):
-    make_env(factory)
+def test_reject_fails_task(factory, tmp_path):
+    make_env(factory, tmp_path)
     run, result = _audit_run(factory, verdict="REJECT", revision={"note": "不可接受"})
     with UnitOfWork(factory) as uow:
         counts = apply_audit_result(uow.session, run, TaskRepo(uow.session).get_by_task_id("T-AUD-1"), result)
@@ -142,8 +150,8 @@ def test_reject_fails_task(factory):
         assert task.status is TaskStatus.FAILED
 
 
-def test_apply_is_idempotent(factory):
-    make_env(factory, evidence_candidates=[
+def test_apply_is_idempotent(factory, tmp_path):
+    make_env(factory, tmp_path, evidence_candidates=[
         {"local_ref": "E-1", "type": "literature", "statement": "s",
          "literature": {"source_id": "doi:10.1/x"}},
     ])
@@ -163,8 +171,8 @@ def test_apply_is_idempotent(factory):
         assert len(evs) == 1
 
 
-def test_accept_requires_all_criteria_pass(factory):
-    make_env(factory, criteria="FAIL")
+def test_accept_requires_all_criteria_pass(factory, tmp_path):
+    make_env(factory, tmp_path, criteria="FAIL")
     run, result = _audit_run(factory)
     with UnitOfWork(factory) as uow:
         counts = apply_audit_result(uow.session, run, TaskRepo(uow.session).get_by_task_id("T-AUD-1"), result)
@@ -173,13 +181,13 @@ def test_accept_requires_all_criteria_pass(factory):
         assert TaskRepo(uow.session).get_by_task_id("T-AUD-1").status is TaskStatus.FAILED
 
 
-def test_audit_crash_recovery_reviews_again_not_completes(factory):
+def test_audit_crash_recovery_reviews_again_not_completes(factory, tmp_path):
     """A crashed audit run (RUNNING, no heartbeat) leaves the task REVIEW;
     reconciliation orphans the run and the next tick re-audits — never an
     implicit COMPLETE."""
     from researchd.scheduler.dispatch import reconcile_orphans
 
-    make_env(factory)
+    make_env(factory, tmp_path)
     run, _result = _audit_run(factory)  # audit run created but never applied
     with UnitOfWork(factory) as uow:
         # simulate crash: stale heartbeat

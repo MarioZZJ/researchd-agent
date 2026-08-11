@@ -668,6 +668,8 @@ class ContextPackageRepo(BaseRepo):
     row_cls = ContextPackageRow
 
     def _to_row(self, p) -> ContextPackageRow:  # noqa: ANN001
+        meta = dict(p.metadata or {})
+        meta.update({"role": p.role, "run_id": p.run_id, "content": p.content})
         return ContextPackageRow(
             id=p.id,
             context_id=p.context_id,
@@ -682,13 +684,14 @@ class ContextPackageRepo(BaseRepo):
             created_at=p.created_at,
             updated_at=p.updated_at,
             status=p.role,
-            metadata_json={"role": p.role, "run_id": p.run_id, "content": p.content},
+            metadata_json=meta,
         )
 
     def _to_domain(self, row: ContextPackageRow):
         from ..domain.context import ContextObjectRef, ContextPackage
 
-        meta = row.metadata_json or {}
+        meta = dict(row.metadata_json or {})
+        pkg_meta = {k: v for k, v in meta.items() if k not in ("role", "run_id", "content")}
         return ContextPackage(
             id=row.id,
             context_id=row.context_id,
@@ -705,6 +708,7 @@ class ContextPackageRepo(BaseRepo):
             created_by=row.created_by,
             created_at=row.created_at,
             updated_at=row.updated_at,
+            metadata=pkg_meta,
         )
 
     def get_by_context_id(self, context_id: str):

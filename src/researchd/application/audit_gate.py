@@ -70,36 +70,56 @@ def apply_audit_result(session: Session, audit_run, task, result: AuditResult) -
     worker_result = worker_run.result or {}
 
     if verdict in ("ACCEPT",):
-        # 1. evidence: re-check provenance against REAL persisted rows; only
-        #    then VERIFY. Missing provenance keeps the row CANDIDATE.
-        for ev in EvidenceRepo(session).list_by_project(worker_run.project_id):
-            if ev.run_id != worker_run.run_id or ev.status.value != "CANDIDATE":
-                continue
-            try:
-                from ..application.evidence_validation import verify_evidence
-
-                ev = verify_evidence(session, ev)
-                EvidenceRepo(session).save(ev)
-                counts["verified_evidence"] += 1
-            except Exception as exc:  # noqa: BLE001  provenance gate, not audit opinion
-                logger.warning(
-                    "evidence %s stays CANDIDATE after audit ACCEPT: %s", ev.evidence_id, exc
-                )
-        # 2. task completion: ALL success criteria must PASS
-        criteria = worker_result.get("criteria_results", [])
-        results = {c.get("criterion_id"): c.get("status") for c in criteria}
-        required = {sc.id for sc in task.contract.success_criteria}
-        all_pass = bool(required) and all(results.get(cid) == "PASS" for cid in required)
-        if not all_pass:
-            # auditor accepted but the work itself did not meet the criteria:
-            # FAIL (never COMPLETE, never an infinite requeue loop)
-            task.fail("auditor ACCEPT but success criteria not all PASS")
+        # 0. auditor checks must all PASS — an ACCEPT with a FAIL check is
+        #    NOT an accept (the worker's criteria self-report is never
+        #    trusted over the auditor's checks)
+        checks = result.checks or []
+        if any(c.status == "FAIL" for c in checks):
+            task.requeue(reason="auditor ACCEPT but check FAIL: " + str(next(c.summary for c in checks if c.status == "FAIL"))[:200])
             TaskRepo(session).save(task)
-            counts["rejected"] += 1
+            counts["revised"] += 1
         else:
-            task.complete(criteria)
-            TaskRepo(session).save(task)
-            counts["completed"] += 1
+            # 1. evidence: per-candidate verdicts from evidence_status_changes
+            #    (explicit list), else ACCEPT implies VERIFY-when-provenance
+            wanted = {
+                c.evidence_id: c.to_status
+                for c in (result.evidence_status_changes or [])
+            }
+            explicit = bool(wanted)
+            for ev in EvidenceRepo(session).list_by_project(worker_run.project_id):
+                if ev.run_id != worker_run.run_id or ev.status.value != "CANDIDATE":
+                    continue
+                target = wanted.get(ev.evidence_id)
+                if target == "VERIFIED" or (not explicit and target is None):
+                    try:
+                        from ..application.evidence_validation import verify_evidence
+
+                        ev = verify_evidence(session, ev)
+                        EvidenceRepo(session).save(ev)
+                        counts["verified_evidence"] += 1
+                    except Exception as exc:  # noqa: BLE001  provenance gate
+                        logger.warning(
+                            "evidence %s stays CANDIDATE after audit ACCEPT: %s", ev.evidence_id, exc
+                        )
+                elif target in ("CONTESTED", "INVALID", "SUPERSEDED"):
+                    ev.transition(target)
+                    EvidenceRepo(session).save(ev)
+                # no explicit verdict -> stays CANDIDATE (not verified)
+            # 2. task completion: ALL success criteria must PASS
+            criteria = worker_result.get("criteria_results", [])
+            results = {c.get("criterion_id"): c.get("status") for c in criteria}
+            required = {sc.id for sc in task.contract.success_criteria}
+            all_pass = bool(required) and all(results.get(cid) == "PASS" for cid in required)
+            if not all_pass:
+                # auditor accepted but the work itself did not meet the criteria:
+                # FAIL (never COMPLETE, never an infinite requeue loop)
+                task.fail("auditor ACCEPT but success criteria not all PASS")
+                TaskRepo(session).save(task)
+                counts["rejected"] += 1
+            else:
+                task.complete(criteria)
+                TaskRepo(session).save(task)
+                counts["completed"] += 1
     elif verdict in ("REVISE",):
         reason = "auditor REVISE"
         if result.revision_request:
