@@ -200,13 +200,17 @@ class StdioReasonixTransport(ReasonixTransport):
             self._stderr_task = asyncio.create_task(self._drain_stderr())
 
     async def _drain_stderr(self) -> None:
-        """Drain stderr so the pipe never blocks the child; log at debug."""
+        """Drain stderr so the pipe never blocks the child. Content is NEVER
+        logged (raw executor stderr may carry prompts/secrets): only a line
+        count is recorded at debug."""
         assert self._proc is not None
+        count = 0
         while True:
             line = await self._proc.stderr.readline()
             if not line:
                 break
-            logger.debug("reasonix stderr: %s", line.decode("utf-8", errors="replace").rstrip())
+            count += 1
+        logger.debug("reasonix stderr drained: %d line(s), content withheld", count)
 
     async def _read_loop(self) -> None:
         assert self._reader is not None
@@ -268,7 +272,10 @@ class StdioReasonixTransport(ReasonixTransport):
             self._pending.pop(mid, None)
             raise
         if "error" in resp:
-            raise TransportError(f"reasonix acp {method}: {resp['error']}")
+            # error CODE only — the raw ACP error body may echo model output,
+            # prompts, or secrets and must never reach logs
+            code = resp["error"].get("code") if isinstance(resp["error"], dict) else None
+            raise TransportError(f"reasonix acp {method}: error code {code}")
         return resp.get("result", {})
 
     # ------------------------------------------------------------ protocol
