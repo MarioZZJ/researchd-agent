@@ -210,6 +210,46 @@ def check_membership(project_id: str, user_id: str, uow: UnitOfWork = Depends(ge
     raise HTTPException(status_code=403, detail="not a member")
 
 
+class ProjectMemberRequest(BaseModel):
+    platform_user_id: str = Field(min_length=1, max_length=128)
+    role: str = "member"  # member | pi
+    can_approve_decisions: bool = False
+
+
+@router.post("/projects/{project_id}/members", dependencies=[Depends(require_token)])
+def add_member(project_id: str, req: ProjectMemberRequest, uow: UnitOfWork = Depends(get_uow)) -> dict:
+    """Provision a project member (idempotent). The only writer path for
+    membership besides project creation (fail-closed gate §22)."""
+    from sqlalchemy import select
+
+    from ...persistence.models import ProjectMemberRow
+
+    if not _PROJECT_ID_RE.fullmatch(project_id):
+        raise HTTPException(status_code=400, detail="bad project_id")
+    project = ProjectRepo(uow.session).get_by_project_id(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f"project {project_id!r} not found")
+    existing = uow.session.execute(
+        select(ProjectMemberRow).where(
+            ProjectMemberRow.project_id == project_id,
+            ProjectMemberRow.platform_user_id == req.platform_user_id,
+        )
+    ).scalars().first()
+    if existing is not None:
+        return {"project_id": project_id, "platform_user_id": req.platform_user_id, "added": False}
+    uow.session.add(
+        ProjectMemberRow(
+            id=f"PM-{project_id}-{req.platform_user_id[:24]}",
+            member_id=f"PM-{project_id}-{req.platform_user_id[:24]}",
+            project_id=project_id,
+            platform_user_id=req.platform_user_id,
+            role=req.role,
+            can_approve_decisions=req.can_approve_decisions,
+        )
+    )
+    return {"project_id": project_id, "platform_user_id": req.platform_user_id, "added": True}
+
+
 @router.get("/projects/{project_id}/status", dependencies=[Depends(require_token)])
 def project_status(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
     project = _get_project(uow, project_id)

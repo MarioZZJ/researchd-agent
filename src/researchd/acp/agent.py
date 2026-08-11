@@ -169,22 +169,25 @@ class AcpServer:
         reply = await process_prompt(self.settings, session, prompt, message_id=message_id)
         # cc-connect's ACP client aggregates reply text from the
         # session/update notification stream (agent_message_chunk) — the
-        # synchronous response body is ignored for text. Send the update
-        # BEFORE returning so the engine gets the text.
+        # synchronous response body is ignored for text. The notification
+        # MUST be written BEFORE the synchronous response returns, otherwise
+        # the engine finishes the turn (EventResult) and the late EventText
+        # is dropped. `notify` is awaited here; stdio writer serializes.
         if self._notify is not None:
-            self._notify(
-                {
-                    "jsonrpc": "2.0",
-                    "method": "session/update",
-                    "params": {
-                        "sessionId": session.session_id,
-                        "update": {
-                            "sessionUpdate": "agent_message_chunk",
-                            "content": {"type": "text", "text": reply.text},
-                        },
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session.session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": reply.text},
                     },
-                }
-            )
+                },
+            }
+            result = self._notify(payload)
+            if asyncio.iscoroutine(result):
+                await result
         # keep a minimal synchronous result for spec compliance
         return {
             "sessionId": session.session_id,
@@ -218,9 +221,10 @@ async def run_acp_stdio(settings: Settings) -> None:
             writer.write((json.dumps(obj) + "\n").encode())
             await writer.drain()
 
-    def _notify(obj: dict) -> None:
-        # called from _session_prompt (same event loop): schedule the write
-        asyncio.ensure_future(_write_line(obj))
+    def _notify(obj: dict):
+        # called from _session_prompt (same event loop); awaited by the
+        # caller so the update is written BEFORE the synchronous response
+        return _write_line(obj)
 
     server = AcpServer(settings, notify=_notify)
 
