@@ -168,9 +168,17 @@ async def _drive_with_timeout(env, ex, run_id, task_id):
 
 
 def test_scheduler_dispatch_and_collect(env):
-    """End-to-end through the loop: READY task -> RUNNING -> REVIEW, and the
-    outbox delivers a scheduled message exactly once."""
+    """End-to-end through the loop: READY task -> RUNNING -> REVIEW -> auditor
+    ACCEPT -> COMPLETED, and the outbox delivers a scheduled message exactly once."""
     ex = FakeExecutor()
+    ex.script("worker", {"payload": {
+        "schema": "researchd.work_result.v1",
+        "task_id": "T-001",
+        "outcome": "SUBMIT_FOR_REVIEW",
+        "criteria_results": [{"criterion_id": "SC-1", "status": "PASS"}],
+        "artifacts": [], "evidence_candidates": [], "claim_changes": [],
+        "issues": [], "decision_candidates": [], "next_task_proposals": [],
+    }})
     port = FakeDeliveryPort()
     with UnitOfWork(env["factory"]) as uow:
         t = make_task(status="READY")
@@ -185,7 +193,7 @@ def test_scheduler_dispatch_and_collect(env):
     loop = SchedulerLoop(settings, env["factory"], ex, port, max_parallel=4)
 
     async def run_ticks():
-        for _ in range(6):
+        for _ in range(8):
             await loop.tick()
             await asyncio.sleep(0.05)
     asyncio.run(run_ticks())
@@ -193,7 +201,8 @@ def test_scheduler_dispatch_and_collect(env):
     with UnitOfWork(env["factory"]) as uow:
         task = TaskRepo(uow.session).get_by_task_id("T-001")
         runs = RunRepo(uow.session).list_active()
-        assert task.status.value == "REVIEW"
+        # independent auditor accepted -> task COMPLETED (never RUNNING->COMPLETED)
+        assert task.status.value == "COMPLETED"
         assert len(port.deliveries) == 1
         assert port.deliveries[0]["idempotency_key"] == "out-1"
         # a second round of ticks does NOT redeliver (idempotent)
@@ -245,6 +254,14 @@ def test_blocked_task_not_dispatched(env):
     from researchd.persistence.repositories import DecisionRepo
 
     ex = FakeExecutor()
+    ex.script("worker", {"payload": {
+        "schema": "researchd.work_result.v1",
+        "task_id": "T-001",
+        "outcome": "SUBMIT_FOR_REVIEW",
+        "criteria_results": [{"criterion_id": "SC-1", "status": "PASS"}],
+        "artifacts": [], "evidence_candidates": [], "claim_changes": [],
+        "issues": [], "decision_candidates": [], "next_task_proposals": [],
+    }})
     with UnitOfWork(env["factory"]) as uow:
         t = make_task(status="READY", blocked_by=["D-002"])
         TaskRepo(uow.session).save(t)
@@ -262,7 +279,7 @@ def test_blocked_task_not_dispatched(env):
     asyncio.run(loop.tick())
     with UnitOfWork(env["factory"]) as uow:
         assert TaskRepo(uow.session).get_by_task_id("T-001").status.value == "READY"  # still READY
-    # close the decision -> next tick dispatches and completes
+    # close the decision -> next tick dispatches, audits, and completes
     with UnitOfWork(env["factory"]) as uow:
         d = DecisionRepo(uow.session).get_by_decision_id("D-002")
         d.apply_answer("A", "pi")
@@ -274,4 +291,4 @@ def test_blocked_task_not_dispatched(env):
             await asyncio.sleep(0.05)
     asyncio.run(wait_ticks())
     with UnitOfWork(env["factory"]) as uow:
-        assert TaskRepo(uow.session).get_by_task_id("T-001").status.value == "REVIEW"
+        assert TaskRepo(uow.session).get_by_task_id("T-001").status.value == "COMPLETED"

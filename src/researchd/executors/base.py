@@ -58,6 +58,7 @@ class EvidenceCandidate(BaseModel):
     artifact_refs: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     literature: dict | None = None
+    computational: dict | None = None
 
 
 class ClaimChange(BaseModel):

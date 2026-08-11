@@ -83,6 +83,10 @@ EVENT_TYPES = {
     "taste_rule.applied",
     "milestone.reached",
     "result.applied",
+    "audit.accepted",
+    "audit.revised",
+    "audit.blocked",
+    "audit.rejected",
     "diagnostic.giveup",
 }
 

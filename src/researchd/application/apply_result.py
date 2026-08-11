@@ -26,6 +26,7 @@ from ..domain.evidence import (
     Artifact,
     Claim,
     ClaimEvidenceLink,
+    ComputationalProvenance,
     Evidence,
     Issue,
     LiteratureProvenance,
@@ -144,7 +145,10 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
         )
         counts["artifacts"] += 1
 
-    # 2. evidence candidates -> Evidence with the unified verification gate
+    # 2. evidence candidates -> CANDIDATE rows ONLY. VERIFIED is reached
+    #    exclusively through the auditor gate (apply_audit_result) after an
+    #    independent auditor ACCEPTs the run — free-text worker judgment can
+    #    never claim VERIFIED, and provenance is re-checked at audit time.
     for cand in result.evidence_candidates:
         evidence_id = cand.local_ref
         if EvidenceRepo(session).get_by_evidence_id(evidence_id):
@@ -154,6 +158,17 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
             lit = LiteratureProvenance(
                 source_id=cand.literature.get("source_id") or cand.literature.get("doi") or "unknown",
                 locator=cand.literature.get("locator") or cand.literature.get("url"),
+            )
+        comp = None
+        if cand.computational and cand.artifact_refs:
+            comp = ComputationalProvenance(
+                run_id=run.run_id,
+                artifact_id=cand.artifact_refs[0],
+                code_commit=cand.computational.get("code_commit"),
+                data_snapshot=cand.computational.get("data_snapshot"),
+                statistics=cand.computational.get("statistics") or {},
+                uncertainty=cand.computational.get("uncertainty") or {},
+                interpretation_limits=cand.computational.get("interpretation_limits") or [],
             )
         evidence = Evidence(
             evidence_id=evidence_id,
@@ -165,19 +180,11 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
             run_id=run.run_id,
             artifact_refs=cand.artifact_refs,
             literature=lit,
+            computational=comp,
             limitations=cand.limitations,
         )
-        # unified verification: only real, type-matching provenance may VERIFY
-        try:
-            from ..application.evidence_validation import verify_evidence
-
-            evidence = verify_evidence(session, evidence)
-        except Exception as exc:  # noqa: BLE001  provenance missing -> stays CANDIDATE
-            logger.debug("evidence %s stays CANDIDATE: %s", evidence_id, exc)
         EvidenceRepo(session).save(evidence)
         counts["evidence"] += 1
-        if evidence.status.value == "VERIFIED":
-            counts["verified_evidence"] += 1
 
     # 3. claim changes (upsert, project-scoped, evidence links persisted)
     for change in result.claim_changes:

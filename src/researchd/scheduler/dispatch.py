@@ -154,6 +154,66 @@ class RunDispatcher:
         if run.lease_token:
             LeaseRepo(self.session).heartbeat(run.lease_token)
 
+    # ------------------------------------------------------------ auditor
+    def dispatch_audit_run(self, task: Task, *, profile: dict | None = None, worker_run_id: str | None = None) -> Run | None:
+        """Create an auditor Run for a REVIEW task. The task STAYS REVIEW
+        (REVIEW -> RUNNING is illegal); the lease serializes audits so a
+        crashed/replayed audit can never double-run. Returns None when the
+        lease is contended (an audit for this task is already in flight)."""
+        run = Run(
+            run_id=new_id("run"),
+            task_id=task.task_id,
+            project_id=task.project_id,
+            executor=self.executor.name,
+            executor_profile=(profile or {}).get("name"),
+            resolved_model=(profile or {}).get("model"),
+            reasoning_effort=(profile or {}).get("reasoning_effort"),
+            configuration_source=(profile or {}).get("source") or "scheduler",
+            process_instance_id=(profile or {}).get("process_instance_id"),
+            lease_token=None,
+            metadata={"role": "auditor", "worker_run_id": worker_run_id or task.current_run_id},
+        )
+        run.transition(RunStatus.STARTING)
+        RunRepo(self.session).save(run)
+        self.session.flush()
+        token = LeaseRepo(self.session).acquire(
+            project_id=task.project_id,
+            task_id=task.task_id,
+            run_id=run.run_id,
+            owner=f"auditor:{self.executor.name}",
+        )
+        if token is None:
+            return None
+        run.lease_token = token
+        run.transition(RunStatus.RUNNING)
+        RunRepo(self.session).save(run)
+        self._emit("run.running", run, {"task_id": task.task_id, "role": "auditor"})
+        return run
+
+    def collect_audit(self, run: Run, result: Any, session_info: ExecutorSessionInfo) -> None:
+        """Apply an auditor verdict in the SAME transaction as run success."""
+        run.result = result.model_dump()
+        run.session_id = session_info.session_id
+        run.turn_id = session_info.turn_id
+        outcome = result.verdict.value if hasattr(result.verdict, "value") else str(result.verdict)
+        run.outcome = outcome
+        run.transition(RunStatus.SUCCEEDED)
+        RunRepo(self.session).save(run)
+        LeaseRepo(self.session).release(run.lease_token)
+        task = TaskRepo(self.session).get_by_task_id(run.task_id)
+        if task is None:
+            raise RuntimeError(f"task {run.task_id!r} missing for audit run {run.run_id}")
+        from ..application.audit_gate import apply_audit_result
+
+        counts = apply_audit_result(self.session, run, task, result)
+        self._emit("run.succeeded", run, {"task_id": task.task_id, "verdict": outcome})
+        if counts.get("completed"):
+            self._emit("task.completed", task, {"audit_run_id": run.run_id})
+        elif counts.get("revised") or counts.get("blocked"):
+            self._emit("task.ready", task, {"audit_run_id": run.run_id, "verdict": outcome})
+        elif counts.get("rejected"):
+            self._emit("task.failed", task, {"audit_run_id": run.run_id})
+
     # ------------------------------------------------------------ events
     def _emit(self, event_type: str, obj: Any, payload: dict | None = None) -> None:
         EventRepo(self.session).append(

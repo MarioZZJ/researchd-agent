@@ -107,6 +107,9 @@ class SchedulerLoop:
         )
         # 2d. milestones: verified-evidence threshold reached -> one report
         stats["milestones"] = check_milestones(self.session_factory)
+        # 2e. auditor: REVIEW tasks get an independent auditor run; ACCEPT
+        #     completes the task, REVISE sends it back to READY
+        stats["audited"] = await self._audit_review_tasks()
         # 3. reporting: emit queued reports for active projects
         stats["reports"] = await self._report_projects()
         # 4. project document projection (incremental, PI Notes protected)
@@ -392,6 +395,29 @@ class SchedulerLoop:
                 slots -= 1
         return dispatched
 
+    async def _audit_review_tasks(self) -> int:
+        """Dispatch an independent auditor run for every REVIEW task without a
+        live audit run (the task-level lease deduplicates crashes/restarts)."""
+        dispatched = 0
+        with self.session_factory() as session:
+            tasks = TaskRepo(session).list_by_status(None, [TaskStatus.REVIEW.value])
+            for task in tasks:
+                if task.task_id in self.active:
+                    continue
+                slots = self.max_parallel - len(self.active)
+                if slots <= 0:
+                    break
+                dispatcher = RunDispatcher(session, self.executor)
+                profile = self._resolve_profile(session, task, role="auditor")
+                run = dispatcher.dispatch_audit_run(task, profile=profile)
+                if run is None:
+                    continue
+                session.commit()
+                handle = asyncio.create_task(self._drive_run(run.run_id, run.task_id, role="auditor"))
+                self.active[task.task_id] = ActiveRun(run_id=run.run_id, task_id=run.task_id, task=task, task_handle=handle)
+                dispatched += 1
+        return dispatched
+
     def _open_blocking_scope(self, session) -> set:  # noqa: ANN001
         """Union of blocking_scope across OPEN decisions (IMPLEMENTATION.md §8:
         only blocking_scope pauses tasks)."""
@@ -403,15 +429,18 @@ class SchedulerLoop:
                 blocked.update(d.blocking_scope)
         return blocked
 
-    def _resolve_profile(self, session, task) -> dict:  # noqa: ANN001
+    def _resolve_profile(self, session, task, *, role: str | None = None) -> dict:  # noqa: ANN001
         """Resolve the executor profile for a task (IMPLEMENTATION.md §15.1):
         explicit contract profile > project role override > role default."""
         from ..persistence.repositories import ProjectRepo
 
         name = task.contract.executor_profile
         source = "contract"
-        role = task.contract.role.value if hasattr(task.contract.role, "value") else str(task.contract.role)
-        if not name:
+        role = role or (task.contract.role.value if hasattr(task.contract.role, "value") else str(task.contract.role))
+        if not name and role != "auditor":
+            # the auditor is NEVER the worker's own profile: an explicit
+            # auditor contract profile wins, then the project override, then
+            # the role default (auditor). Independent reviewer by construction.
             project = ProjectRepo(session).get_by_project_id(task.project_id)
             name = (project.policy.role_overrides or {}).get(role) if project else None
             source = "project_role_override" if name else "default"
@@ -464,14 +493,14 @@ class SchedulerLoop:
         return n
 
     # ------------------------------------------------------------ drive
-    async def _drive_run(self, run_id: str, task_id: str) -> None:
+    async def _drive_run(self, run_id: str, task_id: str, *, role: str = "worker") -> None:
         """Execute one run with budget enforcement; heartbeat + lease renewal."""
         async with self._dispatch_sem:
             profile = await self._run_profile(run_id)
             budget = await self._run_budget(task_id)
             try:
                 async with asyncio.timeout(budget):
-                    await self._execute_with_heartbeat(run_id, profile)
+                    await self._execute_with_heartbeat(run_id, profile, role=role)
             except TimeoutError:
                 await self._collect_interrupt(run_id, "budget exceeded")
             except asyncio.CancelledError:
@@ -500,7 +529,7 @@ class SchedulerLoop:
                 return 300.0
             return float(task.contract.budget.max_wall_seconds or 300.0)
 
-    async def _execute_with_heartbeat(self, run_id: str, profile: dict) -> None:
+    async def _execute_with_heartbeat(self, run_id: str, profile: dict, *, role: str = "worker") -> None:
         """Run the executor turn, refreshing heartbeat every HEARTBEAT_SECONDS."""
         heartbeat_task = asyncio.create_task(self._heartbeat_loop(run_id))
         try:
@@ -513,11 +542,12 @@ class SchedulerLoop:
                 # saw is recorded before any model call happens.
                 from ..application.context_package import ContextPackageBuilder
 
-                pkg = ContextPackageBuilder(session).worker(task, run=run)
-                ContextPackageBuilder(session).persist(pkg)
-                context = ContextPackageBuilder(session).to_context_dict(
-                    pkg, objective=task.contract.objective
-                )
+                builder = ContextPackageBuilder(session)
+                if role == "auditor":
+                    pkg = builder.persist(builder.auditor(task, run))
+                else:
+                    pkg = builder.persist(builder.worker(task, run=run))
+                context = builder.to_context_dict(pkg, objective=task.contract.objective)
                 session.commit()
             # record the executor session id as soon as it exists (recovery)
             def _on_session(sid: str) -> None:
@@ -531,10 +561,17 @@ class SchedulerLoop:
             hook = getattr(self.executor, "on_session_started", None)
             if hook is not None:
                 hook(_on_session)
-            result, session_info = await self.executor.run_worker(context, profile=profile)
+            if role == "auditor":
+                result, session_info = await self.executor.run_auditor(context, profile=profile)
+            else:
+                result, session_info = await self.executor.run_worker(context, profile=profile)
             with self.session_factory() as session:
                 run = RunRepo(session).get_by_run_id(run_id)
-                RunDispatcher(session, self.executor).collect_success(run, result, session_info)
+                dispatcher = RunDispatcher(session, self.executor)
+                if role == "auditor":
+                    dispatcher.collect_audit(run, result, session_info)
+                else:
+                    dispatcher.collect_success(run, result, session_info)
                 session.commit()
         finally:
             heartbeat_task.cancel()
