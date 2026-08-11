@@ -75,6 +75,12 @@ class FakeExecutor(ExecutorAdapter):
             step = ScriptStep(**step)
         self._scripts.setdefault(role, []).append(step)
 
+    def call_count(self, role: RoleKind | None = None) -> int:
+        """Total executor turn calls (all roles, or one role)."""
+        if role is not None:
+            return self._calls.get(role, 0)
+        return sum(self._calls.values())
+
     def _next(self, role: RoleKind, task_id: str | None = None) -> ScriptStep | None:
         """Next unused step for this role: prefer a step bound to task_id,
         else the next unbound step. Each call bumps the per-role call count

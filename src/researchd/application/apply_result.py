@@ -132,18 +132,8 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
                 ),
             )
             path = str(registered.path)
-        ArtifactRepo(session).save(
-            Artifact(
-                artifact_id=artifact_id,
-                project_id=project_id,
-                task_id=run.task_id,
-                run_id=run.run_id,
-                kind=art.kind,
-                path=path,
-                description=art.description,
-            )
-        )
-        counts["artifacts"] += 1
+            counts["artifacts"] += 1
+            continue
 
     # 2. evidence candidates -> CANDIDATE rows ONLY. VERIFIED is reached
     #    exclusively through the auditor gate (apply_audit_result) after an

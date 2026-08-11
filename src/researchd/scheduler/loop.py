@@ -231,13 +231,20 @@ class SchedulerLoop:
                     # diagnostic): mark so stale candidates are never re-scanned
                     evaluated.append(row.id)
             # mark evaluated runs (so stale candidates are never re-scanned)
+            # JSON-merge, never overwrite: metadata carries role/skills/context_id
             if evaluated:
                 from sqlalchemy import update as sa_update
 
                 session.execute(
                     sa_update(RunRow)
                     .where(RunRow.id.in_(evaluated))
-                    .values(metadata_json={"decisions_evaluated": True})
+                    .values(
+                        metadata_json=func.json_set(
+                            func.ifnull(RunRow.metadata_json, "{}"),
+                            "$.decisions_evaluated",
+                            1,
+                        )
+                    )
                     .execution_options(synchronize_session=False)
                 )
             # block the scope of OPEN decisions (only blocking_scope)
