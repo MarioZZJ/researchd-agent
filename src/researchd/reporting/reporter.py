@@ -78,11 +78,41 @@ def build_spec_from_snapshot(session, snapshot: StateSnapshot, reasons: list[str
             project_id=project_id,
             type=ReportType.EVIDENCE,
             title="研究进展",
-            bottom_line=f"新增 {len(snapshot.verified_evidence_ids)} 条已验证证据",
+            bottom_line=_evidence_bottom_line(session, snapshot.verified_evidence_ids),
             bottom_line_evidence_refs=snapshot.verified_evidence_ids[-5:],
-            active_actions=[],
+            active_actions=_active_task_actions(session, project_id),
         )
     return None
+
+
+def _evidence_bottom_line(session, evidence_ids: list[str]) -> str:  # noqa: ANN001
+    """Bottom line that cites each new evidence by id + clipped statement
+    (never a bare count — the report must reference what actually changed)."""
+    parts = []
+    for eid in evidence_ids[:5]:
+        ev = EvidenceRepo(session).get_by_evidence_id(eid)
+        if ev is None:
+            continue
+        statement = (ev.statement or "").strip().replace("\n", " ")
+        parts.append(f"{eid}「{statement[:40]}」")
+    if not parts:
+        return f"新增 {len(evidence_ids)} 条已验证证据"
+    return "新增已验证证据：" + "；".join(parts)
+
+
+def _active_task_actions(session, project_id: str) -> list[ReportAction]:  # noqa: ANN001
+    """Current actions must reference REAL tasks (READY/RUNNING), never
+    generic "下一步继续深入" filler."""
+    from ..domain.enums import TaskStatus
+
+    actions = []
+    for t in TaskRepo(session).list_by_status(project_id, []):
+        if t.status.value not in (TaskStatus.READY.value, TaskStatus.RUNNING.value):
+            continue
+        actions.append(
+            ReportAction(task_id=t.task_id, text=f"进行中：{t.contract.objective[:60]}")
+        )
+    return actions[:10]
 
 
 async def schedule_report(session_factory, *, project_id: str) -> ReporterResult:
@@ -236,9 +266,9 @@ def _specs_for_snapshot(session, snapshot: StateSnapshot, new_decisions: set[str
                     project_id=project_id,
                     type=ReportType.EVIDENCE,
                     title="研究进展",
-                    bottom_line=f"新增 {len(snapshot.verified_evidence_ids)} 条已验证证据",
+                    bottom_line=_evidence_bottom_line(session, snapshot.verified_evidence_ids),
                     bottom_line_evidence_refs=snapshot.verified_evidence_ids[-5:],
-                    active_actions=[],
+                    active_actions=_active_task_actions(session, project_id),
                 )
             )
         return specs
@@ -248,9 +278,9 @@ def _specs_for_snapshot(session, snapshot: StateSnapshot, new_decisions: set[str
                 project_id=project_id,
                 type=ReportType.EVIDENCE,
                 title="研究进展",
-                bottom_line=f"新增 {len(snapshot.verified_evidence_ids)} 条已验证证据",
+                bottom_line=_evidence_bottom_line(session, snapshot.verified_evidence_ids),
                 bottom_line_evidence_refs=snapshot.verified_evidence_ids[-5:],
-                active_actions=[],
+                active_actions=_active_task_actions(session, project_id),
             )
         )
     return specs

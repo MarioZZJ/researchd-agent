@@ -111,14 +111,16 @@ async def plan_projects(session_factory, executor, *, planner_profile: dict | No
 
 
 def check_milestones(session_factory) -> int:  # noqa: ANN001
-    """Emit one milestone report per project once the verified-evidence
-    threshold is reached (idempotent via the milestone.reached event key)."""
+    """Emit ONE milestone report per real milestone event (idempotent via the
+    milestone.reached event key). No evidence-count thresholds: a milestone is
+    a deterministic PROJECT milestone — the first completed task, or the
+    first applied decision. Reports cite the real task/decision ids."""
     from sqlalchemy import select
 
-    from ..domain.enums import ReportType
+    from ..domain.enums import ReportType, TaskStatus
     from ..persistence.models import EventRow, OutboxRow, ReportRow
     from ..persistence.outbox import OutboxStatus
-    from ..persistence.repositories import EvidenceRepo, ProjectRepo
+    from ..persistence.repositories import DecisionRepo, ProjectRepo, TaskRepo
 
     reached = 0
     with session_factory() as session:
@@ -126,70 +128,91 @@ def check_milestones(session_factory) -> int:  # noqa: ANN001
     for project in projects:
         if project.status.value != "ACTIVE":
             continue
-        threshold = int((project.metadata or {}).get("milestone_evidence_threshold", 2))
         with session_factory() as session:
-            verified = len(EvidenceRepo(session).list_verified(project.project_id))
-            if verified < threshold:
-                continue
-            key = f"milestone:{project.project_id}:{threshold}"
-            if session.execute(select(EventRow.id).where(EventRow.idempotency_key == key)).first():
-                continue  # already reached (idempotent across restarts)
-            body = (
-                f"【MILESTONE】{project.name}\n"
-                f"已验证证据达到阈值（{verified} ≥ {threshold}）\n"
-                f"里程碑：证据基础就绪，可进入综合阶段。"
-            )
-            report_id = new_id("report")
-            session.add(
-                ReportRow(
-                    id=report_id,
-                    report_id=report_id,
-                    project_id=project.project_id,
-                    spec_json={
-                        "type": ReportType.DIGEST.value,
-                        "body": body,
-                        "project_id": project.project_id,
-                        "milestone_id": f"MS-{project.project_id}",
-                    },
-                    status="COMPILED",
-                    body_hash=hashlib.sha256(body.encode()).hexdigest(),
+            milestones = []
+            completed = [
+                t for t in TaskRepo(session).list_by_status(project.project_id, [])
+                if t.status.value == TaskStatus.COMPLETED.value
+            ]
+            if completed:
+                first = min(completed, key=lambda t: t.task_id)
+                key = f"milestone:{project.project_id}:first-completed"
+                if not session.execute(select(EventRow.id).where(EventRow.idempotency_key == key)).first():
+                    milestones.append(
+                        (
+                            key,
+                            "MS-first-completed",
+                            f"【MILESTONE】{project.name}：首批研究任务完成\n"
+                            f"任务 {first.task_id}「{first.contract.objective[:60]}」已完成并经过独立审查。",
+                        )
+                    )
+            applied = [
+                d for d in DecisionRepo(session).list_all_statuses(project.project_id)
+                if d.status.value in ("ANSWERED", "APPLIED")
+            ]
+            if applied:
+                first_dec = min(applied, key=lambda d: d.decision_id)
+                key = f"milestone:{project.project_id}:first-decision-applied"
+                if not session.execute(select(EventRow.id).where(EventRow.idempotency_key == key)).first():
+                    milestones.append(
+                        (
+                            key,
+                            "MS-first-decision-applied",
+                            f"【MILESTONE】{project.name}：首个科研决策已应用\n"
+                            f"决策 {first_dec.decision_id}「{first_dec.question[:60]}」→ {first_dec.answer}",
+                        )
+                    )
+            for key, milestone_id, body in milestones:
+                report_id = new_id("report")
+                session.add(
+                    ReportRow(
+                        id=report_id,
+                        report_id=report_id,
+                        project_id=project.project_id,
+                        spec_json={
+                            "type": ReportType.DIGEST.value,
+                            "body": body,
+                            "project_id": project.project_id,
+                            "milestone_id": milestone_id,
+                        },
+                        status="COMPILED",
+                        body_hash=hashlib.sha256(body.encode()).hexdigest(),
+                    )
                 )
-            )
-            session.add(
-                OutboxRow(
-                    id=new_id("outbox"),
-                    destination="delivery",
-                    idempotency_key=f"milestone:{report_id}",
-                    project_id=project.project_id,
-                    payload_json={
-                        "kind": "message",
-                        "project_id": project.project_id,
-                        "report_id": report_id,
-                        "body": body,
-                        "source": "milestone",
-                        "milestone_id": f"MS-{project.project_id}",
-                    },
-                    status=OutboxStatus.PENDING.value,
-                    attempts=0,
-                    max_attempts=8,
-                    next_attempt_at=None,
+                session.add(
+                    OutboxRow(
+                        id=new_id("outbox"),
+                        destination="delivery",
+                        idempotency_key=f"milestone:{report_id}",
+                        project_id=project.project_id,
+                        payload_json={
+                            "kind": "message",
+                            "project_id": project.project_id,
+                            "report_id": report_id,
+                            "body": body,
+                            "source": "milestone",
+                            "milestone_id": milestone_id,
+                        },
+                        status=OutboxStatus.PENDING.value,
+                        attempts=0,
+                        max_attempts=8,
+                        next_attempt_at=None,
+                    )
                 )
-            )
-            from ..persistence.repositories import EventRepo
+                from ..persistence.repositories import EventRepo
 
-            EventRepo(session).append(
-                make_event(
-                    event_type="milestone.reached",
-                    aggregate=AggregateRef(type="project", id=project.project_id, version=1),
-                    idempotency_key=key,
-                    project_id=project.project_id,
-                    actor=Actor(type="system"),
-                    payload={"verified_evidence": verified, "threshold": threshold},
+                EventRepo(session).append(
+                    make_event(
+                        event_type="milestone.reached",
+                        aggregate=AggregateRef(type="project", id=project.project_id, version=1),
+                        idempotency_key=key,
+                        project_id=project.project_id,
+                        actor=Actor(type="system"),
+                        payload={"milestone_id": milestone_id, "body": body},
+                    )
                 )
-            )
-            session.commit()
-            reached += 1
-            logger.info("milestone reached for %s (%d evidence)", project.project_id, verified)
+                session.commit()
+                reached += 1
     return reached
 
 
