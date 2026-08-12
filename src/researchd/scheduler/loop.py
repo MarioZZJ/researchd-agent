@@ -191,6 +191,16 @@ class SchedulerLoop:
                     has_conflict = cand.get("has_option_conflict", True)
                     cheap = cand.get("cheap_parallel", False)
                     numerical = cand.get("numerical_only", False)
+                    # category is a free-form model string: normalize it BEFORE
+                    # the gate so a plausible-but-unknown label (e.g.
+                    # "methodology") cannot crash the whole tick in
+                    # build_decision (unknown labels are treated as "other")
+                    from ..domain.enums import DecisionCategory as _DecisionCategory
+
+                    try:
+                        category = _DecisionCategory(cand.get("category", "other"))
+                    except ValueError:
+                        category = _DecisionCategory.OTHER
                     # cheap parallel candidates do not fork: the first time we
                     # see one, a diagnostic task is queued (ensure_cheap_diagnostics)
                     # and this candidate is NOT evaluated yet; the diagnostic
@@ -207,7 +217,7 @@ class SchedulerLoop:
                         continue  # diagnostic queued separately; evaluate later
                     verdict = gate.evaluate(
                         project_id=row.project_id,
-                        category=cand.get("category", "other"),
+                        category=category,
                         question=cand.get("question", ""),
                         why_material=cand.get("why_material", ""),
                         options=options,
@@ -231,12 +241,12 @@ class SchedulerLoop:
                         project_id=row.project_id,
                         question=cand.get("question", ""),
                         options=options,
-                        category=cand.get("category", "other"),
+                        category=category,
                         trigger=cand.get("trigger", ""),
                         why_material=cand.get("why_material", ""),
                         recommendation=cand.get("recommendation"),
                         recommendation_basis=cand.get("recommendation_basis"),
-                        evidence_refs=cand.get("evidence_refs"),
+                        evidence_refs=cand.get("evidence_refs") or [],
                         unresolved_uncertainty=cand.get("unresolved_uncertainty"),
                         reversibility=cand.get("reversibility"),
                     )

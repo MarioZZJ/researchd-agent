@@ -230,7 +230,12 @@ class DecisionGate:
 
 
 def build_decision(verdict: GateVerdict, *, project_id: str, question: str, options: list[DecisionOption], **kw) -> Decision:
-    """Materialize an OPEN decision from a verdict (only for action=ask_pi)."""
+    """Materialize an OPEN decision from a verdict (only for action=ask_pi).
+
+    Optional list fields are normalized here (the single choke point): a real
+    model's candidate may carry None for optional scopes/refs, and a
+    ValidationError here would crash the whole scheduler tick.
+    """
     assert verdict.action == "ask_pi"
     d = Decision(
         project_id=project_id,
@@ -238,8 +243,8 @@ def build_decision(verdict: GateVerdict, *, project_id: str, question: str, opti
         question=question,
         options=options,
         fingerprint=verdict.fingerprint,
-        blocking_scope=verdict.blocking_scope,
-        continue_scope=verdict.continue_scope,
+        blocking_scope=verdict.blocking_scope or [],
+        continue_scope=verdict.continue_scope or [],
         **kw,
     )
     return d

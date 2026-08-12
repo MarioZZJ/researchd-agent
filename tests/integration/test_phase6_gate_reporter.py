@@ -408,6 +408,81 @@ def test_scheduler_decision_gate_blocks_scope_and_reports(factory):
     assert len(loop.sender.port.deliveries) == n_before
 
 
+def test_scheduler_gate_tolerates_unknown_category(factory):
+    """A plausible-but-unknown category label (e.g. "methodology") from a real
+    model must not crash the whole tick in build_decision: it is normalized
+    to DecisionCategory.OTHER and the candidate is evaluated normally."""
+    import asyncio
+
+    from researchd.config import DEFAULT_PROFILES
+    from researchd.domain.task import SuccessCriterion, Task, TaskContract
+    from researchd.executors.fake import FakeDeliveryPort, FakeExecutor
+    from researchd.persistence.models import RunRow
+    from researchd.persistence.repositories import DecisionRepo, ProjectRepo, TaskRepo
+    from researchd.persistence.transaction import UnitOfWork
+    from researchd.scheduler.loop import SchedulerLoop
+
+    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 4})(), "profiles": dict(DEFAULT_PROFILES), "data_dir": "t"})()
+    loop = SchedulerLoop(settings, factory, FakeExecutor(), FakeDeliveryPort(), max_parallel=4)
+
+    with UnitOfWork(factory) as uow:
+        ProjectRepo(uow.session).save(
+            __import__("researchd.domain.project", fromlist=["Project"]).Project(
+                project_id="P-GATE2", name="gate2", status="ACTIVE"
+            )
+        )
+        t1 = Task(
+            task_id="T-G2", project_id="P-GATE2",
+            contract=TaskContract(
+                task_id="T-G2", role="analysis_worker", objective="o",
+                success_criteria=[SuccessCriterion(id="SC-1", text="c")],
+            ),
+        )
+        t1.propose_ready()
+        TaskRepo(uow.session).save(t1)
+        uow.session.add(
+            RunRow(
+                id="R-G2", run_id="R-G2", task_id="T-G2", project_id="P-GATE2",
+                status="SUCCEEDED", outcome="SUBMIT_FOR_REVIEW",
+                result_json={
+                    "schema": "researchd.work_result.v1",
+                    "task_id": "T-G2",
+                    "outcome": "SUBMIT_FOR_REVIEW",
+                    "criteria_results": [{"criterion_id": "SC-1", "status": "PASS"}],
+                    "decision_candidates": [
+                        {
+                            "question": "which discipline granularity?",
+                            "category": "methodology",  # NOT in DecisionCategory
+                            "why_material": "affects all downstream indicators",
+                            "options": [
+                                {"option_id": "A", "label": "level-1", "scientific_consequence": "coarser"},
+                                {"option_id": "B", "label": "level-0", "scientific_consequence": "finer"},
+                            ],
+                            "unresolved_uncertainty": "coverage unknown",
+                        }
+                    ],
+                },
+            )
+        )
+        uow.commit()
+
+    async def run_ticks():
+        for _ in range(4):
+            await loop.tick()
+            await asyncio.sleep(0.03)
+    asyncio.run(run_ticks())  # must not raise
+
+    with UnitOfWork(factory) as uow:
+        decisions = DecisionRepo(uow.session).list_open("P-GATE2")
+        assert len(decisions) == 1, "unknown category must normalize to other and evaluate normally"
+        assert decisions[0].category.value == "other"
+        # run is marked evaluated — the candidate is not re-evaluated next tick
+        row = uow.session.execute(
+            __import__("sqlalchemy", fromlist=["select"]).select(RunRow).where(RunRow.run_id == "R-G2")
+        ).scalar_one()
+        assert (row.metadata_json or {}).get("decisions_evaluated")  # marked evaluated
+
+
 def test_decision_answer_updates_original_card_in_place(factory, tmp_path):
     """Answering a decision PATCHes the already-sent card (receipt from the
     report row) instead of sending a new meaningless card."""
