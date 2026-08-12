@@ -439,33 +439,43 @@ class StdioReasonixTransport(ReasonixTransport):
         except ValueError:
             return ""  # outside the sessions dir: not ours, refuse
         fd = -1
+        dir_fds: list[int] = []
         try:
             root_fd = _os.open(sessions_dir, _os.O_RDONLY | _os.O_DIRECTORY)
-            try:
-                cur = root_fd
-                parts = rel.parts
-                for i, comp in enumerate(parts):
-                    flags = _os.O_RDONLY | _os.O_NOFOLLOW | _os.O_NONBLOCK
-                    if i < len(parts) - 1:
-                        flags |= _os.O_DIRECTORY
+            dir_fds.append(root_fd)
+            cur = root_fd
+            parts = rel.parts
+            for i, comp in enumerate(parts):
+                flags = _os.O_RDONLY | _os.O_NOFOLLOW | _os.O_NONBLOCK
+                if i < len(parts) - 1:
+                    flags |= _os.O_DIRECTORY
+                try:
                     nxt = _os.open(comp, flags, dir_fd=cur)
-                    if i > 0:
-                        _os.close(cur)  # keep only the newest dirfd
-                    cur = nxt
-                fd = cur  # the final component (regular file expected)
-                st = _os.fstat(fd)
-                if not st.st_mode & 0o100000:  # S_IFREG
+                except OSError:
                     return ""
-                if st.st_size == 0 or st.st_size > max_bytes:
-                    return ""
-                with _os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
-                    data = fh.read(max_bytes + 1)
-                fd = -1  # owned by fdopen now
-            finally:
-                _os.close(root_fd)
+                if i > 0:
+                    _os.close(cur)
+                    dir_fds.pop()  # keep only the newest dirfd
+                dir_fds.append(nxt)
+                cur = nxt
+            fd = cur
+            dir_fds.pop()  # fd ownership moves to fdopen below
+            st = _os.fstat(fd)
+            if not st.st_mode & 0o100000:  # S_IFREG
+                return ""
+            if st.st_size == 0 or st.st_size > max_bytes:
+                return ""
+            with _os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
+                data = fh.read(max_bytes + 1)
+            fd = -1  # owned by fdopen now
         except OSError:
             return ""
         finally:
+            for d in dir_fds:
+                try:
+                    _os.close(d)
+                except OSError:
+                    pass
             if fd >= 0:
                 _os.close(fd)
         for line in reversed(data.splitlines()):

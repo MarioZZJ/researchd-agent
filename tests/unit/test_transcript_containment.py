@@ -79,6 +79,27 @@ def test_refuses_intermediate_directory_symlink(tmp_path):
     assert "TOP-SECRET" not in out
 
 
+def test_repeated_missing_nested_path_does_not_leak_fds(tmp_path):
+    """A missing component deep in the walk must release every opened
+    dirfd — repeated hostile paths cannot exhaust the service's fds."""
+    import os
+
+    sessions = tmp_path / "overlay" / "sessions"
+    sessions.mkdir(parents=True)
+
+    def _open_fds():
+        return len(os.listdir("/proc/self/fd"))
+
+    before = _open_fds()
+    for _ in range(200):
+        out = StdioReasonixTransport._last_assistant_text(
+            str(sessions / "sub" / "missing.jsonl"), overlay_root=tmp_path / "overlay"
+        )
+        assert out == ""
+    after = _open_fds()
+    assert after <= before + 1, f"fd leak on failed nested walk: {before} -> {after}"
+
+
 def test_fifo_does_not_block_and_fds_do_not_leak(tmp_path):
     """A sandbox-created FIFO must not block the scheduler (O_NONBLOCK) and
     refused opens must not leak descriptors."""
