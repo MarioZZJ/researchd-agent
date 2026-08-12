@@ -420,41 +420,54 @@ class StdioReasonixTransport(ReasonixTransport):
         path is never trusted blindly (a hostile/compromised reasonix could
         otherwise point us at /dev/zero or any readable host file).
 
-        The file is opened ONCE with O_NOFOLLOW relative to the resolved
-        sessions dir and read from the same fd (no stat-then-open race, no
-        symlink swap after the containment check)."""
+        The file is opened via a COMPONENT-BY-COMPONENT no-follow dirfd walk
+        starting from a trusted sessions-directory fd: O_NOFOLLOW on every
+        component (final AND intermediate — a compromised executor could
+        swap an intermediate dir for a symlink out of the sandbox),
+        O_DIRECTORY on intermediates, O_NONBLOCK so a sandbox FIFO can never
+        block the scheduler, and every fd is closed on all paths."""
         import os as _os
 
         from pathlib import Path as _Path
 
         path = _Path(transcript_path)
-        sessions_dir: _Path | None = None
-        if overlay_root is not None:
-            sessions_dir = (overlay_root / "sessions").resolve()
+        if overlay_root is None:
+            return ""
+        sessions_dir = (_Path(overlay_root) / "sessions").resolve()
+        try:
+            rel = path.resolve().relative_to(sessions_dir)
+        except ValueError:
+            return ""  # outside the sessions dir: not ours, refuse
+        fd = -1
+        try:
+            root_fd = _os.open(sessions_dir, _os.O_RDONLY | _os.O_DIRECTORY)
             try:
-                path.resolve().relative_to(sessions_dir)
-            except ValueError:
-                return ""  # outside the sessions dir: not ours, refuse
-        try:
-            # O_NOFOLLOW on the final component; fd stays pinned after the
-            # containment resolution above
-            fd = _os.open(path, _os.O_RDONLY | _os.O_NOFOLLOW)
+                cur = root_fd
+                parts = rel.parts
+                for i, comp in enumerate(parts):
+                    flags = _os.O_RDONLY | _os.O_NOFOLLOW | _os.O_NONBLOCK
+                    if i < len(parts) - 1:
+                        flags |= _os.O_DIRECTORY
+                    nxt = _os.open(comp, flags, dir_fd=cur)
+                    if i > 0:
+                        _os.close(cur)  # keep only the newest dirfd
+                    cur = nxt
+                fd = cur  # the final component (regular file expected)
+                st = _os.fstat(fd)
+                if not st.st_mode & 0o100000:  # S_IFREG
+                    return ""
+                if st.st_size == 0 or st.st_size > max_bytes:
+                    return ""
+                with _os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
+                    data = fh.read(max_bytes + 1)
+                fd = -1  # owned by fdopen now
+            finally:
+                _os.close(root_fd)
         except OSError:
             return ""
-        try:
-            st = _os.fstat(fd)
-            if not st.st_mode & 0o100000:  # S_IFREG
-                return ""
-            if st.st_size > max_bytes:
-                return ""
-            if st.st_size == 0:
-                return ""
-            with _os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
-                data = fh.read(max_bytes + 1)
-        except OSError:
-            return ""
-        if len(data) > max_bytes:
-            return ""
+        finally:
+            if fd >= 0:
+                _os.close(fd)
         for line in reversed(data.splitlines()):
             try:
                 rec = json.loads(line)

@@ -59,3 +59,47 @@ def test_refuses_oversized_transcript(tmp_path):
     tp = _transcript(sessions, [{"role": "assistant", "content": "x" * 100}])
     out = StdioReasonixTransport._last_assistant_text(tp, overlay_root=tmp_path / "overlay", max_bytes=50)
     assert out == ""
+
+
+def test_refuses_intermediate_directory_symlink(tmp_path):
+    """O_NOFOLLOW on EVERY component: swapping an intermediate dir for a
+    symlink out of the sessions dir must be refused (a sandbox process
+    could otherwise smuggle a host file into the resolved path)."""
+    import os
+
+    sessions = tmp_path / "overlay" / "sessions"
+    sessions.mkdir(parents=True)
+    victim = tmp_path / "host-secret.txt"
+    victim.write_text("TOP-SECRET")
+    sub = sessions / "sub"
+    sub.symlink_to(victim.parent)  # intermediate component -> host dir
+    tp = str(sub / "t.jsonl")
+    out = StdioReasonixTransport._last_assistant_text(tp, overlay_root=tmp_path / "overlay")
+    assert out == ""
+    assert "TOP-SECRET" not in out
+
+
+def test_fifo_does_not_block_and_fds_do_not_leak(tmp_path):
+    """A sandbox-created FIFO must not block the scheduler (O_NONBLOCK) and
+    refused opens must not leak descriptors."""
+    import os
+
+    sessions = tmp_path / "overlay" / "sessions"
+    sessions.mkdir(parents=True)
+    fifo = sessions / "t.jsonl"
+    os.mkfifo(fifo)
+
+    def _open_fds():
+        return len(os.listdir("/proc/self/fd"))
+
+    before = _open_fds()
+    out = StdioReasonixTransport._last_assistant_text(str(fifo), overlay_root=tmp_path / "overlay")
+    after = _open_fds()
+    assert out == ""
+    assert after <= before + 1, f"fd leak: {before} -> {after}"
+    # a directory at the final component is also refused without blocking
+    d = sessions / "adir"
+    d.mkdir()
+    out2 = StdioReasonixTransport._last_assistant_text(str(d), overlay_root=tmp_path / "overlay")
+    assert out2 == ""
+    assert _open_fds() <= before + 1
