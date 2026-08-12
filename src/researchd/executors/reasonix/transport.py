@@ -97,20 +97,17 @@ def _bwrap_command(binary: str, overlay: Path, cwd: Path) -> list[str] | None:
     for libdir in ("/lib", "/lib64"):
         if Path(libdir).is_dir():
             cmd += ["--ro-bind", libdir, libdir]
-    # the native binary lives under ~/.nvm (and may need ~/.cache at runtime):
-    # bind those read-only BEFORE masking the rest of the home
-    for keep in ("/home",):
-        pass
-    nvm = home / ".nvm"
-    cache = home / ".cache"
-    if nvm.is_dir():
-        cmd += ["--ro-bind", str(nvm), str(nvm)]
-    if cache.is_dir():
-        cmd += ["--ro-bind", str(cache), str(cache)]
+    # the native binary lives under ~/.nvm (and may need ~/.cache at runtime).
+    # bwrap mounts are STACKED — the LAST mount wins — so the whole-home
+    # tmpfs must come FIRST, and the keep-binds (nvm/cache) are re-mounted
+    # ON TOP of the mask afterwards.
+    cmd += ["--tmpfs", str(home)]
+    for keep in (home / ".nvm", home / ".cache"):
+        if keep.is_dir():
+            cmd += ["--ro-bind", str(keep), str(keep)]
     # whole user home masked (empty tmpfs): ~/.ssh ~/.aws ~/.reasonix
     # ~/.cc-connect, repository .env, everything — then re-mount ONLY the
     # overlay (config/.env READ-ONLY; sessions writable) and the workspace
-    cmd += ["--tmpfs", str(home)]
     cmd += ["--ro-bind", str(overlay), str(overlay)]
     sessions = overlay / "sessions"
     if sessions.is_dir():

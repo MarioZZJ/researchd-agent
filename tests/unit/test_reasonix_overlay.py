@@ -184,8 +184,18 @@ def test_bwrap_command_masks_secrets_and_mounts_workspace(tmp_path, monkeypatch)
     assert not has(["--ro-bind", "/", "/"], 0, 3)
     for allow in ("/usr", "/bin", "/etc", "/opt", "/proc"):
         assert has(["--ro-bind", allow, allow], 0, 3), allow
-    # whole home masked, then ONLY overlay (ro) + sessions (rw) + workspace
-    assert has(["--tmpfs", str(Path.home())], 0, 2)
+    # whole home masked FIRST, then the keep-binds (nvm/cache) re-mounted ON
+    # TOP of the mask (bwrap mounts are stacked — last mount wins — so the
+    # native binary under ~/.nvm must be visible INSIDE the sandbox), then
+    # ONLY overlay (ro) + sessions (rw) + workspace
+    home = Path.home()
+    assert has(["--tmpfs", str(home)], 0, 2)
+    t_idx = next(k for k in range(len(cmd) - 1) if cmd[k:k + 2] == ["--tmpfs", str(home)])
+    if (home / ".nvm").is_dir():
+        n_idx = next(k for k in range(len(cmd) - 2) if cmd[k:k + 3] == ["--ro-bind", str(home / ".nvm"), str(home / ".nvm")])
+        assert n_idx > t_idx, "nvm keep-bind must come AFTER the home mask"
+    o_idx = next(k for k in range(len(cmd) - 2) if cmd[k:k + 3] == ["--ro-bind", str(overlay), str(overlay)])
+    assert o_idx > t_idx, "overlay bind must come AFTER the home mask"
     assert has(["--ro-bind", str(overlay), str(overlay)], 0, 3)
     sessions = overlay / "sessions"
     if sessions.is_dir():
