@@ -195,6 +195,7 @@ async def schedule_report(session_factory, *, project_id: str) -> ReporterResult
         from ..domain.enums import DecisionCategory as DC
 
         last_report_id: str | None = None
+        skipped: list[str] = []
         for spec in specs:
             procedural = False
             if spec.decision_id:
@@ -215,11 +216,14 @@ async def schedule_report(session_factory, *, project_id: str) -> ReporterResult
                         o.option_id for o in dec.options if not o.scientific_consequence.strip()
                     ]
                     if missing:
-                        return ReporterResult(
-                            sent=False,
-                            reason="linter failed",
-                            lint_errors=[f"decision options lack scientific_consequence: {missing}"],
-                        )
+                        # per-spec skip: one malformed decision must not starve
+                        # the OTHER specs in this batch (a real model's
+                        # free-form cards routinely cite CANDIDATE evidence or
+                        # free-form task labels — those cards are never sent,
+                        # but valid cards like a linked bootstrap decision must
+                        # still go out)
+                        skipped.append(f"decision options lack scientific_consequence: {missing}")
+                        continue
             lint = lint_spec(
                 spec,
                 known_task_ids=task_ids,
@@ -227,11 +231,14 @@ async def schedule_report(session_factory, *, project_id: str) -> ReporterResult
                 allow_procedural_bottom_line=procedural,
             )
             if not lint.ok:
-                return ReporterResult(sent=False, reason="linter failed", lint_errors=lint.errors)
+                skipped.append(f"{spec.type.value}: {'; '.join(lint.errors)}")
+                continue  # skip this spec, send the valid ones
             compressed = await compress_report(spec, allow_model=False)  # model gated (B-01/B-03)
             report_id = new_id("report")
             last_report_id = report_id
             _emit_report(session, project_id, report_id, spec, compressed.body, compressed.source)
+        if skipped:
+            logger.warning("report specs linter-skipped for %s: %s", project_id, skipped)
         if last_report_id is None:
             # state changed (diff reasons non-empty) but nothing compiled into
             # a spec: persist the baseline so the change is not re-flagged on

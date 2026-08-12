@@ -209,6 +209,68 @@ def test_schedule_report_queues_delivery(factory, tmp_path):
         assert payload["body"]  # deterministic template body
 
 
+def test_schedule_report_skips_bad_specs_sends_valid_ones(factory, tmp_path):
+    """One linter-failing spec (cites CANDIDATE/unknown evidence) must NOT
+    starve the valid specs in the same batch: the bad card is skipped (logged)
+    and the good decision card is still sent."""
+    from researchd.domain.decision import Decision, DecisionOption
+    from researchd.domain.evidence import Evidence
+    from researchd.domain.project import Project
+    from researchd.persistence.models import OutboxRow
+    from researchd.persistence.repositories import DecisionRepo, EvidenceRepo, ProjectRepo
+    from researchd.persistence.transaction import UnitOfWork
+    from researchd.reporting.reporter import schedule_report
+
+    ws = tmp_path / "ws"
+    ws.mkdir(exist_ok=True)
+    with UnitOfWork(factory) as uow:
+        ProjectRepo(uow.session).save(
+            Project(project_id="P-MIX", name="mix", description="d", workspace_root=str(ws))
+        )
+        EvidenceRepo(uow.session).save(
+            Evidence(
+                evidence_id="E-GOOD", project_id="P-MIX", type="literature", status="VERIFIED",
+                statement="s", literature={"source_id": "doi:1"},
+            )
+        )
+        EvidenceRepo(uow.session).save(
+            Evidence(
+                evidence_id="E-CAND", project_id="P-MIX", type="literature", status="CANDIDATE",
+                statement="s", literature={"source_id": "doi:2"},
+            )
+        )
+        DecisionRepo(uow.session).save(
+            Decision(
+                decision_id="D-GOOD", project_id="P-MIX", status="OPEN", question="good?",
+                recommendation="proceed", evidence_refs=["E-GOOD"],
+                options=[DecisionOption(option_id="A", label="A", scientific_consequence="ok")],
+            )
+        )
+        DecisionRepo(uow.session).save(
+            Decision(
+                decision_id="D-BAD", project_id="P-MIX", status="OPEN", question="bad?",
+                recommendation="wait", evidence_refs=["E-CAND"],  # CANDIDATE -> linter fail
+                options=[DecisionOption(option_id="A", label="A", scientific_consequence="ok")],
+            )
+        )
+        uow.commit()
+    result = asyncio.run(schedule_report(factory, project_id="P-MIX"))
+    assert result.sent is True, result.lint_errors
+    with UnitOfWork(factory) as uow:
+        rows = uow.session.query(OutboxRow).all()
+        # decision card (D-GOOD) + evidence-progress card; D-BAD's card skipped
+        payloads = [r.payload_json for r in rows]
+        card_bodies = [p["body"] for p in payloads if p.get("kind") == "interactive_card"]
+        assert len(card_bodies) == 1, payloads
+        buttons = payloads[0].get("buttons", [])
+        assert any("D-GOOD" in b.get("value", "") for b in buttons)
+        assert not any("D-BAD" in b.get("value", "") for b in buttons)
+        assert len(payloads) == 2  # decision card + evidence-progress card
+    # baseline persisted: a second call with unchanged state emits nothing
+    result2 = asyncio.run(schedule_report(factory, project_id="P-MIX"))
+    assert result2.sent is False
+
+
 def test_schedule_report_nothing_reportable(factory):
     from researchd.reporting.reporter import schedule_report
 
