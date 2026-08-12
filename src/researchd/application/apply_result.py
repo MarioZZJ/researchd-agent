@@ -132,9 +132,49 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
                         "re-run `researchd migrate` hash backfill before replay (fail-closed)"
                     )
                 if info.get("sha256") is not None and existing_artifact.sha256 != info["sha256"]:
-                    raise ValueError(
-                        f"artifact {artifact_id!r} content changed since registration; rejected"
+                    # A re-declaration of the SAME task's OWN deliverable with
+                    # CHANGED content SUPERSEDES the provisional row (the same
+                    # supersede pattern evidence candidates use): the model
+                    # edited the file in a later run, and the old row recorded
+                    # a stale hash. Only allowed when (a) the declaring run
+                    # belongs to the SAME task and (b) no VERIFIED evidence
+                    # references the artifact (superseding would break its
+                    # provenance chain). Cross-task re-declaration or a
+                    # verified reference keeps the strict reject.
+                    from ..persistence.models import EvidenceRow
+
+                    if existing_artifact.task_id != run.task_id:
+                        raise ValueError(
+                            f"artifact {artifact_id!r} content changed since registration and "
+                            f"belongs to task {existing_artifact.task_id} (not {run.task_id}); rejected"
+                        )
+                    ev_rows = session.execute(
+                        select(EvidenceRow).where(
+                            EvidenceRow.status == "VERIFIED",
+                            EvidenceRow.project_id == project_id,
+                        )
+                    ).scalars()
+                    referenced_by_verified = any(
+                        existing_artifact.artifact_id in (ev.artifact_refs or [])
+                        for ev in ev_rows
                     )
+                    if referenced_by_verified:
+                        raise ValueError(
+                            f"artifact {artifact_id!r} content changed since registration and is "
+                            "referenced by VERIFIED evidence; rejected"
+                        )
+                    logger.warning(
+                        "artifact %r content changed; same-task re-declaration supersedes "
+                        "(hash %s -> %s)", artifact_id,
+                        existing_artifact.sha256[:12], info.get("sha256", "")[:12],
+                    )
+                    existing_artifact.sha256 = info.get("sha256")
+                    existing_artifact.size_bytes = info.get("size_bytes")
+                    existing_artifact.mime_type = info.get("mime_type")
+                    existing_artifact.run_id = run.run_id
+                    existing_artifact.description = art.description or existing_artifact.description
+                    ArtifactRepo(session).save(existing_artifact)
+                    counts["artifacts"] += 1
             continue
         if project is not None:
             # registration gate: project-root boundary + '..' / symlink
