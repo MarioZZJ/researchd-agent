@@ -246,6 +246,11 @@ def ensure_overlay(data_dir: str | Path, *, skills: bool = True) -> Path:
     )
     (overlay / "sessions").mkdir(parents=True, exist_ok=True)
     os.chmod(overlay / "sessions", 0o700)
+    # reasonix session/new writes a workspace write-lease under
+    # REASONIX_HOME/.cache — it must be writable even though the overlay
+    # config/.env stay read-only
+    (overlay / ".cache").mkdir(parents=True, exist_ok=True)
+    os.chmod(overlay / ".cache", 0o700)
     if skills:
         _install_skills(overlay, Path.home() / ".reasonix" / "skills")
     return overlay

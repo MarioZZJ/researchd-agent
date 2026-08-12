@@ -173,6 +173,7 @@ def test_bwrap_command_masks_secrets_and_mounts_workspace(tmp_path, monkeypatch)
     data.mkdir()
     overlay = data / "rx-overlay"
     overlay.mkdir()
+    (overlay / ".cache").mkdir()  # ensure_overlay creates this rw lease dir
     ws = tmp_path / "ws"
     ws.mkdir()
     cmd = _bwrap_command("/bin/reasonix-native", overlay, ws)
@@ -200,6 +201,10 @@ def test_bwrap_command_masks_secrets_and_mounts_workspace(tmp_path, monkeypatch)
     sessions = overlay / "sessions"
     if sessions.is_dir():
         assert has(["--bind", str(sessions), str(sessions)], 0, 3)
+    # reasonix session/new writes a workspace write-lease under
+    # REASONIX_HOME/.cache — must be rw (bound AFTER the ro overlay mount)
+    c_idx = next(k for k in range(len(cmd) - 2) if cmd[k:k + 3] == ["--bind", str(overlay / ".cache"), str(overlay / ".cache")])
+    assert c_idx > o_idx, ".cache rw bind must come AFTER the ro overlay bind"
     assert has(["--bind", str(ws), str(ws)], 0, 3)
     assert has(["--chdir", str(ws)], 0, 2)
     assert cmd[-2:] == ["/bin/reasonix-native", "acp"]

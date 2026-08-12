@@ -109,6 +109,9 @@ def _bwrap_command(binary: str, overlay: Path, cwd: Path) -> list[str] | None:
     # ~/.cc-connect, repository .env, everything — then re-mount ONLY the
     # overlay (config/.env READ-ONLY; sessions writable) and the workspace
     cmd += ["--ro-bind", str(overlay), str(overlay)]
+    cache = overlay / ".cache"
+    if cache.is_dir():
+        cmd += ["--bind", str(cache), str(cache)]
     sessions = overlay / "sessions"
     if sessions.is_dir():
         cmd += ["--bind", str(sessions), str(sessions)]
