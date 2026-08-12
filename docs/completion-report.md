@@ -1,7 +1,9 @@
 # researchd v0.1.1 完成报告（live-readiness）
 
 分支：`v0.1.1-live-readiness`（自 master 创建）
-HEAD：`a29bc13`（v0.1.1 tag，最终合并提交）；测试基线：**233 passed + 6 skipped**（tag 同源）
+代码基线（233 passed + 6 skipped 全量实测）：`a29bc13`（最终合并提交）；
+发布提交/tag：`v0.1.1` → `b8e7a97`（docs-only，tag 固定不再移动）。
+基线哈希与发布提交哈希分离记录；本报告不宣称任何静态哈希等于包含本报告的提交。
 
 状态标注：**IMPLEMENTED**（代码+本地测试完成）/ **LIVE VERIFIED**（真实环境
 验证通过）/ **GATED**（已实现，等待宿主授权/权限后即可验证）/ **FAILED**（未达标）。
@@ -96,5 +98,6 @@ uv run researchctl doctor            # 只读健康检查
 
 ## 6. 发布状态
 
-- v0.1.1 tag 已创建并推送（指向 master 合并提交）；分支 `v0.1.1-live-readiness` 与 master 同源。
-- 发布判据 §5 全部勾选；pilot 真实闭环 2026-08-12 晚 LIVE VERIFIED。
+- tag `v0.1.1` 固定于发布提交 `b8e7a97`（docs-only，不再移动）；已测试代码基线 `a29bc13`
+  （最终合并提交，233 passed + 6 skipped 实测）。发布判据 §5 全部勾选；
+  pilot 真实闭环 2026-08-12 晚 LIVE VERIFIED。
