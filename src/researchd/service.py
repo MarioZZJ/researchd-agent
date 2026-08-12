@@ -37,6 +37,8 @@ async def run_service(settings: Settings) -> None:
         sys.exit(1)
 
     app = create_app(settings)
+    # delivery port is built once in run_service() (shared with the
+    # scheduler); this placeholder is replaced there before serving.
 
     # UDS transport preferred (IMPLEMENTATION.md §18); TCP fallback is
     # localhost-only and requires a bearer token.
@@ -84,7 +86,11 @@ async def run_service(settings: Settings) -> None:
     from .scheduler.loop import SchedulerLoop
 
     executor = _build_executor(settings)
+    # ONE delivery port instance shared by the scheduler and the ops-test
+    # endpoints (app.state.delivery_port) — never two independently built
+    # instances that could drift.
     delivery_port = _build_delivery_port(settings)
+    app.state.delivery_port = delivery_port
     scheduler = SchedulerLoop(
         settings,
         app.state.session_factory,
@@ -132,10 +138,27 @@ def _build_executor(settings: Settings):
 
 
 def _build_delivery_port(settings: Settings):
-    """Delivery port factory. `fake` records deliveries in memory; the real
-    cc-connect Delivery API adapter lands in Phase 6."""
-    from .executors.fake import FakeDeliveryPort
-
+    """Delivery port factory: fake | cc_connect. cc_connect fails closed when
+    the target is not fully configured; the token stays in settings and is
+    never written to logs, the DB, artifacts, or the executor env."""
     if settings.scheduler.delivery == "fake":
+        from .executors.fake import FakeDeliveryPort
+
         return FakeDeliveryPort()
+    if settings.scheduler.delivery == "cc_connect":
+        from .integrations.cc_connect.delivery import CcConnectDeliveryPort
+
+        cc = settings.cc_connect
+        if not cc.token.get_secret_value() or not cc.project:
+            raise ValueError(
+                "delivery=cc_connect requires RESEARCHD_CC_CONNECT__TOKEN and "
+                "RESEARCHD_CC_CONNECT__PROJECT (fail-closed: no silent fallback)"
+            )
+        return CcConnectDeliveryPort(
+            base_url=cc.base_url,
+            token=cc.token.get_secret_value(),
+            project=cc.project,
+            session_key=cc.session_key,
+            uds=cc.uds or None,
+        )
     raise ValueError(f"unknown delivery {settings.scheduler.delivery!r}")

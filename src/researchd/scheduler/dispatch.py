@@ -32,11 +32,14 @@ class DispatchDecision:
     reason: str = ""
 
 
-def task_dispatch_decision(task: Task, open_decision_ids: list[str], blocked_task_ids: set[str] | None = None) -> DispatchDecision:
+def task_dispatch_decision(task: Task, open_decision_ids: list[str], blocked_task_ids: set[str] | None = None, completed_task_ids: set[str] | None = None) -> DispatchDecision:
     """Deterministic readiness: dependencies satisfied, no blocking decisions.
 
     `blocked_task_ids` is the union of blocking_scope of OPEN decisions — only
     those tasks are paused (IMPLEMENTATION.md §8: only blocking_scope blocks).
+    `completed_task_ids` gates depends_on ordering: a READY task whose
+    upstream tasks are not COMPLETED stays parked (skipped, no state churn)
+    instead of running ahead of its dependencies.
     """
     if task.status is not TaskStatus.READY:
         return DispatchDecision("skip", f"status {task.status.value}")
@@ -46,6 +49,10 @@ def task_dispatch_decision(task: Task, open_decision_ids: list[str], blocked_tas
         blocking = [d for d in task.blocked_by if d in open_decision_ids]
         if blocking:
             return DispatchDecision("blocked", f"decisions {blocking}")
+    if completed_task_ids is not None:
+        missing = [d for d in task.depends_on if d not in completed_task_ids]
+        if missing:
+            return DispatchDecision("skip", f"waiting for dependencies {missing}")
     return DispatchDecision("dispatch")
 
 
@@ -74,6 +81,11 @@ class RunDispatcher:
             lease_token=None,
         )
         run.transition(RunStatus.STARTING)
+        # resolved config + mounted skills are frozen on the run for
+        # traceability (IMPLEMENTATION.md §15.2: record what actually ran)
+        run.metadata = dict(run.metadata or {})
+        run.metadata["skills"] = list(getattr(self.executor, "installed_skills", []) or [])
+        run.metadata["context_id"] = None  # set by the scheduler before the turn
         RunRepo(self.session).save(run)
         self.session.flush()
         token = LeaseRepo(self.session).acquire(
@@ -99,6 +111,15 @@ class RunDispatcher:
         run.session_id = session_info.session_id
         run.turn_id = session_info.turn_id
         run.outcome = result.outcome.value
+        # usage: exactly what the executor reports; explicit unavailable when
+        # it reports nothing — never fabricated
+        run.usage = getattr(session_info, "usage", None) or {
+            "available": False,
+            "reason": "executor does not report usage",
+        }
+        run.metadata = dict(run.metadata or {})
+        if getattr(session_info, "transcript_path", None):
+            run.metadata["transcript_path"] = session_info.transcript_path  # path only
         run.transition(RunStatus.SUCCEEDED)
         RunRepo(self.session).save(run)
         LeaseRepo(self.session).release(run.lease_token)
@@ -154,6 +175,75 @@ class RunDispatcher:
         if run.lease_token:
             LeaseRepo(self.session).heartbeat(run.lease_token)
 
+    # ------------------------------------------------------------ auditor
+    def dispatch_audit_run(self, task: Task, *, profile: dict | None = None, worker_run_id: str | None = None) -> Run | None:
+        """Create an auditor Run for a REVIEW task. The task STAYS REVIEW
+        (REVIEW -> RUNNING is illegal); the lease serializes audits so a
+        crashed/replayed audit can never double-run. Returns None when the
+        lease is contended (an audit for this task is already in flight)."""
+        run = Run(
+            run_id=new_id("run"),
+            task_id=task.task_id,
+            project_id=task.project_id,
+            executor=self.executor.name,
+            executor_profile=(profile or {}).get("name"),
+            resolved_model=(profile or {}).get("model"),
+            reasoning_effort=(profile or {}).get("reasoning_effort"),
+            configuration_source=(profile or {}).get("source") or "scheduler",
+            process_instance_id=(profile or {}).get("process_instance_id"),
+            lease_token=None,
+            metadata={"role": "auditor", "worker_run_id": worker_run_id or task.current_run_id},
+        )
+        run.transition(RunStatus.STARTING)
+        run.metadata = dict(run.metadata or {})
+        run.metadata["skills"] = list(getattr(self.executor, "installed_skills", []) or [])
+        RunRepo(self.session).save(run)
+        self.session.flush()
+        token = LeaseRepo(self.session).acquire(
+            project_id=task.project_id,
+            task_id=task.task_id,
+            run_id=run.run_id,
+            owner=f"auditor:{self.executor.name}",
+        )
+        if token is None:
+            return None
+        run.lease_token = token
+        run.transition(RunStatus.RUNNING)
+        RunRepo(self.session).save(run)
+        self._emit("run.running", run, {"task_id": task.task_id, "role": "auditor"})
+        return run
+
+    def collect_audit(self, run: Run, result: Any, session_info: ExecutorSessionInfo) -> None:
+        """Apply an auditor verdict in the SAME transaction as run success."""
+        run.result = result.model_dump()
+        run.session_id = session_info.session_id
+        run.turn_id = session_info.turn_id
+        run.usage = getattr(session_info, "usage", None) or {
+            "available": False,
+            "reason": "executor does not report usage",
+        }
+        run.metadata = dict(run.metadata or {})
+        if getattr(session_info, "transcript_path", None):
+            run.metadata["transcript_path"] = session_info.transcript_path  # path only
+        outcome = result.verdict.value if hasattr(result.verdict, "value") else str(result.verdict)
+        run.outcome = outcome
+        run.transition(RunStatus.SUCCEEDED)
+        RunRepo(self.session).save(run)
+        LeaseRepo(self.session).release(run.lease_token)
+        task = TaskRepo(self.session).get_by_task_id(run.task_id)
+        if task is None:
+            raise RuntimeError(f"task {run.task_id!r} missing for audit run {run.run_id}")
+        from ..application.audit_gate import apply_audit_result
+
+        counts = apply_audit_result(self.session, run, task, result)
+        self._emit("run.succeeded", run, {"task_id": task.task_id, "verdict": outcome})
+        if counts.get("completed"):
+            self._emit("task.completed", task, {"audit_run_id": run.run_id})
+        elif counts.get("revised") or counts.get("blocked"):
+            self._emit("task.ready", task, {"audit_run_id": run.run_id, "verdict": outcome})
+        elif counts.get("rejected"):
+            self._emit("task.failed", task, {"audit_run_id": run.run_id})
+
     # ------------------------------------------------------------ events
     def _emit(self, event_type: str, obj: Any, payload: dict | None = None) -> None:
         EventRepo(self.session).append(
@@ -182,13 +272,21 @@ def orphan_candidates(session: Session, *, max_age_seconds: int = ORPHAN_HEARTBE
     return out
 
 
-def reconcile_orphans(session: Session, *, max_age_seconds: int = ORPHAN_HEARTBEAT_SECONDS) -> list[str]:
-    """Reconcile stale runs after restart/crash: ORPHANED + task back to READY.
-    Returns the list of orphaned run ids."""
+def reconcile_orphans(session: Session, *, max_age_seconds: int = ORPHAN_HEARTBEAT_SECONDS, data_dir: str | Path | None = None) -> list[str]:
+    """Reconcile stale runs after restart/crash.
+
+    Receipt recovery: when the model ALREADY produced the full structured
+    result (runtime receipt written by the executor adapter before collect),
+    the run is finished from the receipt WITHOUT calling the model again.
+    Without a receipt the run is ORPHANED and the task requeued for retry
+    (the retry reason is recorded). Returns the list of handled run ids."""
     orphaned = []
     for run in orphan_candidates(session, max_age_seconds=max_age_seconds):
         dispatcher = RunDispatcher(session, None, actor=Actor(type="system"))  # type: ignore[arg-type]
-        run.termination_reason = "orphaned: heartbeat expired"
+        if data_dir and _recover_from_receipt(session, dispatcher, run, data_dir):
+            orphaned.append(run.run_id)
+            continue
+        run.termination_reason = "orphaned: heartbeat expired; no completion receipt; retry"
         run.transition(RunStatus.ORPHANED)
         RunRepo(session).save(run)
         task = TaskRepo(session).get_by_task_id(run.task_id)
@@ -197,3 +295,44 @@ def reconcile_orphans(session: Session, *, max_age_seconds: int = ORPHAN_HEARTBE
             TaskRepo(session).save(task)
         orphaned.append(run.run_id)
     return orphaned
+
+
+def _recover_from_receipt(session: Session, dispatcher: Any, run: Run, data_dir: str | Path) -> bool:
+    """Finish an orphaned run from its runtime receipt (model already
+    produced the result). Returns True when recovered. A corrupt receipt
+    is treated as absent (retry) — never silently trusted."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    from ..executors.base import ExecutorSessionInfo, validate_audit_result, validate_work_result
+
+    path = _Path(data_dir) / "receipts" / f"{run.run_id}.json"
+    if not path.exists():
+        return False
+    # parse + validate FIRST (corrupt receipt -> absent -> retry); collection
+    # failures PROPAGATE (a mutated run must never be re-orphaned)
+    try:
+        receipt = _json.loads(path.read_text())
+        raw = receipt["raw"]
+        role = receipt.get("role", "worker")
+        validator = validate_audit_result if role == "auditor" else validate_work_result
+        result = validator(raw)
+    except Exception:  # noqa: BLE001  corrupt receipt -> fall through to retry
+        logger.warning("receipt for run %s unusable; falling back to retry", run.run_id)
+        return False
+    info = ExecutorSessionInfo(
+        executor=run.executor or "reasonix",
+        session_id=receipt.get("session_id"),
+        transcript_path=receipt.get("transcript_path"),
+    )
+    if role == "auditor":
+        dispatcher.collect_audit(run, result, info)
+    else:
+        dispatcher.collect_success(run, result, info)
+    run.termination_reason = "recovered from runtime receipt (no re-invocation)"
+    RunRepo(session).save(run)
+    # the receipt is deliberately KEPT: recovery only ever applies to stale
+    # (STARTING/RUNNING) runs, so a leftover receipt on a SUCCEEDED run is
+    # inert; deleting it before commit would create a crash window where the
+    # only completed result is lost and the model gets re-invoked
+    return True

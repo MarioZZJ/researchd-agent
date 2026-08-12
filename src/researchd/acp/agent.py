@@ -37,12 +37,19 @@ class AcpServer:
     Methods: initialize, session/new, session/prompt, session/close,
     session/list. Prompt text is first parsed as a deterministic command;
     unrecognized input may go through the interaction profile (config-gated).
+
+    Reply text is delivered the way cc-connect expects it: as a
+    session/update notification (agent_message_chunk) — cc-connect ignores
+    the synchronous session/prompt response body for text and aggregates
+    EventText from the update stream. `notify` writes the JSON-RPC
+    notification to stdout (thread-safe).
     """
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, notify: Any = None):
         self.settings = settings
         self.sessions: dict[str, InteractionSession] = {}
         self._seq = 0
+        self._notify = notify
 
     # ------------------------------------------------------------ protocol
     async def handle(self, msg: dict) -> dict | None:
@@ -99,16 +106,50 @@ class AcpServer:
         profile = config.get("interaction_profile")
         if profile not in (None, "fast", "deep", "deterministic"):
             raise AcpError(-32602, f"invalid interaction_profile {profile!r}")
+        # identity is REQUIRED and must come from cc-connect (env injection
+        # CC_PROJECT/CC_SESSION_KEY/CC_USER_ID, or explicit sessionConfig).
+        # Fail closed: an anonymous session can never be mapped to the PI,
+        # and unknown users must not be auto-mapped to anything.
+        identity = self._resolve_identity(config)
+        if identity["cc_project"] is None or identity["cc_session_key"] is None or identity["cc_user_id"] is None:
+            raise AcpError(
+                -32602,
+                "cc-connect identity missing: sessionConfig (cc_project/cc_session_key/"
+                "cc_user_id) or env (CC_PROJECT/CC_SESSION_KEY/CC_USER_ID) must be provided; "
+                "refusing anonymous session (never auto-mapping unknown users to PI)",
+            )
         self._seq += 1
         session = InteractionSession(
             session_id=f"SES-{self._seq:04d}",
             interaction_profile=profile or "fast",
-            cc_project=config.get("cc_project"),
-            cc_session_key=config.get("cc_session_key"),
-            cc_user_id=config.get("cc_user_id"),
+            cc_project=identity["cc_project"],
+            cc_session_key=identity["cc_session_key"],
+            cc_user_id=identity["cc_user_id"],
         )
         self.sessions[session.session_id] = session
         return {"sessionId": session.session_id, "sessionConfig": config}
+
+    @staticmethod
+    def _resolve_identity(config: dict) -> dict:
+        """Identity is ATOMIC: either the caller provides all three fields in
+        sessionConfig, or all three come from the cc-connect env injection
+        (CC_PROJECT/CC_SESSION_KEY/CC_USER_ID). Mixing (e.g. overriding only
+        cc_user_id while inheriting the env project) is rejected so an
+        identity can never be half-spoofed."""
+        import os
+
+        configured = {k: config.get(k) for k in ("cc_project", "cc_session_key", "cc_user_id")}
+        provided = [v for v in configured.values() if v]
+        if provided:
+            if len(provided) != 3:
+                return {"cc_project": None, "cc_session_key": None, "cc_user_id": None}
+            return {k: str(v) for k, v in configured.items()}
+        env = {
+            "cc_project": os.environ.get("CC_PROJECT"),
+            "cc_session_key": os.environ.get("CC_SESSION_KEY"),
+            "cc_user_id": os.environ.get("CC_USER_ID"),
+        }
+        return {k: (v if v else None) for k, v in env.items()}
 
     async def _session_prompt(self, params: dict) -> dict:
         session_id = params.get("sessionId")
@@ -118,15 +159,42 @@ class AcpServer:
         prompt = params.get("prompt", "")
         if isinstance(prompt, list):  # content blocks
             prompt = " ".join(b.get("text", "") for b in prompt if isinstance(b, dict))
+        # REAL platform message id (cc-connect sends msg.ID): used verbatim as
+        # the idempotency key, so a user re-sending the SAME text later is a
+        # NEW message, never a duplicate-merged one (the old hash-based key
+        # merged legitimate repeats forever)
+        message_id = params.get("messageId") or None
         from .inbound import process_prompt
 
-        reply = await process_prompt(self.settings, session, prompt)
+        reply = await process_prompt(self.settings, session, prompt, message_id=message_id)
+        # cc-connect's ACP client aggregates reply text from the
+        # session/update notification stream (agent_message_chunk) — the
+        # synchronous response body is ignored for text. The notification
+        # MUST be written BEFORE the synchronous response returns, otherwise
+        # the engine finishes the turn (EventResult) and the late EventText
+        # is dropped. `notify` is awaited here; stdio writer serializes.
+        if self._notify is not None:
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session.session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": reply.text},
+                    },
+                },
+            }
+            result = self._notify(payload)
+            if asyncio.iscoroutine(result):
+                await result
+        # keep a minimal synchronous result for spec compliance
         return {
             "sessionId": session.session_id,
             "requestId": f"REQ-{session.request_counter()}",
             "message": {
                 "role": "assistant",
-                "content": [{"type": "text", "text": reply.text}],
+                "content": {"type": "text", "text": reply.text},
             },
         }
 
@@ -138,7 +206,6 @@ class AcpServer:
 
 async def run_acp_stdio(settings: Settings) -> None:
     """Read JSON-RPC lines from stdin, write responses to stdout."""
-    server = AcpServer(settings)
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
@@ -147,6 +214,19 @@ async def run_acp_stdio(settings: Settings) -> None:
         lambda: asyncio.streams.FlowControlMixin(), sys.stdout  # type: ignore[arg-type]
     )
     writer = asyncio.StreamWriter(writer_transport, writer_protocol, None, loop)
+    write_lock = asyncio.Lock()
+
+    async def _write_line(obj: dict) -> None:
+        async with write_lock:
+            writer.write((json.dumps(obj) + "\n").encode())
+            await writer.drain()
+
+    def _notify(obj: dict):
+        # called from _session_prompt (same event loop); awaited by the
+        # caller so the update is written BEFORE the synchronous response
+        return _write_line(obj)
+
+    server = AcpServer(settings, notify=_notify)
 
     while True:
         line = await reader.readline()

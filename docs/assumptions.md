@@ -53,3 +53,21 @@
 
 - 假设：pilot 项目工作区 = `.data/workspaces/interdisciplinary-citation-pilot/`（与代码仓库分离；模板来自 `templates/project/`）。
 - 理由：文档要求项目工作区与代码仓库分离，且可写位置受限。
+
+## A-11 pilot 真实运行的环境约束与观察（2026-08-12）
+
+- 假设：真实数据源（OpenAlex）会限流/封禁宿主机（/works 查询被封 24h），
+  真实模型会持续工作直到预算耗尽（单 turn 最长 60 分钟）。
+- 影响：数据获取类任务的 success criteria 应包含「覆盖不足的量化记录与原因
+  说明」兜底口径（模型自身 escalation 指引亦如此建议），否则环境内不可达的
+  阈值（如引用解析率 ≥80%）会让任务永远无法 COMPLETED。
+- 复审：pilot T1 的 c2 合同因此按 PI 授权放宽（详见执行报告，数据修复已披露）。
+
+## A-12 真实模型输出是自由格式的（schema 校验之外的偏差常态）
+
+- 假设：真实模型会声明目录 artifact（`data/raw/`）、在同任务后续 run 修改并
+  重声明自己的交付物、使用枚举外 category（如 methodology）、引用 CANDIDATE
+  evidence 或自由文本 task 标签。系统对这些偏差按「fail-closed per card /
+  per declaration」处理（跳过而非整单拒绝；安全违规仍整单拒绝）。
+- 影响：pilot 驱动的 7 项修复（completion-report §2b）均为此类偏差的系统级兜底；
+  后续真实任务应预期这些偏差为常态而非异常。

@@ -68,6 +68,7 @@ EVENT_TYPES = {
     "decision.closed",
     "decision.withdrawn",
     "decision.duplicate_rejected",
+    "decision.evidence_linked",
     "report.compiled",
     "report.sent",
     "outbox.delivered",
@@ -76,6 +77,7 @@ EVENT_TYPES = {
     "inbound.message_duplicate",
     "projection.updated",
     "projection.human_patch",
+    "document.created",
     "planner.ran",
     "plan_revision.proposed",
     "plan_revision.applied",
@@ -83,6 +85,10 @@ EVENT_TYPES = {
     "taste_rule.applied",
     "milestone.reached",
     "result.applied",
+    "audit.accepted",
+    "audit.revised",
+    "audit.blocked",
+    "audit.rejected",
     "diagnostic.giveup",
 }
 

@@ -68,16 +68,31 @@ class ProjectionResult:
 
 class DocPlatform:
     """Minimal docx-like surface (blocks keyed by section). The Feishu docx
-    client is PENDING (B-01); FakeDocPlatform serves deterministic tests."""
+    client is real; FakeDocPlatform serves deterministic tests."""
+
+    async def create_document(self, title: str, *, folder_token: str | None = None):
+        """Create a new document; returns (document_id, revision_id)."""
+        raise NotImplementedError
+
+    async def add_permission_member(
+        self, document_id: str, *, member_type: str, member_id: str, perm: str = "full_access"
+    ) -> bool:
+        """Share the document with a member; False when the platform denies."""
+        raise NotImplementedError
 
     async def list_blocks(self, document_id: str) -> dict[str, str]:
         """section_key -> block text (remote truth)."""
         raise NotImplementedError
 
-    async def create_block(self, document_id: str, section_key: str, text: str) -> None:
+    async def list_blocks_with_revision(self, document_id: str) -> tuple[dict[str, str], int | None]:
+        """section_key -> block text + current document revision (optimistic
+        concurrency token); None revision when the platform has none."""
+        return await self.list_blocks(document_id), None
+
+    async def create_block(self, document_id: str, section_key: str, text: str, *, document_revision_id: int | None = None) -> None:
         raise NotImplementedError
 
-    async def update_block(self, document_id: str, section_key: str, text: str) -> None:
+    async def update_block(self, document_id: str, section_key: str, text: str, *, document_revision_id: int | None = None) -> None:
         raise NotImplementedError
 
 
@@ -89,20 +104,56 @@ class FakeDocPlatform(DocPlatform):
         self.calls: list[tuple] = []
         self.human_edit: list[tuple] = []  # (document_id, section_key, text) applied manually
         self.fail_writes: bool = False  # simulate platform outages
+        self.revision: int | None = 1  # simulated document revision
+        self.documents: dict[str, dict] = {}  # document_id -> {title, folder_token, members}
+        self.deny_collaborator: bool = False  # simulate missing drive scope
+
+    async def create_document(self, title: str, *, folder_token: str | None = None):
+        doc_id = f"doc-{len(self.documents) + 1}"
+        self.documents[doc_id] = {"title": title, "folder_token": folder_token, "members": []}
+        self.revision = 1
+        return doc_id, self.revision
+
+    async def add_permission_member(
+        self, document_id: str, *, member_type: str, member_id: str, perm: str = "full_access"
+    ) -> bool:
+        if self.deny_collaborator:
+            return False
+        self.documents.setdefault(document_id, {"members": []})["members"].append(
+            {"member_type": member_type, "member_id": member_id, "perm": perm}
+        )
+        return True
+
+    async def remove_permission_member(
+        self, document_id: str, *, member_type: str, member_id: str
+    ) -> bool:
+        if self.deny_collaborator:
+            return False  # platform refuses membership ops (missing scope)
+        members = self.documents.setdefault(document_id, {"members": []})["members"]
+        before = len(members)
+        self.documents[document_id]["members"] = [
+            m for m in members if not (m["member_type"] == member_type and m["member_id"] == member_id)
+        ]
+        return len(self.documents[document_id]["members"]) != before
 
     async def list_blocks(self, document_id: str) -> dict[str, str]:
         return dict(self.blocks.get(document_id, {}))
 
-    async def create_block(self, document_id: str, section_key: str, text: str) -> None:
+    async def list_blocks_with_revision(self, document_id: str) -> tuple[dict[str, str], int | None]:
+        return dict(self.blocks.get(document_id, {})), self.revision
+
+    async def create_block(self, document_id: str, section_key: str, text: str, *, document_revision_id: int | None = None) -> None:
         if self.fail_writes:
             raise RuntimeError("platform outage (simulated)")
         self.blocks.setdefault(document_id, {})[section_key] = text
+        self.revision += 1
         self.calls.append(("create", document_id, section_key))
 
-    async def update_block(self, document_id: str, section_key: str, text: str) -> None:
+    async def update_block(self, document_id: str, section_key: str, text: str, *, document_revision_id: int | None = None) -> None:
         if self.fail_writes:
             raise RuntimeError("platform outage (simulated)")
         self.blocks.setdefault(document_id, {})[section_key] = text
+        self.revision += 1
         self.calls.append(("update", document_id, section_key))
 
     def simulate_human_edit(self, document_id: str, section_key: str, text: str) -> None:
@@ -145,7 +196,28 @@ def compile_sections(session: Session, project_id: str) -> dict[str, SectionCont
         key="decisions",
         text="## 决策\n" + ("\n".join(decision_lines) if decision_lines else "（暂无）"),
     )
-    sections["milestones"] = SectionContent(key="milestones", text="## 里程碑\n（暂无）")
+    # milestones: compiled from REAL milestone.reached events (never a
+    # hardcoded placeholder); each entry cites the task/decision it came from
+    from ..domain.events import make_event  # noqa: F401  (type registry)
+    from ..persistence.repositories import EventRepo
+
+    from sqlalchemy import select
+
+    from ..persistence.models import EventRow
+
+    milestone_rows = session.execute(
+        select(EventRow)
+        .where(EventRow.project_id == project_id, EventRow.event_type == "milestone.reached")
+        .order_by(EventRow.occurred_at)
+    ).scalars().all()
+    milestone_lines = []
+    for m in milestone_rows:
+        body = (m.payload_json or {}).get("body", "")
+        milestone_lines.append(f"- {body[:200]}" if body else f"- {m.idempotency_key}")
+    sections["milestones"] = SectionContent(
+        key="milestones",
+        text="## 里程碑\n" + ("\n".join(milestone_lines) if milestone_lines else "（暂无）"),
+    )
     # PI Notes: PI-owned; the system NEVER writes it
     sections[PI_NOTES_SECTION] = SectionContent(
         key=PI_NOTES_SECTION, text="## PI Notes\n（仅 PI 编辑）", owner="pi"
@@ -165,6 +237,163 @@ def _state_row(session: Session, project_id: str, document_id: str, section_key:
             ProjectionStateRow.section_key == section_key,
         )
     ).scalar_one_or_none()
+
+
+async def ensure_project_document(
+    session: Session,
+    platform: DocPlatform,
+    project,
+    *,
+    title_template: str,
+    folder_token: str = "",
+    staging_chat_id: str = "",
+    pi_open_id: str = "",
+    default_permission: str = "full_access",
+) -> str:
+    """Create the project's document ONCE and persist the receipt in the same
+    transaction (project.metadata.feishu_document_id + document.created event
+    + first projection outbox). Idempotent: a replay with the receipt already
+    persisted never creates a second document.
+
+    Collaborator sharing is best-effort by design: a missing drive scope must
+    not block the projection (the PI can still be granted access later), but
+    the denial is logged by code only.
+    """
+    from ..persistence.outbox import OutboxRepo
+    from ..persistence.repositories import ProjectRepo
+
+    existing = (project.metadata or {}).get("feishu_document_id")
+    if existing:
+        # idempotent replay: never create a second document, but retry a
+        # missing collaborator share (e.g. docs:doc scope granted later)
+        await _ensure_shared(session, platform, project, existing, staging_chat_id, pi_open_id, default_permission)
+        return existing
+    from datetime import date
+
+    title = title_template.format(project_name=project.name, date=date.today().isoformat())
+    doc_id, revision = await platform.create_document(title, folder_token=folder_token or None)
+    await _ensure_shared(session, platform, project, doc_id, staging_chat_id, pi_open_id, default_permission)
+    # same-transaction write-back: receipt + event + first projection outbox
+    project.metadata = dict(project.metadata or {})
+    project.metadata["feishu_document_id"] = doc_id
+    project.metadata["feishu_document_title"] = title
+    project.metadata["feishu_document_revision"] = revision
+    project.updated_at = utcnow()
+    ProjectRepo(session).save(project)
+    EventRepo(session).append(
+        make_event(
+            event_type="document.created",
+            aggregate=AggregateRef(type="project", id=project.id, version=project.version),
+            idempotency_key=f"project:{project.project_id}:document.created:{doc_id}",
+            project_id=project.project_id,            payload={"document_id": doc_id, "title": title, "revision": revision},
+        )
+    )
+    # first projection outbox: queue all sections (write-back happens in the
+    # outbox sender AFTER a successful delivery, same design as sync_document)
+    sections = compile_sections(session, project.project_id)
+    for key in SECTION_ORDER:
+        content = sections[key]
+        if content.owner == "pi":
+            continue
+        _enqueue_doc_block(
+            session,
+            project_id=project.project_id,
+            document_id=doc_id,
+            section_key=key,
+            text=content.text,
+            expected_remote="",  # brand-new document: no remote content yet
+            actor=Actor(type="system"),
+        )
+    logger.info(
+        "project document ensured: project=%s document_id=%s title=%r",
+        project.project_id, doc_id, title,
+    )
+    return doc_id
+
+
+async def _ensure_shared(
+    session: Session,
+    platform: DocPlatform,
+    project,
+    doc_id: str,
+    staging_chat_id: str,
+    pi_open_id: str,
+    default_permission: str,
+) -> None:
+    """Best-effort collaborator sharing with a persisted shared marker.
+
+    A missing drive scope (e.g. docs:doc not yet granted) must NOT block the
+    projection: the denial is logged by code only, the document receipt is
+    still persisted, and a later replay (after the scope is granted) retries
+    the share.
+
+    Least privilege: the group (openchat) gets read-only `view` — extra chat
+    members must never edit project documents — while the PI (openid) gets
+    the configured permission (full_access so PI Notes stay editable). The
+    marker stores (member_type, member_id) so rotating the chat/PI re-grants
+    to the new principal instead of skipping on the old label.
+    """
+    logger = logging.getLogger("researchd.doc")
+    from ..persistence.repositories import ProjectRepo
+
+    metadata = dict(project.metadata or {})
+    # marker stores "member_type:member_id" so rotations re-grant to the NEW
+    # principal AND revoke the former one
+    marked = {x for x in (metadata.get("feishu_document_shared") or "").split(",") if x}
+    targets = [
+        ("openchat:" + staging_chat_id, "openchat", staging_chat_id, "view"),
+        ("openid:" + pi_open_id, "openid", pi_open_id, default_permission),
+    ]
+    desired = {label for label, member_type, member_id, _ in targets if member_id}
+    # revoke principals that are no longer desired
+    for stale in marked - desired:
+        member_type, _, member_id = stale.partition(":")
+        if not member_id:
+            continue
+        try:
+            revoked = await platform.remove_permission_member(
+                doc_id, member_type=member_type, member_id=member_id
+            )
+            if revoked:
+                marked.discard(stale)
+                logger.info("document share revoked: doc=%s %s", doc_id, stale)
+            else:
+                # platform denied the revoke (e.g. missing scope): KEEP the
+                # marker so a later replay retries; the stale principal must
+                # not silently stay authorized
+                logger.warning(
+                    "document revoke denied by platform (code unknown): doc=%s member=%s — marker kept for retry",
+                    doc_id, stale,
+                )
+        except Exception as exc:  # noqa: BLE001 — best-effort by design
+            logger.warning(
+                "document revoke skipped (code %s): doc=%s member=%s — marker kept for retry",
+                getattr(exc, "code", "unknown"), doc_id, stale,
+            )
+    for label, member_type, member_id, perm in targets:
+        if not member_id or label in marked:
+            continue
+        try:
+            granted = await platform.add_permission_member(
+                doc_id, member_type=member_type, member_id=member_id, perm=perm
+            )
+            if granted:
+                marked.add(label)
+            else:
+                # platform denied (missing scope): do NOT record as shared —
+                # a later replay retries
+                logger.warning(
+                    "document share denied by platform: doc=%s member=%s — marker not set",
+                    doc_id, label,
+                )
+        except Exception as exc:  # noqa: BLE001 — best-effort by design
+            logger.warning(
+                "document share skipped (code %s): doc=%s member=%s — will retry on next replay",
+                getattr(exc, "code", "unknown"), doc_id, label,
+            )
+    metadata["feishu_document_shared"] = ",".join(sorted(marked))
+    project.metadata = metadata
+    ProjectRepo(session).save(project)
 
 
 def _pending_outbox(session: Session, prefix: str) -> bool:

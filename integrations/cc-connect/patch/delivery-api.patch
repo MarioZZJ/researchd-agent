@@ -1,14 +1,43 @@
 diff --git a/core/engine.go b/core/engine.go
-index 79e2892..195188c 100644
+index 79e2892..095fcf8 100644
 --- a/core/engine.go
 +++ b/core/engine.go
-@@ -10629,6 +10629,46 @@ func (e *Engine) tryProviderAddPreset(p Platform, msg *Message, switcher Provide
+@@ -3613,7 +3613,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
+ 	if agent != e.agent {
+ 		agentOverride = agent
+ 	}
+-	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey)
++	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey, msg.UserID)
+ 
+ 	// Set workspaceDir on the state for idle reaper identification
+ 	if workspaceDir != "" {
+@@ -3880,7 +3880,7 @@ func adoptPendingFromPlaceholder(existing, newState *interactiveState) {
+ 
+ // When agentOverride is non-nil it is used instead of e.agent to start the session.
+ // ccSessionKey, when non-empty, is used for CC_SESSION_KEY env injection; otherwise sessionKey is used.
+-func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string) *interactiveState {
++func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey, userID string) *interactiveState {
+ 	e.interactiveMu.Lock()
+ 	defer e.interactiveMu.Unlock()
+ 
+@@ -3932,6 +3932,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform,
+ 		envVars := []string{
+ 			"CC_PROJECT=" + e.name,
+ 			"CC_SESSION_KEY=" + ccKey,
++			"CC_USER_ID=" + userID,
+ 		}
+ 		if e.dataDir != "" {
+ 			envVars = append(envVars, "CC_DATA_DIR="+e.dataDir)
+@@ -10629,6 +10630,46 @@ func (e *Engine) tryProviderAddPreset(p Platform, msg *Message, switcher Provide
  
  // SendToSession sends a message to an active session from an external caller (API/CLI).
  // If sessionKey is empty, it picks the first active session.
 +// SendToSessionWithHandle sends a message and returns the platform message id
 +// (used by the Delivery API so callers can update the same message in place).
-+func (e *Engine) SendToSessionWithHandle(sessionKey, message string) (string, error) {
++// idempotencyKey, when non-empty, is passed to the platform as the native
++// message uuid (Feishu de-duplicates on it), so a crash between send and
++// persist can never produce a duplicate message on retry.
++func (e *Engine) SendToSessionWithHandle(sessionKey, message, idempotencyKey string) (string, error) {
 +	state, p, replyCtx, err := e.resolveOutboundSessionTarget(sessionKey, false)
 +	if err != nil {
 +		return "", err
@@ -20,7 +49,7 @@ index 79e2892..195188c 100644
 +	if err := e.waitOutgoing(p); err != nil {
 +		return "", err
 +	}
-+	handle, err := sender.SendHandle(e.ctx, replyCtx, message)
++	handle, err := sender.SendHandle(e.ctx, replyCtx, message, idempotencyKey)
 +	if err != nil {
 +		return "", err
 +	}
@@ -49,6 +78,146 @@ index 79e2892..195188c 100644
  func (e *Engine) SendToSession(sessionKey, message string) error {
  	return e.SendToSessionWithAttachments(sessionKey, message, nil, nil, nil, false)
  }
+diff --git a/core/engine_test.go b/core/engine_test.go
+index 7cd2585..66cc9a6 100644
+--- a/core/engine_test.go
++++ b/core/engine_test.go
+@@ -3265,6 +3265,9 @@ func TestHandleMessage_MultiWorkspacePreservesCCSessionKey(t *testing.T) {
+ 			if strings.Contains(got, normalizedWsDir) {
+ 				t.Fatalf("CC_SESSION_KEY leaked workspace path: %q", got)
+ 			}
++			if uid := wsAgent.EnvValue("CC_USER_ID"); uid != "U1" {
++				t.Fatalf("CC_USER_ID = %q, want %q (real platform user id)", uid, "U1")
++			}
+ 			return
+ 		}
+ 
+@@ -7060,7 +7063,7 @@ func TestSessionMismatch_RecyclesStaleAgent(t *testing.T) {
+ 	// The active Session now wants a DIFFERENT agent session ID.
+ 	session := &Session{AgentSessionID: "new-agent-id"}
+ 
+-	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
++	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
+ 
+ 	if state.agentSession == oldSess {
+ 		t.Fatal("expected stale agent session to be replaced")
+@@ -7097,7 +7100,7 @@ func TestSessionClearedAfterNew_RecyclesAliveAgent(t *testing.T) {
+ 
+ 	session := &Session{AgentSessionID: ""}
+ 
+-	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
++	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
+ 	if state.agentSession == oldSess {
+ 		t.Fatal("expected stale agent to be recycled when AgentSessionID was cleared")
+ 	}
+@@ -7132,7 +7135,7 @@ func TestSessionMismatch_ReusesWhenIDsMatch(t *testing.T) {
+ 
+ 	session := &Session{AgentSessionID: "matching-id"}
+ 
+-	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
++	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
+ 	if state != existingState {
+ 		t.Fatal("expected existing state to be reused when session IDs match")
+ 	}
+@@ -7150,7 +7153,7 @@ func TestSessionIDWriteback_ImmediateAfterStartSession(t *testing.T) {
+ 	key := "test:user1"
+ 	session := &Session{AgentSessionID: ""} // empty — no prior binding
+ 
+-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
++	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
+ 
+ 	got := session.GetAgentSessionID()
+ 
+@@ -7171,7 +7174,7 @@ func TestSessionIDWriteback_MapsSessionName(t *testing.T) {
+ 	key := "test:user1"
+ 	session := e.sessions.NewSession(key, "我的自定义会话")
+ 
+-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
++	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
+ 
+ 	got := e.sessions.GetSessionName("agent-uuid-456")
+ 	if got != "我的自定义会话" {
+@@ -7193,7 +7196,7 @@ func TestSessionIDWriteback_TracksLiveForkedID(t *testing.T) {
+ 	key := "test:user1"
+ 	session := &Session{AgentSessionID: "existing-uuid"}
+ 
+-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
++	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
+ 
+ 	got := session.GetAgentSessionID()
+ 
+@@ -7219,7 +7222,7 @@ func TestInteractiveWriteBack_TracksForkedSessionID(t *testing.T) {
+ 	// Session already holds the original (now stale) ID from a prior turn.
+ 	session := &Session{AgentSessionID: "orig-id", AgentType: "controllable"}
+ 
+-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
++	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
+ 
+ 	if got := session.GetAgentSessionID(); got != "forked-id" {
+ 		t.Fatalf("AgentSessionID = %q, want %q — must track the live forked ID", got, "forked-id")
+@@ -7241,7 +7244,7 @@ func TestInteractiveWriteBack_NamingBindsOnlyOnFirstAssignment(t *testing.T) {
+ 	session := &Session{Name: "my-feature", AgentType: "controllable"}
+ 
+ 	// First assignment: name should bind to first-id.
+-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
++	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
+ 	if got := e.sessions.GetSessionName("first-id"); got != "my-feature" {
+ 		t.Fatalf("first-id name = %q, want %q on first assignment", got, "my-feature")
+ 	}
+@@ -7254,7 +7257,7 @@ func TestInteractiveWriteBack_NamingBindsOnlyOnFirstAssignment(t *testing.T) {
+ 	delete(e.interactiveStates, key) // force a fresh start path
+ 	e.interactiveMu.Unlock()
+ 
+-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
++	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
+ 	if got := session.GetAgentSessionID(); got != "forked-id" {
+ 		t.Fatalf("AgentSessionID = %q, want %q after fork", got, "forked-id")
+ 	}
+@@ -7321,7 +7324,7 @@ func TestResumeFallback_ClearsStaleSessionID(t *testing.T) {
+ 	// Session has a stale AgentSessionID from a previously killed agent.
+ 	session := &Session{AgentSessionID: "stale-id", AgentType: "controllable"}
+ 
+-	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
++	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
+ 
+ 	// The new agent session should be the fresh one.
+ 	if state.agentSession != freshSess {
+@@ -7362,7 +7365,7 @@ func TestStaleGoroutineCleanup_RaceSimulation(t *testing.T) {
+ 
+ 	// Step 3: New turn creates Session B and calls getOrCreateInteractiveStateWith.
+ 	sessionB := &Session{AgentSessionID: ""}
+-	newState := e.getOrCreateInteractiveStateWith(key, p, "ctx", sessionB, e.sessions, nil, "")
++	newState := e.getOrCreateInteractiveStateWith(key, p, "ctx", sessionB, e.sessions, nil, "", "")
+ 
+ 	// Verify S2 is in the map.
+ 	e.interactiveMu.Lock()
+@@ -7840,7 +7843,7 @@ func TestResumeFailureFallbackToFreshSession(t *testing.T) {
+ 	session.SetAgentSessionID("old-session-id", "stub")
+ 
+ 	p := &stubPlatformEngine{n: "test"}
+-	state := e.getOrCreateInteractiveStateWith("test:user1", p, "ctx", session, e.sessions, nil, "")
++	state := e.getOrCreateInteractiveStateWith("test:user1", p, "ctx", session, e.sessions, nil, "", "")
+ 
+ 	if state.agentSession == nil {
+ 		t.Fatal("expected agentSession to be non-nil after fallback")
+@@ -7878,7 +7881,7 @@ func TestFreshSessionWithoutSavedSessionIDStartsFresh(t *testing.T) {
+ 	session := e.sessions.GetOrCreateActive("test:user2")
+ 
+ 	p := &stubPlatformEngine{n: "test"}
+-	state := e.getOrCreateInteractiveStateWith("test:user2", p, "ctx", session, e.sessions, nil, "")
++	state := e.getOrCreateInteractiveStateWith("test:user2", p, "ctx", session, e.sessions, nil, "", "")
+ 
+ 	if state.agentSession == nil {
+ 		t.Fatal("expected agentSession to be non-nil")
+@@ -7915,7 +7918,7 @@ func TestWorkspaceReconnectWithSavedSessionIDUsesExactResume(t *testing.T) {
+ 	session.SetAgentSessionID("saved-session-id", "stub")
+ 
+ 	p := &stubPlatformEngine{n: "test"}
+-	state := e.getOrCreateInteractiveStateWith("test:user3", p, "ctx", session, e.sessions, nil, "")
++	state := e.getOrCreateInteractiveStateWith("test:user3", p, "ctx", session, e.sessions, nil, "", "")
+ 
+ 	if state.agentSession == nil {
+ 		t.Fatal("expected agentSession to be non-nil")
 diff --git a/core/interfaces.go b/core/interfaces.go
 index e92182a..20556f8 100644
 --- a/core/interfaces.go
@@ -62,7 +231,10 @@ index e92182a..20556f8 100644
 +// message and return its platform message id (needed by the Delivery API so
 +// the sender can later update the same message in place).
 +type MessageHandleSender interface {
-+	SendHandle(ctx context.Context, rctx any, content string) (string, error)
++	// SendHandle sends content and returns the platform message id.
++	// idempotencyKey, when non-empty, is the platform-native uuid used for
++	// de-duplication (Feishu returns the SAME message id for the same uuid).
++	SendHandle(ctx context.Context, rctx any, content, idempotencyKey string) (string, error)
 +}
 +
 +// MessageUpdaterByID is an optional interface for platforms that can update an
@@ -74,11 +246,13 @@ diff --git a/core/management.go b/core/management.go
 index 70bab96..17df6e3 100644
 --- a/core/management.go
 +++ b/core/management.go
-@@ -10,6 +10,7 @@ import (
+@@ -10,6 +10,9 @@ import (
  	"log/slog"
  	"net/http"
  	"os"
 +	"path/filepath"
++	"crypto/sha256"
++	"encoding/hex"
  	"strconv"
  	"strings"
  	"sync"
@@ -123,52 +297,56 @@ index 70bab96..17df6e3 100644
 +			return
 +		}
 +		// idempotency: the same idempotency_key always returns the same
-+		// platform_message_id (persisted across restarts). The whole
-+		// load->send->save sequence is serialized per process; concurrent
-+		// requests for the same key cannot double-deliver.
++		// platform_message_id. The key maps to a DETERMINISTIC platform uuid
++		// (rd-<sha256(key) prefix>), so Feishu itself de-duplicates: a crash
++		// between send and persist can never double-send, and a retry after
++		// the crash simply re-uses the uuid (the platform returns the SAME
++		// message id). The ledger (deliveries.json) is a cache only; a
++		// CORRUPT ledger fails closed (500) — it is never treated as empty.
++		var origKey string
 +		if body.IdempotencyKey != "" {
 +			deliveryMu.Lock()
 +			defer deliveryMu.Unlock()
-+			if existing, ok := loadDelivery(body.IdempotencyKey); ok {
-+				if existing == deliveryInFlight {
-+					// write-ahead reservation: a previous attempt is still
-+					// completing (or crashed mid-send) — retry later; the key
-+					// will resolve to the final id once the send completes.
-+					mgmtError(w, http.StatusConflict, "delivery in progress for idempotency key")
-+					return
-+				}
++			origKey = body.IdempotencyKey
++			existing, ok, err := loadDelivery(origKey)
++			if err != nil {
++				mgmtError(w, http.StatusInternalServerError, "delivery ledger unreadable (fail-closed)")
++				return
++			}
++			if ok {
 +				mgmtJSON(w, http.StatusOK, map[string]any{
 +					"platform_message_id": existing,
-+					"idempotency_key":     body.IdempotencyKey,
++					"idempotency_key":     origKey,
 +					"replayed":            true,
 +				})
 +				return
 +			}
-+			// write-ahead: reserve the key BEFORE sending so a crash between
-+			// send and persist can never double-deliver the same key
-+			if err := saveDelivery(body.IdempotencyKey, deliveryInFlight); err != nil {
-+				mgmtError(w, http.StatusInternalServerError, "reserve delivery: "+err.Error())
-+				return
-+			}
++			// deterministic platform uuid derived from the key: a retry after
++			// a crash re-uses the SAME uuid, so Feishu returns the SAME
++			// message id — never a duplicate message
++			body.IdempotencyKey = deliveryUUID(origKey)
 +		}
-+		handle, err := e.SendToSessionWithHandle(body.SessionKey, body.Message)
++		handle, err := e.SendToSessionWithHandle(body.SessionKey, body.Message, body.IdempotencyKey)
 +		if err != nil {
-+			// unreserve so the key can be retried
-+			if body.IdempotencyKey != "" {
-+				_ = deleteDelivery(body.IdempotencyKey)
-+			}
 +			mgmtError(w, http.StatusInternalServerError, err.Error())
 +			return
 +		}
-+		if body.IdempotencyKey != "" {
-+			if err := saveDelivery(body.IdempotencyKey, handle); err != nil {
++		if handle == "" {
++			// a successful platform response WITHOUT a message id must never
++			// be cached as "" — that would permanently break in-place
++			// updates for this key
++			mgmtError(w, http.StatusInternalServerError, "platform returned no message id")
++			return
++		}
++		if origKey != "" {
++			if err := saveDelivery(origKey, handle); err != nil {
 +				mgmtError(w, http.StatusInternalServerError, "persist delivery: "+err.Error())
 +				return
 +			}
 +		}
 +		mgmtJSON(w, http.StatusOK, map[string]any{
 +			"platform_message_id": handle,
-+			"idempotency_key":     body.IdempotencyKey,
++			"idempotency_key":     origKey,
 +			"replayed":            false,
 +		})
 +		return
@@ -215,16 +393,23 @@ index 70bab96..17df6e3 100644
 +// (single-process; cross-process coordination is out of scope for the patch).
 +var deliveryMu sync.Mutex
 +
-+// deliveriesFile is the persisted idempotency map (key -> platform message id).
++// deliveriesFile is the persisted idempotency cache (key -> platform message
++// id). It is a CACHE: the real de-duplication is Feishu's native uuid
++// (deliveryUUID below), so a crash between send and persist can never
++// double-send, and a retry resolves to the same message id.
 +var deliveriesFile = filepath.Join(os.Getenv("HOME"), ".cc-connect", "deliveries.json")
 +
 +type deliveriesStore struct {
 +	Entries map[string]string `json:"entries"`
 +}
 +
-+// deliveryInFlight is the write-ahead reservation value stored before the
-+// message is sent; it resolves to the final id once the send completes.
-+const deliveryInFlight = "__in_flight__"
++// deliveryUUID derives the deterministic platform uuid from an idempotency
++// key: "rd-" + hex(sha256(key))[:32]. Feishu's uuid de-duplication guarantees
++// exactly-once even across crashes and restarts.
++func deliveryUUID(key string) string {
++	sum := sha256.Sum256([]byte(key))
++	return "rd-" + hex.EncodeToString(sum[:])[:32]
++}
 +
 +func deleteDelivery(key string) error {
 +	store := deliveriesStore{Entries: map[string]string{}}
@@ -246,17 +431,22 @@ index 70bab96..17df6e3 100644
 +	return os.Rename(tmp, deliveriesFile)
 +}
 +
-+func loadDelivery(key string) (string, bool) {
++// loadDelivery returns (id, found, err). A CORRUPT ledger is an error (the
++// caller fails closed) — it is never silently treated as an empty file.
++func loadDelivery(key string) (string, bool, error) {
 +	data, err := os.ReadFile(deliveriesFile)
 +	if err != nil {
-+		return "", false
++		if os.IsNotExist(err) {
++			return "", false, nil
++		}
++		return "", false, err
 +	}
 +	var store deliveriesStore
 +	if err := json.Unmarshal(data, &store); err != nil {
-+		return "", false
++		return "", false, fmt.Errorf("deliveries.json corrupt: %w", err)
 +	}
 +	id, ok := store.Entries[key]
-+	return id, ok
++	return id, ok, nil
 +}
 +
 +func saveDelivery(key, messageID string) error {
@@ -281,17 +471,50 @@ index 70bab96..17df6e3 100644
 +	}
 +	return os.Rename(tmp, deliveriesFile)
 +}
+diff --git a/core/session_id_validation_test.go b/core/session_id_validation_test.go
+index 09ce9c9..5a2138d 100644
+--- a/core/session_id_validation_test.go
++++ b/core/session_id_validation_test.go
+@@ -50,7 +50,7 @@ func TestIssue599_InvalidSessionIDClearedBeforeResume(t *testing.T) {
+ 	// Simulate a stored cross-project session ID.
+ 	s := &Session{AgentSessionID: "leaked-id-from-other-project"}
+ 
+-	e.getOrCreateInteractiveStateWith(key, p, "ctx", s, e.sessions, nil, "")
++	e.getOrCreateInteractiveStateWith(key, p, "ctx", s, e.sessions, nil, "", "")
+ 
+ 	if startedWith != "" {
+ 		t.Errorf("StartSession called with %q, want \"\" (fresh start; leaked id must NOT be passed through)", startedWith)
+@@ -80,7 +80,7 @@ func TestIssue599_ValidSessionIDPreserved(t *testing.T) {
+ 
+ 	s := &Session{AgentSessionID: "valid-id-abc"}
+ 
+-	e.getOrCreateInteractiveStateWith(key, p, "ctx", s, e.sessions, nil, "")
++	e.getOrCreateInteractiveStateWith(key, p, "ctx", s, e.sessions, nil, "", "")
+ 
+ 	if startedWith != "valid-id-abc" {
+ 		t.Errorf("StartSession called with %q, want %q (resume path)", startedWith, "valid-id-abc")
+@@ -106,7 +106,7 @@ func TestIssue599_AgentWithoutValidatorNotBlocked(t *testing.T) {
+ 
+ 	s := &Session{AgentSessionID: "any-id"}
+ 
+-	e.getOrCreateInteractiveStateWith(key, p, "ctx", s, e.sessions, nil, "")
++	e.getOrCreateInteractiveStateWith(key, p, "ctx", s, e.sessions, nil, "", "")
+ 
+ 	if startedWith != "any-id" {
+ 		t.Errorf("StartSession called with %q, want %q (no validator = pass through)", startedWith, "any-id")
 diff --git a/platform/feishu/feishu.go b/platform/feishu/feishu.go
-index bafedee..a9a2f35 100644
+index bafedee..99b2ec3 100644
 --- a/platform/feishu/feishu.go
 +++ b/platform/feishu/feishu.go
-@@ -2627,6 +2627,21 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
+@@ -2627,6 +2627,27 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
  	return p.sendNewMessageToChat(ctx, rc, msgType, msgBody)
  }
  
 +// SendHandle implements core.MessageHandleSender: send a message and return
 +// its platform message id so the caller can update it in place.
-+func (p *Platform) SendHandle(ctx context.Context, rctx any, content string) (string, error) {
++// A full interactive card JSON (schema 2.0) is passed through verbatim so
++// decision buttons survive; plain markdown is wrapped like a normal send.
++func (p *Platform) SendHandle(ctx context.Context, rctx any, content, idempotencyKey string) (string, error) {
 +	rc, ok := rctx.(replyContext)
 +	if !ok {
 +		return "", fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
@@ -301,24 +524,33 @@ index bafedee..a9a2f35 100644
 +	// path cannot produce one).
 +	content = p.resolveMentionsInContent(ctx, rc.chatID, content)
 +	msgType, msgBody := buildReplyContent(content)
-+	return p.createMessageHandle(ctx, rc.chatID, msgType, msgBody, "send")
++	if isCardJSON(content) {
++		msgType = larkim.MsgTypeInteractive
++		msgBody = content
++	}
++	return p.createMessageHandle(ctx, rc.chatID, msgType, msgBody, "send", idempotencyKey)
 +}
 +
  // SendWithStatusFooter implements core.StatusFooterSender: send a reply with
  // the body content followed by a small/dim status-footer block. Always uses
  // the interactive card path so the footer can render with text_size:
-@@ -3388,6 +3403,37 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
+@@ -3388,6 +3409,37 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
  	})
  }
  
-+func (p *Platform) createMessageHandle(ctx context.Context, chatID, msgType, content, op string) (string, error) {
++func (p *Platform) createMessageHandle(ctx context.Context, chatID, msgType, content, op, idempotencyKey string) (string, error) {
++	reqBuilder := larkim.NewCreateMessageReqBodyBuilder().
++		ReceiveId(chatID).
++		MsgType(msgType).
++		Content(content)
++	if idempotencyKey != "" {
++		// Feishu de-duplicates on uuid: the same key always maps to the same
++		// message — retries after a crash can never double-send.
++		reqBuilder.Uuid(idempotencyKey)
++	}
 +	req := larkim.NewCreateMessageReqBuilder().
 +		ReceiveIdType(larkim.ReceiveIdTypeChatId).
-+		Body(larkim.NewCreateMessageReqBodyBuilder().
-+			ReceiveId(chatID).
-+			MsgType(msgType).
-+			Content(content).
-+			Build()).
++		Body(reqBuilder.Build()).
 +		Build()
 +	var messageID string
 +	err := p.withTransientRetry(ctx, op, func() error {
@@ -345,7 +577,7 @@ index bafedee..a9a2f35 100644
  func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, op string) error {
  	req := larkim.NewCreateMessageReqBuilder().
  		ReceiveIdType(larkim.ReceiveIdTypeChatId).
-@@ -4405,6 +4451,25 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
+@@ -4405,6 +4457,25 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
  	return p.patchCardMessage(ctx, h.messageID, cardJSON)
  }
  
@@ -371,3 +603,68 @@ index bafedee..a9a2f35 100644
  // UpdateMessageWithStatusFooter implements core.StatusFooterUpdater: edit an
  // existing card to render the body markdown plus a small/dim status-footer
  // block (Lark `text_size: "notation"`). Falls through to UpdateMessage when
+diff --git a/core/delivery_idempotency_test.go b/core/delivery_idempotency_test.go
+new file mode 100644
+index 0000000..4099311
+--- /dev/null
++++ b/core/delivery_idempotency_test.go
+@@ -0,0 +1,59 @@
++package core
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestDeliveryUUIDDeterministic(t *testing.T) {
++	a := deliveryUUID("outbox:key-1")
++	b := deliveryUUID("outbox:key-1")
++	c := deliveryUUID("outbox:key-2")
++	if a != b {
++		t.Fatalf("deliveryUUID not deterministic: %s != %s", a, b)
++	}
++	if a == c {
++		t.Fatal("deliveryUUID collides for different keys")
++	}
++	if len(a) != 35 || a[:3] != "rd-" {
++		t.Fatalf("unexpected uuid shape %q (want rd-<32 hex>)", a)
++	}
++	for _, ch := range a {
++		ok := ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9' || ch == '-'
++		if !ok {
++			t.Fatalf("uuid %q contains char outside [a-z0-9-]: %q", a, ch)
++		}
++	}
++}
++
++func TestDeliveryLedgerCorruptFailsClosed(t *testing.T) {
++	dir := t.TempDir()
++	deliveriesFile = filepath.Join(dir, "deliveries.json")
++	t.Cleanup(func() { deliveriesFile = filepath.Join(os.Getenv("HOME"), ".cc-connect", "deliveries.json") })
++	if err := os.WriteFile(deliveriesFile, []byte("{not json"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err := loadDelivery("k"); err == nil {
++		t.Fatal("corrupt ledger must fail closed (error), not look empty")
++	}
++	if _, ok, _ := loadDelivery("k"); ok {
++		t.Fatal("corrupt ledger must not return entries")
++	}
++}
++
++func TestDeliveryLedgerRoundTrip(t *testing.T) {
++	dir := t.TempDir()
++	deliveriesFile = filepath.Join(dir, "deliveries.json")
++	t.Cleanup(func() { deliveriesFile = filepath.Join(os.Getenv("HOME"), ".cc-connect", "deliveries.json") })
++	if err := saveDelivery("key-1", "om_abc123"); err != nil {
++		t.Fatal(err)
++	}
++	id, ok, err := loadDelivery("key-1")
++	if err != nil || !ok || id != "om_abc123" {
++		t.Fatalf("round trip failed: id=%q ok=%v err=%v", id, ok, err)
++	}
++	if _, ok, _ := loadDelivery("key-2"); ok {
++		t.Fatal("unknown key must not resolve")
++	}
++}

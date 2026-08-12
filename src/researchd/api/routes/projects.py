@@ -190,6 +190,67 @@ def _get_project(uow: UnitOfWork, project_id: str) -> Project:
     return project
 
 
+@router.get("/projects/{project_id}/members/{user_id}", dependencies=[Depends(require_token)])
+def check_membership(project_id: str, user_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
+    """Membership check for the ACP bind path (fail-closed: a project with no
+    member rows refuses everything; a non-member gets 403)."""
+    from sqlalchemy import select
+
+    from ...persistence.models import ProjectMemberRow
+
+    if not _PROJECT_ID_RE.fullmatch(project_id) or len(user_id) > 128:
+        raise HTTPException(status_code=400, detail="bad project_id or user_id")
+    rows = uow.session.execute(
+        select(ProjectMemberRow).where(ProjectMemberRow.project_id == project_id)
+    ).scalars().all()
+    if not rows:
+        raise HTTPException(status_code=403, detail="project has no members provisioned")
+    if any(r.platform_user_id == user_id for r in rows):
+        return {"project_id": project_id, "member": True}
+    raise HTTPException(status_code=403, detail="not a member")
+
+
+class ProjectMemberRequest(BaseModel):
+    platform_user_id: str = Field(min_length=1, max_length=128)
+    role: str = "member"  # member | pi
+    can_approve_decisions: bool = False
+
+
+@router.post("/projects/{project_id}/members", dependencies=[Depends(require_token)])
+def add_member(project_id: str, req: ProjectMemberRequest, uow: UnitOfWork = Depends(get_uow)) -> dict:
+    """Provision a project member (idempotent). The only writer path for
+    membership besides project creation (fail-closed gate §22)."""
+    from sqlalchemy import select
+
+    from ...persistence.models import ProjectMemberRow
+
+    if not _PROJECT_ID_RE.fullmatch(project_id):
+        raise HTTPException(status_code=400, detail="bad project_id")
+    project = ProjectRepo(uow.session).get_by_project_id(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f"project {project_id!r} not found")
+    existing = uow.session.execute(
+        select(ProjectMemberRow).where(
+            ProjectMemberRow.project_id == project_id,
+            ProjectMemberRow.platform_user_id == req.platform_user_id,
+        )
+    ).scalars().first()
+    if existing is not None:
+        return {"project_id": project_id, "platform_user_id": req.platform_user_id, "added": False}
+    uow.session.add(
+        ProjectMemberRow(
+            id=f"PM-{project_id}-{req.platform_user_id[:24]}",
+            member_id=f"PM-{project_id}-{req.platform_user_id[:24]}",
+            project_id=project_id,
+            platform_user_id=req.platform_user_id,
+            role=req.role,
+            can_approve_decisions=req.can_approve_decisions,
+        )
+    )
+    uow.commit()
+    return {"project_id": project_id, "platform_user_id": req.platform_user_id, "added": True}
+
+
 @router.get("/projects/{project_id}/status", dependencies=[Depends(require_token)])
 def project_status(project_id: str, uow: UnitOfWork = Depends(get_uow)) -> dict:
     project = _get_project(uow, project_id)
@@ -337,8 +398,63 @@ def answer_decision(decision_id: str, req: DecisionAnswerRequest, uow: UnitOfWor
             payload={"option_id": req.option_id},
         )
     )
+    # in-place card update: the already-sent decision card (if any) is
+    # PATCHed to show the recorded answer — no meaningless new card (shared
+    # application flow: the ACP/button path goes through the same helper)
+    from ...application.handlers import _enqueue_decision_card_update
+
+    _enqueue_decision_card_update(uow.session, decision, req.actor, req.option_id)
     uow.commit()
     return {"decision_id": decision_id, "applied": True, "answer": req.option_id}
+
+
+class DecisionEvidenceLinkRequest(BaseModel):
+    evidence_id: str
+
+
+@router.post("/decisions/{decision_id}/evidence", dependencies=[Depends(require_token)])
+def link_decision_evidence(decision_id: str, req: DecisionEvidenceLinkRequest, uow: UnitOfWork = Depends(get_uow)) -> dict:
+    """Append a real evidence id to a decision's evidence_refs (idempotent).
+
+    The reporter's linter requires a decision card's bottom line to cite REAL
+    evidence; a bootstrap-OPEN decision (pilot D-002) needs the pilot's first
+    VERIFIED evidence linked before its card can be sent. Token-gated; the
+    evidence row itself must exist (fail-closed — the linter re-checks at
+    report time anyway).
+    """
+    from ...persistence.repositories import EvidenceRepo
+
+    repo = DecisionRepo(uow.session)
+    decision = repo.get_by_decision_id(decision_id)
+    if decision is None:
+        raise HTTPException(status_code=404, detail=f"decision {decision_id!r} not found")
+    evidence = EvidenceRepo(uow.session).get_by_evidence_id(req.evidence_id)
+    if evidence is None:
+        raise HTTPException(status_code=404, detail=f"evidence {req.evidence_id!r} not found")
+    if evidence.project_id != decision.project_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"evidence {req.evidence_id!r} belongs to project {evidence.project_id}, "
+            f"not {decision.project_id}",
+        )
+    refs = list(decision.evidence_refs or [])
+    if req.evidence_id in refs:
+        uow.commit()
+        return {"decision_id": decision_id, "evidence_refs": refs, "applied": False}
+    refs.append(req.evidence_id)
+    decision.evidence_refs = refs
+    repo.save(decision)
+    EventRepo(uow.session).append(
+        make_event(
+            event_type="decision.evidence_linked",
+            aggregate=AggregateRef(type="decision", id=decision.id, version=decision.version),
+            idempotency_key=f"decision:{decision_id}:evidence:{req.evidence_id}",
+            project_id=decision.project_id,
+            payload={"evidence_id": req.evidence_id},
+        )
+    )
+    uow.commit()
+    return {"decision_id": decision_id, "evidence_refs": refs, "applied": True}
 
 
 @router.post("/projects/{project_id}/commands", dependencies=[Depends(require_token)])

@@ -141,11 +141,11 @@ def test_overlay_isolation(tmp_path, monkeypatch):
         'name = "gateway"\n'
         'kind = "openai"\n'
         'base_url = "http://127.0.0.1:1/v1"\n'
-        'api_key = "sk-test-key"\n'
+        'api_key_env = "TEST_KEY"\n'
         'models = ["m"]\n'
         '[[providers]]\n'
         'name = "other"\n'
-        'api_key = "sk-other"\n'
+        'api_key_env = "OTHER_KEY"\n'
         '[bot]\n'
         'enabled = true\n'
         'app_secret_env = "SOMETHING"\n'
@@ -153,7 +153,9 @@ def test_overlay_isolation(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
     overlay = ensure_overlay(tmp_path / "data")
     cfg = (overlay / "config.toml").read_text()
-    assert "sk-test-key" in cfg and "sk-other" in cfg  # providers kept (needed to run)
+    assert "api_key_env = \"TEST_KEY\"" in cfg
+    assert "api_key_env = \"OTHER_KEY\"" in cfg  # env refs kept (needed to run)
+    assert "sk-" not in cfg  # inline secrets NEVER copied
     assert "SOMETHING" not in cfg  # bot secrets NOT copied
     mode = (overlay / "config.toml").stat().st_mode & 0o777
     assert mode == 0o600
@@ -200,7 +202,7 @@ def test_overlay_excludes_following_tables(tmp_path, monkeypatch):
     (fake_home / ".reasonix" / "config.toml").write_text(
         '[[providers]]\n'
         'name = "gw"\n'
-        'api_key = "sk-gw"\n'
+        'api_key_env = "GW_KEY"\n'
         '[[mcp.servers]]\n'
         'name = "secret-mcp"\n'
         'token = "mcp-secret-token"\n'
@@ -211,7 +213,8 @@ def test_overlay_excludes_following_tables(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
     overlay = ensure_overlay(tmp_path / "data2")
     cfg = (overlay / "config.toml").read_text()
-    assert "sk-gw" in cfg
+    assert 'api_key_env = "GW_KEY"' in cfg
+    assert "sk-gw" not in cfg  # inline secrets never copied
     assert "mcp-secret-token" not in cfg
     assert "BOT_SECRET" not in cfg
 

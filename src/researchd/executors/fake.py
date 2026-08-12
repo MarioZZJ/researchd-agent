@@ -75,6 +75,12 @@ class FakeExecutor(ExecutorAdapter):
             step = ScriptStep(**step)
         self._scripts.setdefault(role, []).append(step)
 
+    def call_count(self, role: RoleKind | None = None) -> int:
+        """Total executor turn calls (all roles, or one role)."""
+        if role is not None:
+            return self._calls.get(role, 0)
+        return sum(self._calls.values())
+
     def _next(self, role: RoleKind, task_id: str | None = None) -> ScriptStep | None:
         """Next unused step for this role: prefer a step bound to task_id,
         else the next unbound step. Each call bumps the per-role call count
@@ -105,7 +111,7 @@ class FakeExecutor(ExecutorAdapter):
         self.sessions.append(session)
 
         def _take_step(*, allow_default: bool) -> ScriptStep | None:
-            task_id = (context.get("task") or {}).get("task_id")
+            task_id = (context.get("task") or {}).get("task_id") or context.get("task_id")
             step = self._next(role, task_id=task_id)
             if step is not None:
                 return step
@@ -164,7 +170,7 @@ class FakeExecutor(ExecutorAdapter):
     async def run_worker(self, context: dict, *, profile: dict) -> tuple[WorkResult, ExecutorSessionInfo]:
         default = {
             "schema": "researchd.work_result.v1",
-            "task_id": context.get("task", {}).get("task_id", "T-UNKNOWN"),
+            "task_id": context.get("task_id") or context.get("task", {}).get("task_id", "T-UNKNOWN"),
             "outcome": "SUBMIT_FOR_REVIEW",
             "criteria_results": [],
             "artifacts": [],
@@ -179,7 +185,7 @@ class FakeExecutor(ExecutorAdapter):
     async def run_auditor(self, context: dict, *, profile: dict) -> tuple[AuditResult, ExecutorSessionInfo]:
         default = {
             "schema": "researchd.audit_result.v1",
-            "task_id": context.get("task", {}).get("task_id", "T-UNKNOWN"),
+            "task_id": context.get("task_id") or context.get("task", {}).get("task_id", "T-UNKNOWN"),
             "verdict": "ACCEPT",
             "checks": [],
         }

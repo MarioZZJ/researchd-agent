@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from typing import Any, Generic, TypeVar
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from ..domain.base import utcnow
@@ -24,10 +24,12 @@ from ..domain.evidence import Evidence, Claim, Issue  # noqa: F401
 from .models import (  # noqa: F401
     ArtifactRow,
     ClaimRow,
+    ContextPackageRow,
     DecisionOptionRow,
     DecisionRow,
     EventRow,
     EvidenceRow,
+    InvocationRow,
     IssueRow,
     ProjectBindingRow,
     ProjectRow,
@@ -241,6 +243,7 @@ class RunRepo(BaseRepo[Run]):
             outcome=r.outcome,
             result_json=r.result,
             error_message=r.error_message,
+            usage_json=r.usage,
             repair_attempts=r.repair_attempts,
             version=r.version,
             created_by=r.created_by,
@@ -272,6 +275,7 @@ class RunRepo(BaseRepo[Run]):
             outcome=row.outcome,
             result=row.result_json,
             error_message=row.error_message,
+            usage=row.usage_json,
             repair_attempts=row.repair_attempts,
             version=row.version,
             created_by=row.created_by,
@@ -289,6 +293,15 @@ class RunRepo(BaseRepo[Run]):
             select(RunRow).where(RunRow.status.in_(["QUEUED", "STARTING", "RUNNING"])).order_by(RunRow.created_at)
         ).scalars()
         return [self._to_domain(r) for r in rows]
+
+    def count_for_task(self, task_id: str) -> int:
+        """Total runs ever created for a task (bounds BLOCKED re-dispatches)."""
+        return int(
+            self.session.execute(
+                select(func.count()).select_from(RunRow).where(RunRow.task_id == task_id)
+            ).scalar()
+            or 0
+        )
 
 
 # ---------------------------------------------------------------- Events
@@ -396,6 +409,16 @@ class ArtifactRepo(BaseRepo):
     def get_by_artifact_id(self, artifact_id: str):
         row = self.session.execute(select(ArtifactRow).where(ArtifactRow.artifact_id == artifact_id)).scalar_one_or_none()
         return self._to_domain(row) if row else None
+
+    def list_by_run(self, run_id: str) -> list[Any]:
+        """All artifacts REGISTERED for a run (auditor re-checks these; the
+        worker's declared artifact list is not trusted)."""
+        rows = self.session.execute(
+            select(ArtifactRow)
+            .where(ArtifactRow.run_id == run_id)
+            .order_by(ArtifactRow.path, ArtifactRow.version)
+        ).scalars()
+        return [self._to_domain(r) for r in rows]
 
 
 # ---------------------------------------------------------------- Evidence
@@ -655,5 +678,144 @@ class ProjectBindingRepo(BaseRepo):
     def list_for_project(self, project_id: str) -> list:
         rows = self.session.execute(
             select(ProjectBindingRow).where(ProjectBindingRow.project_id == project_id).order_by(ProjectBindingRow.created_at)
+        ).scalars()
+        return [self._to_domain(r) for r in rows]
+
+
+# ---------------------------------------------------------------- Context Package
+class ContextPackageRepo(BaseRepo):
+    """Persist context packages so every model judgment is traceable to the
+    exact objects + rendered text it received (IMPLEMENTATION.md §13)."""
+
+    row_cls = ContextPackageRow
+
+    def _to_row(self, p) -> ContextPackageRow:  # noqa: ANN001
+        meta = dict(p.metadata or {})
+        meta.update({"role": p.role, "run_id": p.run_id, "content": p.content})
+        return ContextPackageRow(
+            id=p.id,
+            context_id=p.context_id,
+            project_id=p.project_id,
+            task_id=p.task_id,
+            objects_json=[o.model_dump() for o in p.objects],
+            token_estimate=p.token_estimate,
+            excluded_by_budget_json=p.excluded_by_budget or None,
+            content_hash=p.content_hash,
+            version=p.version,
+            created_by=p.created_by,
+            created_at=p.created_at,
+            updated_at=p.updated_at,
+            status=p.role,
+            metadata_json=meta,
+        )
+
+    def _to_domain(self, row: ContextPackageRow):
+        from ..domain.context import ContextObjectRef, ContextPackage
+
+        meta = dict(row.metadata_json or {})
+        pkg_meta = {k: v for k, v in meta.items() if k not in ("role", "run_id", "content")}
+        return ContextPackage(
+            id=row.id,
+            context_id=row.context_id,
+            role=meta.get("role") or row.status or "worker",
+            task_id=row.task_id,
+            run_id=meta.get("run_id"),
+            project_id=row.project_id,
+            objects=[ContextObjectRef(**o) for o in (row.objects_json or [])],
+            content=meta.get("content") or "",
+            token_estimate=row.token_estimate,
+            excluded_by_budget=row.excluded_by_budget_json or [],
+            content_hash=row.content_hash,
+            version=row.version,
+            created_by=row.created_by,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+            metadata=pkg_meta,
+        )
+
+    def get_by_context_id(self, context_id: str):
+        row = self.session.execute(
+            select(ContextPackageRow).where(ContextPackageRow.context_id == context_id)
+        ).scalar_one_or_none()
+        return self._to_domain(row) if row else None
+
+    def list_for_run(self, run_id: str) -> list:
+        rows = self.session.execute(
+            select(ContextPackageRow).where(ContextPackageRow.metadata_json["run_id"].as_string() == run_id)
+            .order_by(ContextPackageRow.created_at)
+        ).scalars()
+        return [self._to_domain(r) for r in rows]
+
+
+class InvocationRepo(BaseRepo):
+    """Model-call invocation ledger (planner/worker/auditor turns). Worker and
+    auditor turns also have runs rows; planner turns exist ONLY here."""
+
+    row_cls = InvocationRow
+
+    def _to_row(self, i) -> InvocationRow:  # noqa: ANN001
+        return InvocationRow(
+            id=i.id,
+            invocation_id=i.invocation_id,
+            role=i.role,
+            project_id=i.project_id,
+            task_id=i.task_id,
+            run_id=i.run_id,
+            context_id=i.context_id,
+            profile_name=i.profile_name,
+            resolved_model=i.resolved_model,
+            reasoning_effort=i.reasoning_effort,
+            skills_json=i.skills or None,
+            budget_json=i.budget or None,
+            started_at=i.started_at,
+            finished_at=i.finished_at,
+            status=i.status,
+            error_message=i.error_message,
+            usage_json=i.usage,
+            metadata_json=i.metadata or None,
+            version=i.version,
+            created_by=i.created_by,
+            created_at=i.created_at,
+            updated_at=i.updated_at,
+        )
+
+    def _to_domain(self, row: InvocationRow):
+        from ..domain.invocation import Invocation
+
+        return Invocation(
+            id=row.id,
+            invocation_id=row.invocation_id,
+            role=row.role,
+            project_id=row.project_id,
+            task_id=row.task_id,
+            run_id=row.run_id,
+            context_id=row.context_id,
+            profile_name=row.profile_name,
+            resolved_model=row.resolved_model,
+            reasoning_effort=row.reasoning_effort,
+            skills=row.skills_json or [],
+            budget=row.budget_json or {},
+            started_at=row.started_at,
+            finished_at=row.finished_at,
+            status=row.status,
+            error_message=row.error_message,
+            usage=row.usage_json,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+            metadata=row.metadata_json or {},
+        )
+
+    def get_by_invocation_id(self, invocation_id: str):
+        row = self.session.execute(
+            select(InvocationRow).where(InvocationRow.invocation_id == invocation_id)
+        ).scalar_one_or_none()
+        return self._to_domain(row) if row else None
+
+    def list_by_project(self, project_id: str, limit: int = 100) -> list:
+        rows = self.session.execute(
+            select(InvocationRow)
+            .where(InvocationRow.project_id == project_id)
+            .order_by(InvocationRow.started_at.desc())
+            .limit(limit)
         ).scalars()
         return [self._to_domain(r) for r in rows]

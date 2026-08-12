@@ -27,6 +27,15 @@ logger = logging.getLogger("researchd.scheduler")
 TICK_SECONDS = 2.0
 HEARTBEAT_SECONDS = 10.0
 
+# Bounded re-dispatches for tasks whose worker reported BLOCKED (outcome
+# BLOCKED, no decision blocking): after this many total runs the task stays
+# BLOCKED for human review instead of burning more model calls.
+MAX_WORKER_BLOCKED_RETRIES = 2
+
+# Bounded total runs per task before a retryable transport timeout becomes a
+# permanent failure (1 initial + 2 retries).
+MAX_RUN_RETRIES = 3
+
 # TaskRole -> default profile suffix (IMPLEMENTATION.md §15.1). Every role
 # must map to an existing DEFAULT_PROFILES entry.
 ROLE_TO_PROFILE = {
@@ -92,7 +101,9 @@ class SchedulerLoop:
         stats: dict = {"orphans": 0, "dispatched": 0, "heartbeats": 0, "outbox": {}, "decisions": 0, "reports": 0, "projection": 0, "diagnostics": 0, "planned": 0, "milestones": 0}
         # 1. recovery: any stale run (restart/crash) -> ORPHANED, task -> READY
         with self.session_factory() as session:
-            stats["orphans"] = len(reconcile_orphans(session))
+            stats["orphans"] = len(
+                reconcile_orphans(session, data_dir=self.settings.data_dir)
+            )
             session.commit()
         # 2. decision gate: evaluate pending candidates -> OPEN decisions
         #    (cheap-parallel conflict candidates are deferred to diagnostics)
@@ -102,9 +113,20 @@ class SchedulerLoop:
 
         stats["diagnostics"] = ensure_cheap_diagnostics(self.session_factory)
         # 2c. planning: first task batch for task-less ACTIVE projects
-        stats["planned"] = await plan_projects(self.session_factory, self.executor)
+        stats["planned"] = await plan_projects(
+            self.session_factory,
+            self.executor,
+            planner_profile=self._planner_profile(),
+            data_dir=self.settings.data_dir,
+        )
         # 2d. milestones: verified-evidence threshold reached -> one report
         stats["milestones"] = check_milestones(self.session_factory)
+        # 2e. auditor: REVIEW tasks get an independent auditor run; ACCEPT
+        #     completes the task, REVISE sends it back to READY
+        stats["audited"] = await self._audit_review_tasks()
+        # 2f. worker-BLOCKED tasks (no decision blocking) whose upstream
+        #     depends_on are COMPLETED get requeued (bounded retries)
+        stats["unblocked"] = await self._requeue_worker_blocked()
         # 3. reporting: emit queued reports for active projects
         stats["reports"] = await self._report_projects()
         # 4. project document projection (incremental, PI Notes protected)
@@ -169,6 +191,16 @@ class SchedulerLoop:
                     has_conflict = cand.get("has_option_conflict", True)
                     cheap = cand.get("cheap_parallel", False)
                     numerical = cand.get("numerical_only", False)
+                    # category is a free-form model string: normalize it BEFORE
+                    # the gate so a plausible-but-unknown label (e.g.
+                    # "methodology") cannot crash the whole tick in
+                    # build_decision (unknown labels are treated as "other")
+                    from ..domain.enums import DecisionCategory as _DecisionCategory
+
+                    try:
+                        category = _DecisionCategory(cand.get("category", "other"))
+                    except ValueError:
+                        category = _DecisionCategory.OTHER
                     # cheap parallel candidates do not fork: the first time we
                     # see one, a diagnostic task is queued (ensure_cheap_diagnostics)
                     # and this candidate is NOT evaluated yet; the diagnostic
@@ -185,7 +217,7 @@ class SchedulerLoop:
                         continue  # diagnostic queued separately; evaluate later
                     verdict = gate.evaluate(
                         project_id=row.project_id,
-                        category=cand.get("category", "other"),
+                        category=category,
                         question=cand.get("question", ""),
                         why_material=cand.get("why_material", ""),
                         options=options,
@@ -209,12 +241,12 @@ class SchedulerLoop:
                         project_id=row.project_id,
                         question=cand.get("question", ""),
                         options=options,
-                        category=cand.get("category", "other"),
+                        category=category,
                         trigger=cand.get("trigger", ""),
                         why_material=cand.get("why_material", ""),
                         recommendation=cand.get("recommendation"),
                         recommendation_basis=cand.get("recommendation_basis"),
-                        evidence_refs=cand.get("evidence_refs"),
+                        evidence_refs=cand.get("evidence_refs") or [],
                         unresolved_uncertainty=cand.get("unresolved_uncertainty"),
                         reversibility=cand.get("reversibility"),
                     )
@@ -226,13 +258,20 @@ class SchedulerLoop:
                     # diagnostic): mark so stale candidates are never re-scanned
                     evaluated.append(row.id)
             # mark evaluated runs (so stale candidates are never re-scanned)
+            # JSON-merge, never overwrite: metadata carries role/skills/context_id
             if evaluated:
                 from sqlalchemy import update as sa_update
 
                 session.execute(
                     sa_update(RunRow)
                     .where(RunRow.id.in_(evaluated))
-                    .values(metadata_json={"decisions_evaluated": True})
+                    .values(
+                        metadata_json=func.json_set(
+                            func.ifnull(RunRow.metadata_json, "{}"),
+                            "$.decisions_evaluated",
+                            1,
+                        )
+                    )
                     .execution_options(synchronize_session=False)
                 )
             # block the scope of OPEN decisions (only blocking_scope)
@@ -366,6 +405,10 @@ class SchedulerLoop:
                     if d.status.value == "OPEN"
                 ]
             slots = self.max_parallel - len(self.active)
+            completed = {
+                t.task_id
+                for t in TaskRepo(session).list_by_status(None, [TaskStatus.COMPLETED.value])
+            }
             for task in tasks:
                 if slots <= 0:
                     break
@@ -375,6 +418,7 @@ class SchedulerLoop:
                     task,
                     open_decisions,
                     blocked_task_ids=self._open_blocking_scope(session),
+                    completed_task_ids=completed,
                 )
                 if decision.action != "dispatch":
                     continue
@@ -390,6 +434,29 @@ class SchedulerLoop:
                 slots -= 1
         return dispatched
 
+    async def _audit_review_tasks(self) -> int:
+        """Dispatch an independent auditor run for every REVIEW task without a
+        live audit run (the task-level lease deduplicates crashes/restarts)."""
+        dispatched = 0
+        with self.session_factory() as session:
+            tasks = TaskRepo(session).list_by_status(None, [TaskStatus.REVIEW.value])
+            for task in tasks:
+                if task.task_id in self.active:
+                    continue
+                slots = self.max_parallel - len(self.active)
+                if slots <= 0:
+                    break
+                dispatcher = RunDispatcher(session, self.executor)
+                profile = self._resolve_profile(session, task, role="auditor")
+                run = dispatcher.dispatch_audit_run(task, profile=profile)
+                if run is None:
+                    continue
+                session.commit()
+                handle = asyncio.create_task(self._drive_run(run.run_id, run.task_id, role="auditor"))
+                self.active[task.task_id] = ActiveRun(run_id=run.run_id, task_id=run.task_id, task=task, task_handle=handle)
+                dispatched += 1
+        return dispatched
+
     def _open_blocking_scope(self, session) -> set:  # noqa: ANN001
         """Union of blocking_scope across OPEN decisions (IMPLEMENTATION.md §8:
         only blocking_scope pauses tasks)."""
@@ -401,25 +468,94 @@ class SchedulerLoop:
                 blocked.update(d.blocking_scope)
         return blocked
 
-    def _resolve_profile(self, session, task) -> dict:  # noqa: ANN001
+    async def _requeue_worker_blocked(self) -> int:
+        """Requeue tasks a worker marked BLOCKED (outcome BLOCKED, empty
+        blocked_by) once their depends_on are COMPLETED.
+
+        A worker-reported BLOCKED means "upstream work not ready yet" — the
+        design's BLOCKED -> READY transition (IMPLEMENTATION.md §7.1: 阻塞条件
+        解除). Decision-blocked tasks (blocked_by non-empty) are owned by
+        _unblock_resolved instead. Bounded: at most
+        MAX_WORKER_BLOCKED_RETRIES re-dispatches per task (counted by prior
+        runs); tasks past the bound stay BLOCKED for human review instead of
+        burning unbounded model calls.
+        """
+        from ..domain.enums import TaskStatus as TS
+        from ..domain.events import make_event
+        from ..domain.base import Actor, AggregateRef
+        from ..persistence.repositories import EventRepo, RunRepo, TaskRepo
+
+        requeued = 0
+        with self.session_factory() as session:
+            completed = {
+                t.task_id for t in TaskRepo(session).list_by_status(None, [TS.COMPLETED.value])
+            }
+            for task in TaskRepo(session).list_by_status(None, [TS.BLOCKED.value]):
+                if task.blocked_by:
+                    continue  # decision-blocked; _unblock_resolved owns it
+                missing = [d for d in task.depends_on if d not in completed]
+                if missing:
+                    continue  # upstream work still missing
+                if RunRepo(session).count_for_task(task.task_id) > MAX_WORKER_BLOCKED_RETRIES:
+                    continue  # retries exhausted; stays BLOCKED for human review
+                task.requeue(reason="worker reported BLOCKED; dependencies satisfied")
+                TaskRepo(session).save(task)
+                EventRepo(session).append(
+                    make_event(
+                        event_type="task.ready",
+                        aggregate=AggregateRef(type="task", id=task.task_id, version=task.version),
+                        idempotency_key=f"task:{task.task_id}:requeued:{task.current_run_id or 'x'}",
+                        project_id=task.project_id,
+                        actor=Actor(type="system"),
+                        payload={"reason": "worker BLOCKED resolved (dependencies satisfied)"},
+                    )
+                )
+                requeued += 1
+            session.commit()
+        return requeued
+
+
+    def _resolve_profile(self, session, task, *, role: str | None = None) -> dict:  # noqa: ANN001
         """Resolve the executor profile for a task (IMPLEMENTATION.md §15.1):
         explicit contract profile > project role override > role default."""
         from ..persistence.repositories import ProjectRepo
 
         name = task.contract.executor_profile
         source = "contract"
-        role = task.contract.role.value if hasattr(task.contract.role, "value") else str(task.contract.role)
+        role = role or (task.contract.role.value if hasattr(task.contract.role, "value") else str(task.contract.role))
+        if role == "auditor":
+            # the auditor is NEVER the worker's own profile: a contract
+            # profile belongs to the worker role. Independent reviewer by
+            # construction: project auditor override > auditor default.
+            name = None
         if not name:
             project = ProjectRepo(session).get_by_project_id(task.project_id)
             name = (project.policy.role_overrides or {}).get(role) if project else None
             source = "project_role_override" if name else "default"
         if not name:
-            prefix = {"reasonix": "reasonix", "codex": "codex", "fake": "fake"}.get(self.executor.name, "fake")
-            name = f"{prefix}_{ROLE_TO_PROFILE[role]}"
+            name = self._default_profile_name(role)
+        return self._profile_dict(name, source)
+
+    def _default_profile_name(self, role: str) -> str:
+        """Default profile name for a role: <executor>_<role-suffix>.
+
+        The planner schema leaves `role` a free string, so a real model may
+        return any role label; unknown roles fall back to the worker profile
+        (tasks are execution work) instead of crashing the dispatch loop."""
+        prefix = {"reasonix": "reasonix", "codex": "codex", "fake": "fake"}.get(self.executor.name, "fake")
+        suffix = ROLE_TO_PROFILE.get(role)
+        if suffix is None:
+            logger.warning(
+                "unknown task role %r; defaulting to worker profile (task still runs)", role
+            )
+            suffix = "worker"
+        return f"{prefix}_{suffix}"
+
+    def _profile_dict(self, name: str, source: str) -> dict:
         profile_cfg = getattr(self.settings, "profiles", {}).get(name)
         if profile_cfg is None:
             raise ValueError(
-                f"unknown executor profile {name!r} for task {task.task_id} (role {role}, source {source}); "
+                f"unknown executor profile {name!r} (source {source}); "
                 "configure it in settings.profiles"
             )
         return {
@@ -429,6 +565,10 @@ class SchedulerLoop:
             "process_instance_id": profile_cfg.process_instance_id,
             "source": source,
         }
+
+    def _planner_profile(self) -> dict:
+        """Resolved profile for the planner turn (no task object exists yet)."""
+        return self._profile_dict(self._default_profile_name("planner"), "default")
 
     async def _heartbeat_active(self) -> int:
         n = 0
@@ -451,19 +591,32 @@ class SchedulerLoop:
         return n
 
     # ------------------------------------------------------------ drive
-    async def _drive_run(self, run_id: str, task_id: str) -> None:
+    async def _drive_run(self, run_id: str, task_id: str, *, role: str = "worker") -> None:
         """Execute one run with budget enforcement; heartbeat + lease renewal."""
         async with self._dispatch_sem:
             profile = await self._run_profile(run_id)
             budget = await self._run_budget(task_id)
             try:
                 async with asyncio.timeout(budget):
-                    await self._execute_with_heartbeat(run_id, profile)
+                    await self._execute_with_heartbeat(run_id, profile, role=role)
             except TimeoutError:
                 await self._collect_interrupt(run_id, "budget exceeded")
             except asyncio.CancelledError:
                 await self._collect_interrupt(run_id, "cancelled")
             except Exception as exc:  # noqa: BLE001
+                # transient executor infrastructure: a transport timeout means
+                # the model turn was still in flight (work may be partial but
+                # the workspace persists) — retryable like a budget interrupt,
+                # but BOUNDED so a persistently slow turn cannot burn unbounded
+                # model calls (past MAX_RUN_RETRIES it becomes a real failure)
+                from ..executors.reasonix.transport import TransportTimeoutError
+
+                if isinstance(exc, TransportTimeoutError):
+                    with self.session_factory() as session:
+                        attempts = RunRepo(session).count_for_task(task_id)
+                    if attempts < MAX_RUN_RETRIES:
+                        await self._collect_interrupt(run_id, "executor transport timeout (retryable)")
+                        return
                 await self._collect_failure(run_id, str(exc))
 
     async def _run_profile(self, run_id: str) -> dict:
@@ -484,17 +637,42 @@ class SchedulerLoop:
         with self.session_factory() as session:
             task = TaskRepo(session).get_by_task_id(task_id)
             if task is None:
-                return 300.0
-            return float(task.contract.budget.max_wall_seconds or 300.0)
+                return 900.0
+            return float(task.contract.budget.max_wall_seconds or 900.0)
 
-    async def _execute_with_heartbeat(self, run_id: str, profile: dict) -> None:
+    async def _execute_with_heartbeat(self, run_id: str, profile: dict, *, role: str = "worker") -> None:
         """Run the executor turn, refreshing heartbeat every HEARTBEAT_SECONDS."""
         heartbeat_task = asyncio.create_task(self._heartbeat_loop(run_id))
         try:
             with self.session_factory() as session:
                 run = RunRepo(session).get_by_run_id(run_id)
                 task = TaskRepo(session).get_by_task_id(run.task_id)
-                context = {"task": task.model_dump(), "project_id": task.project_id}
+                # bounded, traceable context: build + persist the package in
+                # the SAME transaction as the dispatch state (IMPLEMENTATION.md
+                # §13): the run is recoverable and the exact text the model
+                # saw is recorded before any model call happens.
+                from ..application.context_package import ContextPackageBuilder
+
+                builder = ContextPackageBuilder(session, data_dir=self.settings.data_dir)
+                if role == "auditor":
+                    # the audit package is built from the WORKER run under
+                    # review (its structured result + real artifacts), never
+                    # from the audit run itself (which has no result yet)
+                    worker_run_id = (run.metadata or {}).get("worker_run_id") or task.current_run_id
+                    worker_run = RunRepo(session).get_by_run_id(worker_run_id) if worker_run_id else None
+                    if worker_run is None:
+                        raise RuntimeError(
+                            f"audit run {run.run_id}: worker run {worker_run_id!r} not found; cannot audit"
+                        )
+                    pkg = builder.persist(builder.auditor(task, worker_run, audit_run_id=run.run_id))
+                else:
+                    pkg = builder.persist(builder.worker(task, run=run))
+                context = builder.to_context_dict(pkg, objective=task.contract.objective)
+                # freeze the context id on the run for traceability
+                run.metadata = dict(run.metadata or {})
+                run.metadata["context_id"] = pkg.context_id
+                RunRepo(session).save(run)
+                session.commit()
             # record the executor session id as soon as it exists (recovery)
             def _on_session(sid: str) -> None:
                 with self.session_factory() as session:
@@ -507,13 +685,83 @@ class SchedulerLoop:
             hook = getattr(self.executor, "on_session_started", None)
             if hook is not None:
                 hook(_on_session)
-            result, session_info = await self.executor.run_worker(context, profile=profile)
+            # model-call invocation ledger: EVERY worker/auditor turn is
+            # recorded durably (RUNNING -> SUCCEEDED/FAILED), matching the
+            # planner turns recorded in plan_projects
+            invocation = self._record_invocation(run_id, role, context, profile)
+            try:
+                if role == "auditor":
+                    result, session_info = await self.executor.run_auditor(context, profile=profile)
+                else:
+                    result, session_info = await self.executor.run_worker(context, profile=profile)
+            except Exception:
+                self._finish_invocation(invocation, status="FAILED", error="executor turn failed")
+                raise
             with self.session_factory() as session:
                 run = RunRepo(session).get_by_run_id(run_id)
-                RunDispatcher(session, self.executor).collect_success(run, result, session_info)
+                dispatcher = RunDispatcher(session, self.executor)
+                if role == "auditor":
+                    dispatcher.collect_audit(run, result, session_info)
+                else:
+                    dispatcher.collect_success(run, result, session_info)
                 session.commit()
+            self._finish_invocation(
+                invocation,
+                status="SUCCEEDED",
+                usage=getattr(session_info, "usage", None),
+            )
         finally:
             heartbeat_task.cancel()
+
+    def _record_invocation(self, run_id: str, role: str, context: dict, profile: dict):  # noqa: ANN001
+        """Create a RUNNING invocation row for a worker/auditor turn (durable
+        before the model call; the run row itself is not enough because the
+        planner has no run)."""
+        from ..domain.invocation import Invocation
+        from ..persistence.repositories import InvocationRepo
+
+        with self.session_factory() as session:
+            run = RunRepo(session).get_by_run_id(run_id)
+            if run is None:
+                return None
+            inv = Invocation(
+                role=role,
+                project_id=run.project_id,
+                task_id=run.task_id,
+                run_id=run.run_id,
+                context_id=context.get("context_id"),
+                profile_name=profile.get("name"),
+                resolved_model=profile.get("model"),
+                reasoning_effort=profile.get("reasoning_effort"),
+                skills=list(getattr(self.executor, "installed_skills", []) or []),
+                budget=dict(getattr(run, "metadata", {}) or {}).get("budget", {}) or {},
+                status="RUNNING",
+                created_by="scheduler",
+            )
+            InvocationRepo(session).save(inv)
+            session.commit()
+            return inv.invocation_id
+
+    def _finish_invocation(self, invocation_id, *, status: str, usage=None, error: str = "") -> None:  # noqa: ANN001
+        from ..domain.base import utcnow
+        from ..persistence.repositories import InvocationRepo
+
+        if not invocation_id:
+            return
+        with self.session_factory() as session:
+            inv = InvocationRepo(session).get_by_invocation_id(invocation_id)
+            if inv is None:
+                return
+            inv.status = status
+            inv.finished_at = utcnow()
+            if error:
+                inv.error_message = error[:500]
+            if usage is not None:
+                inv.usage = usage
+            elif status == "SUCCEEDED":
+                inv.usage = {"available": False, "reason": "executor does not report usage"}
+            InvocationRepo(session).save(inv)
+            session.commit()
 
     async def _heartbeat_loop(self, run_id: str) -> None:
         try:

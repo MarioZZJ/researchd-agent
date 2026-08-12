@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+
+from sqlalchemy import select
 import json
 
 import pytest
@@ -206,6 +209,68 @@ def test_schedule_report_queues_delivery(factory, tmp_path):
         assert payload["body"]  # deterministic template body
 
 
+def test_schedule_report_skips_bad_specs_sends_valid_ones(factory, tmp_path):
+    """One linter-failing spec (cites CANDIDATE/unknown evidence) must NOT
+    starve the valid specs in the same batch: the bad card is skipped (logged)
+    and the good decision card is still sent."""
+    from researchd.domain.decision import Decision, DecisionOption
+    from researchd.domain.evidence import Evidence
+    from researchd.domain.project import Project
+    from researchd.persistence.models import OutboxRow
+    from researchd.persistence.repositories import DecisionRepo, EvidenceRepo, ProjectRepo
+    from researchd.persistence.transaction import UnitOfWork
+    from researchd.reporting.reporter import schedule_report
+
+    ws = tmp_path / "ws"
+    ws.mkdir(exist_ok=True)
+    with UnitOfWork(factory) as uow:
+        ProjectRepo(uow.session).save(
+            Project(project_id="P-MIX", name="mix", description="d", workspace_root=str(ws))
+        )
+        EvidenceRepo(uow.session).save(
+            Evidence(
+                evidence_id="E-GOOD", project_id="P-MIX", type="literature", status="VERIFIED",
+                statement="s", literature={"source_id": "doi:1"},
+            )
+        )
+        EvidenceRepo(uow.session).save(
+            Evidence(
+                evidence_id="E-CAND", project_id="P-MIX", type="literature", status="CANDIDATE",
+                statement="s", literature={"source_id": "doi:2"},
+            )
+        )
+        DecisionRepo(uow.session).save(
+            Decision(
+                decision_id="D-GOOD", project_id="P-MIX", status="OPEN", question="good?",
+                recommendation="proceed", evidence_refs=["E-GOOD"],
+                options=[DecisionOption(option_id="A", label="A", scientific_consequence="ok")],
+            )
+        )
+        DecisionRepo(uow.session).save(
+            Decision(
+                decision_id="D-BAD", project_id="P-MIX", status="OPEN", question="bad?",
+                recommendation="wait", evidence_refs=["E-CAND"],  # CANDIDATE -> linter fail
+                options=[DecisionOption(option_id="A", label="A", scientific_consequence="ok")],
+            )
+        )
+        uow.commit()
+    result = asyncio.run(schedule_report(factory, project_id="P-MIX"))
+    assert result.sent is True, result.lint_errors
+    with UnitOfWork(factory) as uow:
+        rows = uow.session.query(OutboxRow).all()
+        # decision card (D-GOOD) + evidence-progress card; D-BAD's card skipped
+        payloads = [r.payload_json for r in rows]
+        card_bodies = [p["body"] for p in payloads if p.get("kind") == "interactive_card"]
+        assert len(card_bodies) == 1, payloads
+        buttons = payloads[0].get("buttons", [])
+        assert any("D-GOOD" in b.get("value", "") for b in buttons)
+        assert not any("D-BAD" in b.get("value", "") for b in buttons)
+        assert len(payloads) == 2  # decision card + evidence-progress card
+    # baseline persisted: a second call with unchanged state emits nothing
+    result2 = asyncio.run(schedule_report(factory, project_id="P-MIX"))
+    assert result2.sent is False
+
+
 def test_schedule_report_nothing_reportable(factory):
     from researchd.reporting.reporter import schedule_report
 
@@ -321,7 +386,7 @@ def test_scheduler_decision_gate_blocks_scope_and_reports(factory):
     from researchd.persistence.transaction import UnitOfWork
     from researchd.scheduler.loop import SchedulerLoop
 
-    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 4})(), "profiles": dict(DEFAULT_PROFILES)})()
+    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 4})(), "profiles": dict(DEFAULT_PROFILES), "data_dir": "t"})()
     loop = SchedulerLoop(settings, factory, FakeExecutor(), FakeDeliveryPort(), max_parallel=4)
 
     with UnitOfWork(factory) as uow:
@@ -403,3 +468,154 @@ def test_scheduler_decision_gate_blocks_scope_and_reports(factory):
             await asyncio.sleep(0.03)
     asyncio.run(run_ticks2())
     assert len(loop.sender.port.deliveries) == n_before
+
+
+def test_scheduler_gate_tolerates_unknown_category(factory):
+    """A plausible-but-unknown category label (e.g. "methodology") from a real
+    model must not crash the whole tick in build_decision: it is normalized
+    to DecisionCategory.OTHER and the candidate is evaluated normally."""
+    import asyncio
+
+    from researchd.config import DEFAULT_PROFILES
+    from researchd.domain.task import SuccessCriterion, Task, TaskContract
+    from researchd.executors.fake import FakeDeliveryPort, FakeExecutor
+    from researchd.persistence.models import RunRow
+    from researchd.persistence.repositories import DecisionRepo, ProjectRepo, TaskRepo
+    from researchd.persistence.transaction import UnitOfWork
+    from researchd.scheduler.loop import SchedulerLoop
+
+    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 4})(), "profiles": dict(DEFAULT_PROFILES), "data_dir": "t"})()
+    loop = SchedulerLoop(settings, factory, FakeExecutor(), FakeDeliveryPort(), max_parallel=4)
+
+    with UnitOfWork(factory) as uow:
+        ProjectRepo(uow.session).save(
+            __import__("researchd.domain.project", fromlist=["Project"]).Project(
+                project_id="P-GATE2", name="gate2", status="ACTIVE"
+            )
+        )
+        t1 = Task(
+            task_id="T-G2", project_id="P-GATE2",
+            contract=TaskContract(
+                task_id="T-G2", role="analysis_worker", objective="o",
+                success_criteria=[SuccessCriterion(id="SC-1", text="c")],
+            ),
+        )
+        t1.propose_ready()
+        TaskRepo(uow.session).save(t1)
+        uow.session.add(
+            RunRow(
+                id="R-G2", run_id="R-G2", task_id="T-G2", project_id="P-GATE2",
+                status="SUCCEEDED", outcome="SUBMIT_FOR_REVIEW",
+                result_json={
+                    "schema": "researchd.work_result.v1",
+                    "task_id": "T-G2",
+                    "outcome": "SUBMIT_FOR_REVIEW",
+                    "criteria_results": [{"criterion_id": "SC-1", "status": "PASS"}],
+                    "decision_candidates": [
+                        {
+                            "question": "which discipline granularity?",
+                            "category": "methodology",  # NOT in DecisionCategory
+                            "why_material": "affects all downstream indicators",
+                            "options": [
+                                {"option_id": "A", "label": "level-1", "scientific_consequence": "coarser"},
+                                {"option_id": "B", "label": "level-0", "scientific_consequence": "finer"},
+                            ],
+                            "unresolved_uncertainty": "coverage unknown",
+                        }
+                    ],
+                },
+            )
+        )
+        uow.commit()
+
+    async def run_ticks():
+        for _ in range(4):
+            await loop.tick()
+            await asyncio.sleep(0.03)
+    asyncio.run(run_ticks())  # must not raise
+
+    with UnitOfWork(factory) as uow:
+        decisions = DecisionRepo(uow.session).list_open("P-GATE2")
+        assert len(decisions) == 1, "unknown category must normalize to other and evaluate normally"
+        assert decisions[0].category.value == "other"
+        # run is marked evaluated — the candidate is not re-evaluated next tick
+        row = uow.session.execute(
+            __import__("sqlalchemy", fromlist=["select"]).select(RunRow).where(RunRow.run_id == "R-G2")
+        ).scalar_one()
+        assert (row.metadata_json or {}).get("decisions_evaluated")  # marked evaluated
+
+
+def test_decision_answer_updates_original_card_in_place(factory, tmp_path):
+    """Answering a decision PATCHes the already-sent card (receipt from the
+    report row) instead of sending a new meaningless card."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from researchd.domain.base import new_id
+    from researchd.domain.decision import Decision, DecisionOption
+    from researchd.domain.project import Project
+    from researchd.domain.task import Task, TaskContract, Budget, SuccessCriterion
+    from researchd.domain.enums import TaskStatus
+    from researchd.persistence.models import ReportRow
+    from researchd.persistence.repositories import DecisionRepo, ProjectRepo, TaskRepo
+    from researchd.persistence.transaction import UnitOfWork
+    from researchd.scheduler.outbox_sender import OutboxSender
+
+    ws = tmp_path / "ws"
+    ws.mkdir(exist_ok=True)
+    with UnitOfWork(factory) as uow:
+        ProjectRepo(uow.session).save(
+            Project(project_id="P-UPD", name="u", description="d", workspace_root=str(ws))
+        )
+        TaskRepo(uow.session).save(
+            Task(task_id="T-UPD", project_id="P-UPD", status=TaskStatus.READY,
+                 contract=TaskContract(task_id="T-UPD", role="analysis_worker", objective="o",
+                                       success_criteria=[SuccessCriterion(id="SC-1", text="c")],
+                                       budget=Budget(max_wall_seconds=60)),
+                 blocked_by=[])
+        )
+        uow.commit()
+    with UnitOfWork(factory) as uow:
+        d = Decision(
+            decision_id="D-UPD", project_id="P-UPD", category="analysis_strategy",
+            question="继续吗？",
+            options=[DecisionOption(option_id="yes", label="继续"), DecisionOption(option_id="no", label="停止")],
+        )
+        DecisionRepo(uow.session).save(d)
+        uow.session.add(
+            ReportRow(
+                id=new_id("report"), report_id="R-UPD",
+                spec_json={"decision_id": "D-UPD"},
+                platform_message_id="om_card_123", status="SENT",
+            )
+        )
+        uow.commit()
+
+    # answer via the route handler (in-process call)
+    from researchd.application.handlers import _enqueue_decision_card_update
+
+    with UnitOfWork(factory) as uow:
+        d = DecisionRepo(uow.session).get_by_decision_id("D-UPD")
+        d.transition("OPEN")  # CANDIDATE -> OPEN before answering
+        d.apply_answer("yes", actor="ou_real_pi", version=1)
+        DecisionRepo(uow.session).save(d)
+        _enqueue_decision_card_update(uow.session, d, "ou_real_pi", "yes")
+        uow.commit()
+
+    with UnitOfWork(factory) as uow:
+        from researchd.persistence.models import OutboxRow
+
+        rows = uow.session.execute(
+            select(OutboxRow).where(OutboxRow.payload_json["kind"].as_string() == "decision_update")
+        ).scalars().all()
+        assert len(rows) == 1
+        p = rows[0].payload_json
+        assert p["platform_message_id"] == "om_card_123"
+        assert "ou_real_pi" in p["body"]
+
+    # sending the row calls port.update (PATCH) — never deliver (new card)
+    fake = AsyncMock()
+    sender = OutboxSender(factory, fake, doc_platform=None)
+    asyncio.run(sender.send_pending())
+    fake.update.assert_awaited_once()
+    fake.deliver.assert_not_awaited()

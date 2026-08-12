@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
@@ -33,7 +34,7 @@ from ..base import (
     validate_planner_result,
     validate_work_result,
 )
-from .overlay import ensure_overlay
+from .overlay import OverlayError, ensure_overlay, installed_skills, overlay_workdir
 from .transport import FakeReasonixTransport, ReasonixTransport, StdioReasonixTransport, TransportError
 
 MAX_REPAIRS = 2
@@ -136,18 +137,70 @@ class ReasonixAdapter(ExecutorAdapter):
     def __init__(self, settings=None, *, transport: ReasonixTransport | None = None, overlay_dir: str | None = None):
         self.settings = settings
         self.on_session_started = None  # callback(session_id) for early provenance
+        self._overlay_dir = overlay_dir or (settings.data_dir if settings else ".data")
+        self._skills: list[str] = []
+        self._transports: dict[str, ReasonixTransport] = {}
         if transport is not None:
-            self.transport = transport
+            # explicit transport (tests): single shared instance, no overlay
+            self._transports["<explicit>"] = transport
+            self._explicit = True
         else:
-            overlay = ensure_overlay(overlay_dir or (settings.data_dir if settings else ".data"))
-            self.transport = StdioReasonixTransport(overlay)
+            self._explicit = False
+
+    # ------------------------------------------------------------ overlay
+    @property
+    def installed_skills(self) -> list[str]:
+        """Skills actually mounted in the overlay (recorded on the Run)."""
+        return list(self._skills)
+
+    def _transport_for(self, workspace_root: str | None) -> ReasonixTransport:
+        """Per-workspace transport: each project workspace gets its own
+        reasonix process cwd; the fallback is the restricted overlay work dir.
+        A workspace is keyed by its RESOLVED path so two runs of the same
+        project share one process and different projects never share cwd."""
+        if self._explicit:
+            return self._transports["<explicit>"]
+        if workspace_root:
+            resolved = Path(workspace_root).resolve()
+            if not resolved.is_dir():
+                raise OverlayError(
+                    f"workspace root {workspace_root!r} does not exist; refusing to create "
+                    "arbitrary directories for executor cwd (fail-closed)"
+                )
+            key = str(resolved)
+        else:
+            key = "<fallback>"
+        if key not in self._transports:
+            overlay = ensure_overlay(self._overlay_dir)
+            self._skills = installed_skills(overlay)
+            cwd = Path(key) if workspace_root else overlay_workdir(overlay)
+            self._transports[key] = StdioReasonixTransport(overlay, cwd=cwd)
+        return self._transports[key]
 
     # ------------------------------------------------------------ protocol
     async def _ensure_initialize(self) -> None:
         # transport.initialize() is idempotent internally and resets its
         # capability cache when the process restarts (generation bump), so we
-        # always delegate to it.
-        await self.transport.initialize()
+        # always delegate to it. Initializes ALL live transports (per
+        # workspace) so a later run never pays a cold start.
+        for transport in self._transports.values():
+            await transport.initialize()
+
+    def _transport_for_run(self, context: dict) -> ReasonixTransport:
+        """Transport whose subprocess cwd is the run's project workspace
+        (from the persisted ContextPackage). A REAL run without a workspace
+        fails closed — the overlay work dir is never used as a run cwd
+        (IMPLEMENTATION.md §15.2: workspace-confined means confined)."""
+        if self._explicit:
+            return self._transports["<explicit>"]
+        workspace = (context or {}).get("workspace_root")
+        if not workspace:
+            raise OverlayError(
+                "no workspace_root in context; refusing to run the executor "
+                "in the overlay work dir (fail-closed: real runs need a "
+                "project workspace)"
+            )
+        return self._transport_for(workspace)
 
     def _session_config(self, profile: dict) -> dict:
         cfg: dict = {}
@@ -177,8 +230,9 @@ class ReasonixAdapter(ExecutorAdapter):
         schema_name: str,
         validator,
     ) -> tuple[Any, ExecutorSessionInfo]:
-        await self._ensure_initialize()
-        session_id = await self.transport.new_session(self._session_config(profile))
+        transport = self._transport_for_run(context)
+        await transport.initialize()
+        session_id = await transport.new_session(self._session_config(profile))
         session_info = ExecutorSessionInfo(
             executor=self.name,
             session_id=session_id,
@@ -188,12 +242,22 @@ class ReasonixAdapter(ExecutorAdapter):
             self.on_session_started(session_id)
         try:
             prompt = self._prompt(role, context, schema_name)
-            text = await self.transport.prompt(session_id, prompt)
+            text = await transport.prompt(session_id, prompt)
             for attempt in range(MAX_REPAIRS + 1):
                 try:
                     raw = extract_json(text)
+                    # transcript path (path ONLY — content stays in the
+                    # executor's run dir, never in the DB) becomes part of
+                    # the session provenance for the scheduler to persist
+                    session_info.transcript_path = transport.last_transcript(session_id)
+                    # controlled runtime receipt: the model already produced
+                    # the full structured result — if we crash before
+                    # collect, recovery can finish WITHOUT calling the model
+                    # again (see reconcile_orphans receipt recovery)
+                    self._write_receipt(context, raw, session_info)
                     return validator(raw), session_info
                 except (ValueError, json.JSONDecodeError, ValidationFailure) as exc:
+                    self._clear_receipt(context)
                     error = str(exc)
                     if isinstance(exc, ValidationFailure):
                         error = sanitize_validation_error(exc.__cause__) if isinstance(exc.__cause__, ValidationError) else error
@@ -203,11 +267,45 @@ class ReasonixAdapter(ExecutorAdapter):
                         f"你的上一个输出无法解析为符合 {schema_name} 的 JSON：{error}。"
                         f"请只输出修正后的完整 JSON 文档（```json 代码块），不要解释。"
                     )
-                    text = await self.transport.prompt(session_id, repair)
+                    text = await transport.prompt(session_id, repair)
+            self._clear_receipt(context)
             raise TransportError(f"structured output failed after {MAX_REPAIRS} repairs: {error}")
         finally:
             # sessions are closed on every path (success, failure, cancel)
-            await self.transport.close(session_id)
+            await transport.close(session_id)
+
+    # ------------------------------------------------------------ runtime receipts
+    def _receipt_path(self, context: dict) -> Path | None:
+        run_id = (context or {}).get("run_id")
+        if not run_id:
+            return None
+        return Path(self._overlay_dir).resolve() / "receipts" / f"{run_id}.json"
+
+    def _write_receipt(self, context: dict, raw: dict, session_info: ExecutorSessionInfo) -> None:
+        """Durable completion receipt (0600) so a crash between model output
+        and collect never re-invokes the model. Contains the structured JSON +
+        provenance, NOT the transcript text."""
+        path = self._receipt_path(context)
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "role": context.get("role", "worker"),
+            "run_id": context.get("run_id"),
+            "session_id": session_info.session_id,
+            "transcript_path": session_info.transcript_path,
+            "extracted_at": __import__("researchd.domain.base", fromlist=["utcnow"]).utcnow().isoformat(),
+            "raw": raw,
+        }
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False))
+        tmp.chmod(0o600)
+        tmp.replace(path)  # atomic
+
+    def _clear_receipt(self, context: dict) -> None:
+        path = self._receipt_path(context)
+        if path is not None and path.exists():
+            path.unlink()
 
     # ------------------------------------------------------------ ExecutorAdapter
     async def run_planner(self, context: dict, *, profile: dict) -> tuple[PlannerResult, ExecutorSessionInfo]:
@@ -238,12 +336,29 @@ class ReasonixAdapter(ExecutorAdapter):
         )
 
     # ------------------------------------------------------------ control
+    def last_transcript(self, session_id: str) -> str | None:
+        """Path of the persisted transcript for a session (path only)."""
+        if isinstance(self._transport, StdioReasonixTransport):
+            return self._transport.last_transcript(session_id)
+        return None
+
     async def steer(self, session_id: str, instruction: str) -> dict:
-        return await self.transport.steer(session_id, instruction)
+        for transport in self._transports.values():
+            try:
+                return await transport.steer(session_id, instruction)
+            except TransportError:
+                continue
+        raise TransportError(f"session {session_id} not found on any transport")
 
     async def cancel(self, session_id: str) -> dict:
-        return await self.transport.cancel(session_id)
+        for transport in self._transports.values():
+            try:
+                return await transport.cancel(session_id)
+            except TransportError:
+                continue
+        return {"cancelled": False}
 
     async def close(self) -> None:
-        if isinstance(self.transport, StdioReasonixTransport):
-            await self.transport.close_all()
+        for transport in self._transports.values():
+            if isinstance(transport, StdioReasonixTransport):
+                await transport.close_all()

@@ -79,19 +79,47 @@ def version(ctx: click.Context) -> None:
     click.echo(f"researchd {__version__}")
 
 
-if __name__ == "__main__":
-    main()
+@main.group()
+def pilot() -> None:
+    """pilot — bootstrap pilot projects (idempotent)."""
 
 
-@main.command()
-@click.option("--project-id", required=True, help="pilot project id (default: interdisciplinary-citation-pilot)")
+def _derive_workspace_root(data_dir: str, project_id: str) -> str:
+    """Service-derived workspace root (same derivation as the API route):
+    <data_dir>/workspaces/<project_id>, created with a no-follow guard.
+
+    The API route derives the root for projects it creates; `pilot create`
+    runs offline (service stopped) and must derive it identically so the
+    scheduler's fail-closed workspace checks (apply_result) can pass.
+    """
+    anchor = Path(data_dir) / "workspaces"
+    anchor.mkdir(parents=True, exist_ok=True)
+    candidate = anchor / project_id
+    if candidate.is_symlink():
+        raise click.ClickException(f"workspace root {candidate} is a symlink (refusing)")
+    candidate.mkdir(exist_ok=True)
+    return str(candidate.resolve())
+
+
+@pilot.command("create")
+@click.option("--project-id", required=True, help="pilot project id")
 @click.option("--question", default="", help="research question")
+@click.option("--owner-open-id", default="", help="REAL PI platform open_id (owner member; REQUIRED — the synthetic 'pi' owner is never auto-created)")
 @click.option("--import-decision", default="", help="import a decision as <id>=<answer> (e.g. D-001=A)")
+@click.option("--import-open-decision", default="", help="import an OPEN decision <id> (its decision card will be sent to the group)")
+@click.option("--decision-question", default="", help="question/title for --import-open-decision (required with it)")
+@click.option("--decision-body", default="", help="bottom-line for --import-open-decision (optional; shown on the card)")
+@click.option("--link-decision-evidence", default="", help="link a decision to existing evidence as <id>=<evidence_id> (idempotent)")
 @click.option("--db", "db_path", default=None, help="database path (default: settings)")
 @click.pass_context
-def pilot(ctx: click.Context, project_id: str, question: str, import_decision: str, db_path: str | None) -> None:
+def pilot_create(ctx: click.Context, project_id: str, question: str, owner_open_id: str, import_decision: str, import_open_decision: str, decision_question: str, decision_body: str, link_decision_evidence: str, db_path: str | None) -> None:
     """Bootstrap the pilot project (idempotent). Creates the ACTIVE project
-    and optionally imports a pre-decided decision (IMPLEMENTATION.md §24)."""
+    with a service-derived workspace root and optionally imports decisions
+    (APPLIED via --import-decision <id>=<answer>, or OPEN via
+    --import-open-decision <id>, IMPLEMENTATION.md §24).
+
+    The owner member MUST be a real PI open_id: no synthetic 'pi' owner is
+    auto-created (fail-closed membership)."""
     from .domain.decision import Decision, DecisionOption
     from .domain.enums import DecisionStatus
     from .domain.project import Project
@@ -124,38 +152,67 @@ def pilot(ctx: click.Context, project_id: str, question: str, import_decision: s
     with UnitOfWork(factory) as uow:
         existing = ProjectRepo(uow.session).get_by_project_id(project_id)
         if existing is None:
+            workspace_root = _derive_workspace_root(settings.data_dir, project_id)
             ProjectRepo(uow.session).save(
-                Project(project_id=project_id, name=project_id, description=question or "")
-            )
-            # provision the owner member (fail-closed membership gate §22);
-            # the pilot PI acts as 'pi' on the internal API
-            from .persistence.models import ProjectMemberRow
-
-            uow.session.add(
-                ProjectMemberRow(
-                    id=f"PM-{project_id}-pi", member_id=f"PM-{project_id}-pi", project_id=project_id,
-                    platform_user_id="pi", role="owner", can_approve_decisions=True,
+                Project(
+                    project_id=project_id,
+                    name=project_id,
+                    description=question or "",
+                    workspace_root=workspace_root,
                 )
             )
-            print(f"project {project_id} created (owner member provisioned)")
+            print(f"project {project_id} created (workspace_root={workspace_root})")
+            # provision the owner member (fail-closed membership gate §22)
+            # with the REAL PI open_id ONLY — the synthetic 'pi' owner is
+            # never auto-created; without --owner-open-id the project is
+            # created member-less and the PI must be added explicitly
+            from .persistence.models import ProjectMemberRow
+
+            if owner_open_id:
+                uow.session.add(
+                    ProjectMemberRow(
+                        id=f"PM-{project_id}-{owner_open_id[:24]}",
+                        member_id=f"PM-{project_id}-{owner_open_id[:24]}",
+                        project_id=project_id,
+                        platform_user_id=owner_open_id, role="owner",
+                        can_approve_decisions=True,
+                    )
+                )
+                print(f"project {project_id} created (owner member {owner_open_id!r} provisioned)")
+            else:
+                print(
+                    f"project {project_id} created WITHOUT owner member — pass "
+                    "--owner-open-id <real PI open_id> to provision one"
+                )
         else:
             # idempotently provision the owner member on existing projects
             from .persistence.models import ProjectMemberRow
 
-            members = uow.session.execute(
-                ProjectMemberRow.__table__.select().where(
-                    ProjectMemberRow.project_id == project_id,
-                    ProjectMemberRow.platform_user_id == "pi",
-                )
-            ).first()
-            if members is None:
-                uow.session.add(
-                    ProjectMemberRow(
-                        id=f"PM-{project_id}-pi", member_id=f"PM-{project_id}-pi", project_id=project_id,
-                        platform_user_id="pi", role="owner", can_approve_decisions=True,
+            # backfill the service-derived workspace root on pre-existing
+            # pilot projects (created before the API derivation existed)
+            if not existing.workspace_root:
+                existing.workspace_root = _derive_workspace_root(settings.data_dir, project_id)
+                ProjectRepo(uow.session).save(existing)
+            if owner_open_id:
+                members = uow.session.execute(
+                    ProjectMemberRow.__table__.select().where(
+                        ProjectMemberRow.project_id == project_id,
+                        ProjectMemberRow.platform_user_id == owner_open_id,
                     )
-                )
-                print(f"project {project_id} exists (owner member provisioned)")
+                ).first()
+                if members is None:
+                    uow.session.add(
+                        ProjectMemberRow(
+                            id=f"PM-{project_id}-{owner_open_id[:24]}",
+                            member_id=f"PM-{project_id}-{owner_open_id[:24]}",
+                            project_id=project_id,
+                            platform_user_id=owner_open_id, role="owner",
+                            can_approve_decisions=True,
+                        )
+                    )
+                    print(f"project {project_id} exists (owner member {owner_open_id!r} provisioned)")
+                else:
+                    print(f"project {project_id} already exists (owner member present)")
             else:
                 print(f"project {project_id} already exists (no-op)")
         if import_decision:
@@ -179,6 +236,53 @@ def pilot(ctx: click.Context, project_id: str, question: str, import_decision: s
                 print(f"decision {decision_id} imported (answer={answer})")
             else:
                 print(f"decision {decision_id} already exists (no-op)")
+        if decision_question and not import_open_decision:
+            raise click.ClickException("--decision-question/--decision-body require --import-open-decision")
+        if import_open_decision:
+            if not decision_question:
+                raise click.ClickException("--import-open-decision requires --decision-question")
+            if DecisionRepo(uow.session).get_by_decision_id(import_open_decision) is None:
+                DecisionRepo(uow.session).save(
+                    Decision(
+                        decision_id=import_open_decision,
+                        project_id=project_id,
+                        category="other",
+                        question=decision_question,
+                        trigger="pilot bootstrap",
+                        why_material=decision_body or "",
+                        recommendation=decision_body or "验证决策（等待 PI 选择）",
+                        options=[
+                            DecisionOption(
+                                option_id="A", label="批准（approve）",
+                                description="继续验证闭环", scientific_consequence="无（验证用途）",
+                            ),
+                            DecisionOption(
+                                option_id="B", label="拒绝（reject）",
+                                description="中止验证闭环", scientific_consequence="无（验证用途）",
+                            ),
+                        ],
+                        status=DecisionStatus.OPEN,
+                        decision_version=1,
+                    )
+                )
+                print(f"decision {import_open_decision} imported (OPEN)")
+            else:
+                print(f"decision {import_open_decision} already exists (no-op)")
+        if link_decision_evidence:
+            decision_id, _, evidence_id = link_decision_evidence.partition("=")
+            if not evidence_id:
+                raise click.ClickException("--link-decision-evidence must be <decision_id>=<evidence_id>")
+            decision = DecisionRepo(uow.session).get_by_decision_id(decision_id)
+            if decision is None:
+                raise click.ClickException(f"decision {decision_id!r} not found")
+            refs = list(decision.evidence_refs or [])
+            if evidence_id not in refs:
+                refs.append(evidence_id)
+                decision.evidence_refs = refs
+                DecisionRepo(uow.session).save(decision)
+                print(f"decision {decision_id} evidence linked (+{evidence_id})")
+            else:
+                print(f"decision {decision_id} evidence already linked (no-op)")
         uow.commit()
     lock.release()
 
@@ -246,3 +350,7 @@ def export_cmd(ctx: click.Context, project_id: str, out: str | None) -> None:
     target = out or f"{project_id}.export.json"
     path = export_project_file(settings.db_path, project_id, target)
     print(f"exported {project_id} -> {path}")
+
+
+if __name__ == "__main__":
+    main()

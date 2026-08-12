@@ -33,9 +33,109 @@ logger = logging.getLogger("researchd.reasonix")
 ACP_PROTOCOL_VERSION = 1
 STEER_METHOD = "_reasonix.io/session/steer"
 
+# ------------------------------------------------------------------ sandbox
+# The reasonix subprocess runs with the SAME uid as researchd, so `cwd` is NOT
+# a security boundary. When bubblewrap is available we wrap the subprocess in
+# a filesystem namespace: whole root read-only; ONLY the overlay and the
+# project workspace writable; the researchd data dir (DB/socket/logs),
+# ~/.cc-connect (tokens/sessions) and ~/.reasonix (global config incl. .env)
+# masked as empty tmpfs. Network stays shared (reasonix needs the provider
+# gateway). Without bubblewrap the transport FAILS CLOSED — no claim of
+# "workspace-confined" is ever made.
+# home paths masked as EMPTY tmpfs inside the sandbox (in addition to the
+# researchd data dir): a readable / is never enough — ssh/aws/git/npm
+# credentials and the whole reasonix home must be unreachable even though
+# --ro-bind / / leaves them readable on disk
+_SANDBOX_MASKED_HOME_DIRS = (
+    ".cc-connect",
+    ".reasonix",
+    ".ssh",
+    ".aws",
+    ".config",
+    ".gnupg",
+    ".gitconfig",
+    ".netrc",
+    ".npmrc",
+    ".cache",
+)
+
+
+def _bwrap_command(binary: str, overlay: Path, cwd: Path) -> list[str] | None:
+    """bubblewrap argv wrapping `binary acp`; None when bwrap is unavailable
+    (callers must fail closed, never silently degrade).
+
+    The sandbox is built from a MINIMAL read-only runtime allowlist (NOT
+    --ro-bind / /): /usr /bin /sbin /lib* /etc /opt /proc /dev plus the
+    binary's own directory tree (~/.nvm) and ~/.cache — everything else on
+    the host is simply NOT MOUNTED (invisible), which covers repository
+    .env files, .kube/.docker configs, other users' homes, and runtime
+    sockets without needing an exhaustive mask list. The whole user home is
+    then explicitly masked as empty tmpfs and ONLY the overlay (read-only
+    config/env, writable sessions) and the project workspace are re-mounted.
+    """
+    import shutil
+
+    if shutil.which("bwrap") is None:
+        return None
+    home = Path.home()
+    cmd = [
+        "bwrap",
+        "--die-with-parent",
+        # minimal read-only runtime allowlist — NO --ro-bind / /
+        "--ro-bind", "/usr", "/usr",
+        "--ro-bind", "/bin", "/bin",
+        "--ro-bind", "/sbin", "/sbin",
+        "--ro-bind", "/etc", "/etc",
+        "--ro-bind", "/opt", "/opt",
+        "--proc", "/proc",  # namespace-local procfs (--unshare-pid): the
+        #  host's /proc/<pid>/{environ,fd,root} must NOT be reachable from
+        #  inside the sandbox (same-uid service secrets live in environ)
+        "--dev", "/dev",
+        "--tmpfs", "/tmp",
+        "--share-net",  # model calls need the provider gateway
+        "--unshare-pid",
+        "--unshare-ipc",
+    ]
+    for libdir in ("/lib", "/lib64"):
+        if Path(libdir).is_dir():
+            cmd += ["--ro-bind", libdir, libdir]
+    # the native binary lives under ~/.nvm. bwrap mounts are STACKED — the
+    # LAST mount wins — so the whole-home tmpfs must come FIRST, and the
+    # nvm keep-bind is re-mounted ON TOP of the mask afterwards.
+    # NOTE: host ~/.cache is deliberately NOT bound (it may hold cached
+    # credentials, e.g. RESEARCHD_API__TOKEN under ~/.cache/cc-connect-live);
+    # reasonix gets a fresh writable overlay/.cache instead.
+    cmd += ["--tmpfs", str(home)]
+    if (home / ".nvm").is_dir():
+        cmd += ["--ro-bind", str(home / ".nvm"), str(home / ".nvm")]
+    # whole user home masked (empty tmpfs): ~/.ssh ~/.aws ~/.reasonix
+    # ~/.cc-connect, repository .env, everything — then re-mount ONLY the
+    # overlay (config/.env READ-ONLY; sessions writable) and the workspace
+    cmd += ["--ro-bind", str(overlay), str(overlay)]
+    cache = overlay / ".cache"
+    if cache.is_dir():
+        cmd += ["--bind", str(cache), str(cache)]
+    sessions = overlay / "sessions"
+    if sessions.is_dir():
+        cmd += ["--bind", str(sessions), str(sessions)]
+    ws = str(cwd)
+    cmd += ["--bind", ws, ws]
+    cmd += ["--chdir", ws]
+    cmd += [binary, "acp"]
+    return cmd
+
 
 class TransportError(RuntimeError):
     pass
+
+
+class TransportTimeoutError(TransportError):
+    """The transport RPC did not answer within its timeout.
+
+    Transient infrastructure (the model turn was still in flight): the
+    scheduler treats it as a bounded retryable interrupt, never as a
+    permanent task failure.
+    """
 
 
 def resolve_native_binary() -> str:
@@ -98,15 +198,26 @@ class ReasonixTransport(ABC):
     @abstractmethod
     async def cancel(self, session_id: str) -> dict: ...
 
+    def last_transcript(self, session_id: str) -> str | None:
+        """Path of the persisted transcript for a session (path only;
+        transcript CONTENT never leaves the executor run dir)."""
+        return None
+
 
 # ---------------------------------------------------------------- stdio
 class StdioReasonixTransport(ReasonixTransport):
-    """Real native reasonix process over stdio JSON-RPC."""
+    """Real native reasonix process over stdio JSON-RPC.
+
+    `cwd` is the working directory for the subprocess: the project workspace
+    for a real run (so the model's file operations are confined to the
+    workspace), or the overlay work dir as fallback.
+    """
 
     name = "reasonix-stdio"
 
-    def __init__(self, overlay: Path, *, binary: str | None = None):
+    def __init__(self, overlay: Path, *, cwd: str | Path | None = None, binary: str | None = None):
         self.overlay = overlay
+        self.cwd = Path(cwd) if cwd else overlay_workdir(overlay)
         self.binary = binary or resolve_native_binary()
         self._proc: asyncio.subprocess.Process | None = None
         self._reader: asyncio.StreamReader | None = None
@@ -121,6 +232,10 @@ class StdioReasonixTransport(ReasonixTransport):
         self._generation = 0
         self.notifications: dict[str, list] = {}  # session_id -> bounded list
         self._notif_limit = 200
+        self._last_transcript: dict[str, str] = {}  # session_id -> transcriptPath (path only)
+
+    def last_transcript(self, session_id: str) -> str | None:
+        return self._last_transcript.get(session_id)
 
     # ------------------------------------------------------------ lifecycle
     async def _start(self) -> None:
@@ -128,14 +243,20 @@ class StdioReasonixTransport(ReasonixTransport):
             if self._proc is not None:
                 return
             env = overlay_env(self.overlay)
+            self.cwd.mkdir(parents=True, exist_ok=True)
+            cmd = _bwrap_command(self.binary, self.overlay, self.cwd)
+            if cmd is None:
+                raise TransportError(
+                    "bubblewrap (bwrap) is not available; refusing to run the "
+                    "reasonix subprocess WITHOUT filesystem isolation "
+                    "(fail-closed: cwd is not a security boundary)"
+                )
             self._proc = await asyncio.create_subprocess_exec(
-                self.binary,
-                "acp",
+                *cmd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
-                cwd=overlay_workdir(self.overlay),  # restricted working directory
                 start_new_session=True,  # own process group -> killpg reaches the native process
             )
             self._reader = self._proc.stdout
@@ -144,13 +265,17 @@ class StdioReasonixTransport(ReasonixTransport):
             self._stderr_task = asyncio.create_task(self._drain_stderr())
 
     async def _drain_stderr(self) -> None:
-        """Drain stderr so the pipe never blocks the child; log at debug."""
+        """Drain stderr so the pipe never blocks the child. Content is NEVER
+        logged (raw executor stderr may carry prompts/secrets): only a line
+        count is recorded at debug."""
         assert self._proc is not None
+        count = 0
         while True:
             line = await self._proc.stderr.readline()
             if not line:
                 break
-            logger.debug("reasonix stderr: %s", line.decode("utf-8", errors="replace").rstrip())
+            count += 1
+        logger.debug("reasonix stderr drained: %d line(s), content withheld", count)
 
     async def _read_loop(self) -> None:
         assert self._reader is not None
@@ -191,7 +316,7 @@ class StdioReasonixTransport(ReasonixTransport):
             self._generation += 1
             self.capabilities = None  # force re-initialize after restart
 
-    async def _call(self, method: str, params: dict | None = None, *, timeout: float = 120.0) -> dict:
+    async def _call(self, method: str, params: dict | None = None, *, timeout: float = 3600.0) -> dict:
         await self._start()
         self._id += 1
         mid = self._id
@@ -207,12 +332,15 @@ class StdioReasonixTransport(ReasonixTransport):
             resp = await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError as exc:
             self._pending.pop(mid, None)
-            raise TransportError(f"reasonix acp {method}: timeout") from exc
+            raise TransportTimeoutError(f"reasonix acp {method}: timeout") from exc
         except asyncio.CancelledError:
             self._pending.pop(mid, None)
             raise
         if "error" in resp:
-            raise TransportError(f"reasonix acp {method}: {resp['error']}")
+            # error CODE only — the raw ACP error body may echo model output,
+            # prompts, or secrets and must never reach logs
+            code = resp["error"].get("code") if isinstance(resp["error"], dict) else None
+            raise TransportError(f"reasonix acp {method}: error code {code}")
         return resp.get("result", {})
 
     # ------------------------------------------------------------ protocol
@@ -233,10 +361,28 @@ class StdioReasonixTransport(ReasonixTransport):
 
     async def new_session(self, session_config: dict) -> str:
         result = await self._call("session/new", {"sessionConfig": session_config})
-        return result.get("sessionId") or result.get("session", {}).get("sessionId", "")
+        sid = result.get("sessionId") or result.get("session", {}).get("sessionId", "")
+        if not sid:
+            raise TransportError("reasonix acp session/new: no sessionId")
+        # headless execution: the default tool-approval gate (ask) interrupts
+        # every turn in non-interactive mode; switch the gate to yolo AFTER
+        # creation (isolated overlay + workspace-confined cwd is the sandbox)
+        try:
+            await self._call(
+                "session/set_config_option",
+                {"sessionId": sid, "configId": "tool_approval", "value": "yolo"},
+            )
+        except TransportError:
+            pass  # older servers without the control: leave the gate as-is
+        return sid
 
     async def prompt(self, session_id: str, text: str, *, request_id: str | None = None) -> str:
-        params = {"sessionId": session_id, "prompt": text}
+        params = {
+            "sessionId": session_id,
+            # ACP spec: prompt is a content-block ARRAY (reasonix v1.21.2
+            # rejects a bare string with -32602)
+            "prompt": [{"type": "text", "text": text}],
+        }
         if request_id:
             params["requestId"] = request_id
         result = await self._call("session/prompt", params)
@@ -256,10 +402,113 @@ class StdioReasonixTransport(ReasonixTransport):
                             agg.append(b["text"])
             text_out = "\n".join(agg)
         if not text_out.strip():
+            # reasonix v1.21.2 returns {stopReason, transcriptPath} and keeps
+            # the assistant text in the persisted transcript: read the last
+            # assistant block from the transcript file
+            tp = result.get("transcriptPath")
+            if tp:
+                text_out = self._last_assistant_text(tp, overlay_root=self.overlay)
+        if not text_out.strip():
             raise TransportError(
                 f"reasonix acp session/prompt returned no text (result keys: {sorted(result.keys())})"
             )
+        # controlled completion receipt: transcript path only (never content)
+        tp = result.get("transcriptPath")
+        if tp:
+            self._last_transcript[session_id] = tp
         return text_out
+
+    @staticmethod
+    def _last_assistant_text(transcript_path: str, *, overlay_root: Path | None = None, max_bytes: int = 8 * 1024 * 1024) -> str:
+        """Extract the last assistant text block from a reasonix transcript
+        jsonl (message content may be a string or a list of blocks).
+
+        CONTAINMENT: the transcript must live under the overlay sessions dir
+        (the sandbox can only write there); it must be a REGULAR file, not a
+        symlink, not a device, and bounded in size — a sandbox-controlled
+        path is never trusted blindly (a hostile/compromised reasonix could
+        otherwise point us at /dev/zero or any readable host file).
+
+        The file is opened via a COMPONENT-BY-COMPONENT no-follow dirfd walk
+        starting from a trusted sessions-directory fd: O_NOFOLLOW on every
+        component (final AND intermediate — a compromised executor could
+        swap an intermediate dir for a symlink out of the sandbox),
+        O_DIRECTORY on intermediates, O_NONBLOCK so a sandbox FIFO can never
+        block the scheduler, and every fd is closed on all paths."""
+        import os as _os
+
+        from pathlib import Path as _Path
+
+        path = _Path(transcript_path)
+        if overlay_root is None:
+            return ""
+        sessions_dir = (_Path(overlay_root) / "sessions").resolve()
+        try:
+            rel = path.resolve().relative_to(sessions_dir)
+        except ValueError:
+            return ""  # outside the sessions dir: not ours, refuse
+        fd = -1
+        dir_fds: list[int] = []
+        try:
+            root_fd = _os.open(sessions_dir, _os.O_RDONLY | _os.O_DIRECTORY)
+            dir_fds.append(root_fd)
+            cur = root_fd
+            parts = rel.parts
+            for i, comp in enumerate(parts):
+                flags = _os.O_RDONLY | _os.O_NOFOLLOW | _os.O_NONBLOCK
+                if i < len(parts) - 1:
+                    flags |= _os.O_DIRECTORY
+                try:
+                    nxt = _os.open(comp, flags, dir_fd=cur)
+                except OSError:
+                    return ""
+                if i > 0:
+                    _os.close(cur)
+                    dir_fds.pop()  # keep only the newest dirfd
+                dir_fds.append(nxt)
+                cur = nxt
+            fd = cur
+            dir_fds.pop()  # fd ownership moves to fdopen below
+            st = _os.fstat(fd)
+            if not st.st_mode & 0o100000:  # S_IFREG
+                return ""
+            if st.st_size == 0 or st.st_size > max_bytes:
+                return ""
+            fh = _os.fdopen(fd, "r", encoding="utf-8", errors="replace")
+            fd = -1  # ownership transferred BEFORE reading: if read raises,
+            # the file object closes the fd and finally must not double-close
+            with fh:
+                data = fh.read(max_bytes + 1)
+        except OSError:
+            return ""
+        finally:
+            for d in dir_fds:
+                try:
+                    _os.close(d)
+                except OSError:
+                    pass
+            if fd >= 0:
+                _os.close(fd)
+        for line in reversed(data.splitlines()):
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("role") != "assistant":
+                continue
+            content = rec.get("content")
+            if isinstance(content, str) and content.strip():
+                return content
+            if isinstance(content, list):
+                parts = [
+                    b.get("text", "")
+                    for b in content
+                    if isinstance(b, dict) and b.get("text")
+                ]
+                joined = "\n".join(parts).strip()
+                if joined:
+                    return joined
+        return ""
 
     async def status(self, session_id: str) -> dict:
         """Session status. reasonix v1.21.2 does not implement session/status
@@ -373,6 +622,9 @@ class FakeReasonixTransport(ReasonixTransport):
         if method == "session/new":
             self._session_counter += 1
             return {"sessionId": f"SES-FAKE-{self._session_counter}"}
+        if method == "session/set_config_option":
+            # headless approval switch: record and accept (no script needed)
+            return {"sessionId": params.get("sessionId"), "configOptions": []}
         if method == "session/close":
             return {"sessionId": params.get("sessionId", "SES-FAKE-1")}  # idempotent
         replies = self.scripted_replies.get(method, [])

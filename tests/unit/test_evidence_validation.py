@@ -194,3 +194,126 @@ def test_apply_reuses_artifact_without_rewriting_provenance(factory, tmp_path):
         ).scalars().first()
         assert row.run_id == "R-OLD" and row.task_id == "T-OLD"  # provenance immutable
         assert row.description == "original"
+
+
+def test_directory_artifact_declaration_skipped_not_rejected(factory, tmp_path):
+    """A real model may declare an existing DIRECTORY as an artifact (e.g.
+    'data/raw/' for a raw corpus). That benign declaration mistake must drop
+    the declaration (logged), NOT reject the whole result — the audit gate
+    still requires evidence refs to resolve to registered artifacts."""
+    from researchd.application.apply_result import apply_work_result
+    from researchd.domain.project import Project
+    from researchd.domain.run import Run
+    from researchd.executors.base import validate_work_result
+    from researchd.persistence.repositories import ArtifactRepo, ProjectRepo
+    from researchd.persistence.transaction import UnitOfWork
+
+    ws = tmp_path / "ws"
+    (ws / "data" / "raw").mkdir(parents=True)
+    (ws / "data" / "raw" / "refs_batch_00001.json").write_text("{}")
+    (ws / "data" / "corpus.csv").write_text("a,b\n1,2\n")
+    with UnitOfWork(factory) as uow:
+        ProjectRepo(uow.session).save(Project(project_id="P-DIR", name="dir", workspace_root=str(ws)))
+        uow.commit()
+    raw = {
+        "schema": "researchd.work_result.v1",
+        "task_id": "T-DIR",
+        "outcome": "SUBMIT_FOR_REVIEW",
+        "criteria_results": [{"criterion_id": "c-1", "status": "PASS", "refs": []}],
+        "artifacts": [
+            {"local_ref": "A-DIR", "kind": "dataset", "path": "data/raw/", "description": "raw corpus"},
+            {"local_ref": "A-CSV", "kind": "dataset", "path": "data/corpus.csv", "description": "corpus"},
+        ],
+        "evidence_candidates": [], "claim_changes": [], "issues": [], "decision_candidates": [],
+        "next_task_proposals": [],
+    }
+    run = Run(run_id="R-DIR", task_id="T-DIR", project_id="P-DIR")
+    with UnitOfWork(factory) as uow:
+        counts = apply_work_result(uow.session, run, validate_work_result(raw))
+        uow.commit()
+    assert counts["artifacts"] == 1  # only the real file was registered
+    with UnitOfWork(factory) as uow:
+        assert ArtifactRepo(uow.session).get_by_artifact_id("A-CSV") is not None
+        assert ArtifactRepo(uow.session).get_by_artifact_id("A-DIR") is None
+
+
+def test_same_task_artifact_supersede_on_content_change(factory, tmp_path):
+    """A task's LATER run editing its OWN deliverable supersedes the stale
+    artifact row (hash/run updated); a DIFFERENT task re-declaring the same
+    id with changed content is still rejected."""
+    from researchd.application.apply_result import apply_work_result
+    from researchd.domain.evidence import Artifact as ArtifactDomain
+    from researchd.domain.project import Project
+    from researchd.domain.run import Run
+    from researchd.executors.base import validate_work_result
+    from researchd.persistence.repositories import ArtifactRepo, ProjectRepo
+    from researchd.persistence.transaction import UnitOfWork
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    f = ws / "defs.md"
+    f.write_text("v1")
+    with UnitOfWork(factory) as uow:
+        ProjectRepo(uow.session).save(Project(project_id="P-SUP", name="sup", workspace_root=str(ws)))
+        uow.commit()
+        from researchd.application.evidence_validation import register_artifact
+
+        project = ProjectRepo(uow.session).get_by_project_id("P-SUP")
+        register_artifact(
+            uow.session, project=project, workspace_root=str(ws), rel_path="defs.md",
+            artifact=ArtifactDomain(
+                artifact_id="art_doc", project_id="P-SUP", task_id="T-1", run_id="R-OLD",
+                kind="doc", path="defs.md", description="original",
+            ),
+        )
+        uow.commit()
+
+    def result_for(task_id, run_id, desc):
+        return Run(run_id=run_id, task_id=task_id, project_id="P-SUP"), {
+            "schema": "researchd.work_result.v1",
+            "task_id": task_id,
+            "outcome": "SUBMIT_FOR_REVIEW",
+            "criteria_results": [{"criterion_id": "c-1", "status": "PASS", "refs": []}],
+            "artifacts": [{"local_ref": "art_doc", "kind": "doc", "path": "defs.md", "description": desc}],
+            "evidence_candidates": [], "claim_changes": [], "issues": [],
+            "decision_candidates": [], "next_task_proposals": [],
+        }
+
+    # same task, changed content -> supersede (hash/run updated)
+    f.write_text("v2")
+    run, raw = result_for("T-1", "R-NEW", "updated")
+    with UnitOfWork(factory) as uow:
+        apply_work_result(uow.session, run, validate_work_result(raw))
+        uow.commit()
+    with UnitOfWork(factory) as uow:
+        art = ArtifactRepo(uow.session).get_by_artifact_id("art_doc")
+        assert art.run_id == "R-NEW"
+        assert art.sha256 != "v1-hash"
+        assert art.description == "updated"
+    # different task, changed content -> rejected
+    f.write_text("v3")
+    run2, raw2 = result_for("T-2", "R-OTHER", "trespass")
+    with UnitOfWork(factory) as uow:
+        with pytest.raises(ValueError, match="belongs to task"):
+            apply_work_result(uow.session, run2, validate_work_result(raw2))
+        uow.rollback()
+    # VERIFIED evidence referencing the artifact -> supersede rejected too
+    from researchd.domain.evidence import ComputationalProvenance, Evidence
+
+    with UnitOfWork(factory) as uow:
+        EvidenceRepo = __import__("researchd.persistence.repositories", fromlist=["EvidenceRepo"]).EvidenceRepo
+        EvidenceRepo(uow.session).save(
+            Evidence(
+                evidence_id="E-V1", project_id="P-SUP", type="computational", status="VERIFIED",
+                statement="s", run_id="R-OLD", task_id="T-1",
+                artifact_refs=["art_doc"],
+                computational=ComputationalProvenance(run_id="R-OLD", artifact_id="art_doc"),
+            )
+        )
+        uow.commit()
+    f.write_text("v4")
+    run3, raw3 = result_for("T-1", "R-NEW2", "again")
+    with UnitOfWork(factory) as uow:
+        with pytest.raises(ValueError, match="VERIFIED evidence"):
+            apply_work_result(uow.session, run3, validate_work_result(raw3))
+        uow.rollback()

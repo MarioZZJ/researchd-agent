@@ -21,7 +21,7 @@ from ..domain.base import Actor, utcnow
 from ..persistence.repositories import DecisionRepo, ProjectRepo, TaskRepo
 from ..persistence.transaction import UnitOfWork, make_engine, make_session_factory
 from .dependencies import require_token
-from .routes import inbound, projects
+from .routes import inbound, ops_test, projects
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -63,4 +63,5 @@ def create_app(settings: Settings) -> FastAPI:
     # read-only routes (healthz/readyz/GET) stay unauthenticated.
     app.include_router(inbound.router)
     app.include_router(projects.router)
+    app.include_router(ops_test.router)
     return app

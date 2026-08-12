@@ -19,7 +19,7 @@ def _base_url() -> str:
     settings = default_settings()
     if settings.api.socket_path:
         return f"http+unix://{settings.api.socket_path}"
-    return f"http://{settings.api.host}:{settings.api.port}"
+    return f"http://{settings.api.tcp_host}:{settings.api.tcp_port}"
 
 
 def _client() -> httpx.Client:
@@ -29,13 +29,29 @@ def _client() -> httpx.Client:
         transport = httpx.HTTPTransport(
             uds=str(settings.api.socket_path),
         )
+    # the bearer token is REQUIRED on every transport (server-side B-08
+    # enforcement incl. UDS), so send it whenever it is configured
     headers = {}
-    if not settings.api.socket_path and settings.api.token:
+    if settings.api.token:
         headers["Authorization"] = f"Bearer {settings.api.token}"
-    return httpx.Client(transport=transport, headers=headers, base_url="http://localhost", timeout=10.0)
+    # TCP base URL MUST honor the configured port (a bare http://localhost
+    # would silently hit :80 and never reach the service)
+    base = "http://localhost"
+    if not settings.api.socket_path:
+        base = f"http://{settings.api.tcp_host}:{settings.api.tcp_port}"
+    return httpx.Client(transport=transport, headers=headers, base_url=base, timeout=10.0)
+
+
+_MUTATING_METHODS = {"POST", "PATCH", "PUT", "DELETE"}
 
 
 def _call(method: str, path: str, **kw) -> dict:
+    settings = default_settings()
+    if method.upper() in _MUTATING_METHODS and not settings.api.token:
+        raise click.ClickException(
+            "mutating call requires RESEARCHD_API__TOKEN (fail-closed: "
+            "never send a state-changing request without the bearer token)"
+        )
     with _client() as client:
         resp = client.request(method, path, **kw)
         if resp.status_code >= 400:
@@ -80,16 +96,27 @@ def task_cmd(action: str, project_id: str) -> None:
 
 
 @main.command("decision")
-@click.argument("action", type=click.Choice(["list"]))
+@click.argument("action", type=click.Choice(["list", "link"]))
 @click.argument("project_id")
 @click.option("--open", "only_open", is_flag=True, default=False)
-def decision_cmd(action: str, project_id: str, only_open: bool) -> None:
-    """decision list <project-id> [--open]"""
-    data = _call("GET", f"/v1/projects/{project_id}/decisions")
-    for d in data.get("decisions", []):
-        if only_open and d["status"] not in ("OPEN", "ANSWERED"):
-            continue
-        click.echo(f"{d['decision_id']}  {d['status']}  v{d['version']}  {d['question'][:80]}")
+@click.option("--evidence-id", default="", help="evidence id to link (action=link)")
+def decision_cmd(action: str, project_id: str, only_open: bool, evidence_id: str) -> None:
+    """decision list <project-id> [--open] | decision link <decision-id> --evidence-id E-xxx"""
+    if action == "list":
+        data = _call("GET", f"/v1/projects/{project_id}/decisions")
+        for d in data.get("decisions", []):
+            if only_open and d["status"] not in ("OPEN", "ANSWERED"):
+                continue
+            click.echo(f"{d['decision_id']}  {d['status']}  v{d['version']}  {d['question'][:80]}")
+        return
+    # link: the decision card's linter requires real evidence refs — attach
+    # the project's VERIFIED evidence id so the card can be sent
+    if not evidence_id:
+        raise click.ClickException("decision link requires --evidence-id <E-xxx>")
+    click.echo(json.dumps(
+        _call("POST", f"/v1/decisions/{project_id}/evidence", json={"evidence_id": evidence_id}),
+        ensure_ascii=False,
+    ))
 
 
 @main.command()
@@ -130,6 +157,46 @@ def export(project_id: str) -> None:
     """export <project-id> — project state export (Phase 9 full impl)"""
     data = _call("GET", f"/v1/projects/{project_id}/status")
     click.echo(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+@main.command("delivery")
+@click.argument("action", type=click.Choice(["test"]))
+def delivery_cmd(action: str) -> None:
+    """delivery test — send + in-place update a real cc-connect card.
+
+    Sends an interactive card to the service's CONFIGURED staging target
+    (delivery=cc_connect + token/project/session_key from the env file) and
+    PATCH-updates it in place; fails loudly when cc-connect is not configured.
+    """
+    if action == "test":
+        click.echo(json.dumps(_call("POST", "/v1/delivery/test", json={}), ensure_ascii=False, indent=2))
+
+
+@main.command("document")
+@click.argument("action", type=click.Choice(["create", "test"]))
+@click.option("--project-id", default="", help="project id (test defaults to the project's own document)")
+@click.option("--document-id", default="", help="explicit staging feishu docx document id (test only)")
+@click.option("--title", default="", help="optional title override (create only)")
+def document_cmd(action: str, project_id: str, document_id: str, title: str) -> None:
+    """document create --project-id <id> — create the project's feishu docx
+    once and persist the receipt (idempotent).
+
+    document test [--project-id <id>] [--document-id <id>] — block-level
+    docx round-trip on the project's own document by default (no external id
+    required); requires RESEARCHD_LARK_APP_ID/SECRET on the service."""
+    if action == "create":
+        if not project_id:
+            raise click.ClickException("document create requires --project-id")
+        click.echo(json.dumps(
+            _call("POST", "/v1/document/create", json={"project_id": project_id, "title": title}),
+            ensure_ascii=False, indent=2,
+        ))
+    else:
+        body = {"project_id": project_id, "document_id": document_id}
+        click.echo(json.dumps(
+            _call("POST", "/v1/document/test", json=body),
+            ensure_ascii=False, indent=2,
+        ))
 
 
 @main.command()

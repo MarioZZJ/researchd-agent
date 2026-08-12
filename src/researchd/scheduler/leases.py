@@ -47,12 +47,26 @@ class LeaseRepo:
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
     ) -> str:
         """Acquire a lease on the run slot. Fails (returns None) if a live
-        lease for the same run exists."""
+        lease exists for the same run, or — for auditor/worker roles — a live
+        lease exists for the same (task_id, owner-prefix) so a restart with a
+        still-fresh heartbeat can never double-dispatch the same task."""
         existing = self.session.execute(
             select(LeaseRow).where(LeaseRow.run_id == run_id)
         ).scalar_one_or_none()
         if existing is not None and existing.expires_at > utcnow() and existing.released_at is None:
             return None  # live lease held by someone else
+        if task_id and owner:
+            prefix = owner.split(":")[0]
+            dup = self.session.execute(
+                select(LeaseRow).where(
+                    LeaseRow.task_id == task_id,
+                    LeaseRow.owner.like(prefix + ":%"),
+                    LeaseRow.released_at.is_(None),
+                    LeaseRow.expires_at > utcnow(),
+                )
+            ).scalar_one_or_none()
+            if dup is not None and dup.run_id != run_id:
+                return None  # task-level slot already live (fresh heartbeat)
         token = f"L-{new_id('other')[2:]}"
         row = LeaseRow(
             id=new_id("other"),

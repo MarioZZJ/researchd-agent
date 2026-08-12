@@ -24,7 +24,7 @@ class PromptReply:
     command: str | None = None
 
 
-async def process_prompt(settings: Settings, session: InteractionSession, prompt: str) -> PromptReply:
+async def process_prompt(settings: Settings, session: InteractionSession, prompt: str, *, message_id: str | None = None) -> PromptReply:
     """Process one user prompt from cc-connect."""
     stripped = prompt.strip()
     if not stripped:
@@ -42,7 +42,7 @@ async def process_prompt(settings: Settings, session: InteractionSession, prompt
             return await _bind_project(settings, session, cmd)
         if cmd.name == "model" and cmd.args and cmd.args[0] == "interaction":
             return _set_interaction(session, cmd)
-        return await _submit(settings, session, stripped, intent="deterministic_command", command=cmd.name)
+        return await _submit(settings, session, stripped, intent="deterministic_command", command=cmd.name, message_id=message_id)
 
     # 2. optional constrained intent classification (never for deterministic)
     if (
@@ -53,7 +53,8 @@ async def process_prompt(settings: Settings, session: InteractionSession, prompt
         if intent is not None and intent.confidence >= settings.interaction.intent_confidence_threshold:
             if intent.command_text:
                 return await _submit(
-                    settings, session, intent.command_text, intent=intent.name, command=intent.command_name
+                    settings, session, intent.command_text, intent=intent.name,
+                    command=intent.command_name, message_id=message_id,
                 )
             return PromptReply(text=intent.explanation, intent=intent.name)
 
@@ -79,8 +80,36 @@ async def _bind_project(settings: Settings, session: InteractionSession, cmd) ->
     ok, detail = await _service_check(settings, project_id)
     if not ok:
         return PromptReply(text=f"bind failed: {detail}", intent="bind")
+    # membership check (fail-closed like the handler gates): a non-member
+    # must NOT be able to bind — the gateway token is never a confused
+    # deputy. Projects with no members yet refuse binding until the owner
+    # is provisioned (researchd pilot create --owner-open-id).
+    user_id = session.cc_user_id
+    if user_id:
+        ok, detail = await _membership_check(settings, project_id, user_id)
+        if not ok:
+            return PromptReply(text=f"bind failed: {detail}", intent="bind")
     session.cc_project = project_id
     return PromptReply(text=f"bound to project {project_id}", intent="bind", command="bind")
+
+
+async def _membership_check(settings: Settings, project_id: str, user_id: str) -> tuple[bool, str]:
+    """True when user_id is a member of the project (or the project has no
+    member rows at all -> 403 with a provisioning hint, fail-closed)."""
+    transport = httpx.AsyncHTTPTransport(uds=settings.api.socket_path) if settings.api.socket_path else None
+    headers = _auth_headers(settings)
+    try:
+        async with httpx.AsyncClient(transport=transport, headers=headers, timeout=10.0) as client:
+            resp = await client.get(
+                f"http://localhost/v1/projects/{project_id}/members/{user_id}"
+            )
+        if resp.status_code == 200:
+            return True, ""
+        if resp.status_code == 403:
+            return False, "project has no members provisioned (owner must be provisioned first)"
+        return False, f"not a member of project {project_id}"
+    except httpx.HTTPError as exc:
+        return False, f"service unreachable: {exc}"
 
 
 async def _service_check(settings: Settings, project_id: str) -> tuple[bool, str]:
@@ -96,7 +125,7 @@ async def _service_check(settings: Settings, project_id: str) -> tuple[bool, str
         return False, f"service unreachable: {exc}"
 
 
-async def _submit(settings: Settings, session: InteractionSession, text: str, *, intent: str, command: str | None) -> PromptReply:
+async def _submit(settings: Settings, session: InteractionSession, text: str, *, intent: str, command: str | None, message_id: str | None = None) -> PromptReply:
     """POST the normalized inbound message to the service internal API.
 
     The idempotency key is a hash of the platform session identity + prompt
@@ -106,8 +135,14 @@ async def _submit(settings: Settings, session: InteractionSession, text: str, *,
     url = f"http://localhost/v1/inbound/messages"
     transport = httpx.AsyncHTTPTransport(uds=settings.api.socket_path) if settings.api.socket_path else None
     identity = session.cc_session_key or session.session_id
-    digest = hashlib.sha256(f"{identity}:{session.cc_project}:{text}".encode()).hexdigest()[:32]
-    message_id = f"acp-{digest}"
+    if message_id:
+        # REAL platform message id (cc-connect msg.ID): unique per platform
+        # message, so re-sending the SAME text later is a NEW message
+        # (the hash-based key merged legitimate repeats forever)
+        message_id = f"acp-{message_id}"
+    else:
+        digest = hashlib.sha256(f"{identity}:{session.cc_project}:{text}".encode()).hexdigest()[:32]
+        message_id = f"acp-{digest}"
     headers = _auth_headers(settings)
     payload = {
         "schema": "researchd.inbound_message.v1",

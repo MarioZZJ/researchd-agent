@@ -1,0 +1,114 @@
+diff --git a/platform/feishu/feishu.go b/platform/feishu/feishu.go
+index bafedee..850eaec 100644
+--- a/platform/feishu/feishu.go
++++ b/platform/feishu/feishu.go
+@@ -2627,6 +2627,27 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
+ 	return p.sendNewMessageToChat(ctx, rc, msgType, msgBody)
+ }
+ 
++// SendHandle implements core.MessageHandleSender: send a message and return
++// its platform message id so the caller can update it in place.
++// A full interactive card JSON (schema 2.0) is passed through verbatim so
++// decision buttons survive; plain markdown is wrapped like a normal send.
++func (p *Platform) SendHandle(ctx context.Context, rctx any, content, idempotencyKey string) (string, error) {
++	rc, ok := rctx.(replyContext)
++	if !ok {
++		return "", fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
++	}
++	// Always create a NEW message: the Delivery API must return a real
++	// platform message id so the sender can update it in place (the reply
++	// path cannot produce one).
++	content = p.resolveMentionsInContent(ctx, rc.chatID, content)
++	msgType, msgBody := buildReplyContent(content)
++	if isCardJSON(content) {
++		msgType = larkim.MsgTypeInteractive
++		msgBody = content
++	}
++	return p.createMessageHandle(ctx, rc.chatID, msgType, msgBody, "send", idempotencyKey)
++}
++
+ // SendWithStatusFooter implements core.StatusFooterSender: send a reply with
+ // the body content followed by a small/dim status-footer block. Always uses
+ // the interactive card path so the footer can render with text_size:
+@@ -3388,6 +3409,42 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
+ 	})
+ }
+ 
++func (p *Platform) createMessageHandle(ctx context.Context, chatID, msgType, content, op, idempotencyKey string) (string, error) {
++	reqBuilder := larkim.NewCreateMessageReqBodyBuilder().
++		ReceiveId(chatID).
++		MsgType(msgType).
++		Content(content)
++	if idempotencyKey != "" {
++		// Feishu de-duplicates on uuid: the same key always maps to the same
++		// message — retries after a crash can never double-send.
++		reqBuilder.Uuid(idempotencyKey)
++	}
++	req := larkim.NewCreateMessageReqBuilder().
++		ReceiveIdType(larkim.ReceiveIdTypeChatId).
++		Body(reqBuilder.Build()).
++		Build()
++	var messageID string
++	err := p.withTransientRetry(ctx, op, func() error {
++		return p.withFreshTenantAccessTokenRetry(ctx, op, func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
++			resp, err := client.Im.Message.Create(ctx, req, options...)
++			if err != nil {
++				return fmt.Errorf("%s: %s api call: %w", p.tag(), op, err)
++			}
++			if !resp.Success() {
++				return fmt.Errorf("%s: %s failed code=%d msg=%s", p.tag(), op, resp.Code, resp.Msg)
++			}
++			if resp.Data != nil && resp.Data.MessageId != nil {
++				messageID = *resp.Data.MessageId
++			}
++			return nil
++		})
++	})
++	if err != nil {
++		return "", err
++	}
++	return messageID, nil
++}
++
+ func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, op string) error {
+ 	req := larkim.NewCreateMessageReqBuilder().
+ 		ReceiveIdType(larkim.ReceiveIdTypeChatId).
+@@ -4405,6 +4462,25 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
+ 	return p.patchCardMessage(ctx, h.messageID, cardJSON)
+ }
+ 
++// UpdateMessageByID implements core.MessageUpdaterByID: update an existing
++// message using only its platform message id (Delivery API PATCH path).
++func (p *Platform) UpdateMessageByID(ctx context.Context, messageID, content string) error {
++	if !p.useInteractiveCard {
++		return core.ErrNotSupported
++	}
++	cardJSON := ""
++	if isCardJSON(content) {
++		cardJSON = content
++	} else {
++		processed := content
++		if containsMarkdown(content) {
++			processed = preprocessFeishuMarkdown(content)
++		}
++		cardJSON = buildCardJSON(sanitizeMarkdownURLs(processed))
++	}
++	return p.patchCardMessage(ctx, messageID, cardJSON)
++}
++
+ // UpdateMessageWithStatusFooter implements core.StatusFooterUpdater: edit an
+ // existing card to render the body markdown plus a small/dim status-footer
+ // block (Lark `text_size: "notation"`). Falls through to UpdateMessage when
+@@ -6029,7 +6105,11 @@ func isCardJSON(content string) bool {
+ 	if len(content) < 10 || content[0] != '{' {
+ 		return false
+ 	}
+-	return strings.Contains(content, `"schema"`) && strings.Contains(content, `"body"`)
++	// Card 2.0 (schema/body) or card 1.0 (config/header/elements). The
++	// researchd Delivery API sends card 1.0 JSON (config/elements), which the
++	// original schema/body-only check rejected (sent as plain text).
++	return (strings.Contains(content, `"schema"`) && strings.Contains(content, `"body"`)) ||
++		strings.Contains(content, `"config"`)
+ }
+ 
+ // buildCardJSONWithStatus builds a Feishu card JSON with a colored header

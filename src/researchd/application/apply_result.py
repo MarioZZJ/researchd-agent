@@ -22,10 +22,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..domain.base import new_id
-from ..domain.evidence import (
-    Artifact,
+from ..domain.evidence import (    Artifact,
     Claim,
     ClaimEvidenceLink,
+    ComputationalProvenance,
     Evidence,
     Issue,
     LiteratureProvenance,
@@ -40,6 +40,7 @@ from ..persistence.repositories import (
     IssueRepo,
     ProjectRepo,
 )
+from .paths import normalize_artifact_path
 
 logger = logging.getLogger("researchd.apply")
 
@@ -71,12 +72,38 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
     #    project root, no '..' / symlink escape — any violation rejects the
     #    whole result (the transaction rolls back).
     project = ProjectRepo(session).get_by_project_id(project_id)
+    if project is None:
+        # fail-closed: without the persisted project (and its workspace root)
+        # there is no trusted boundary to register artifacts against — reject
+        # the WHOLE result instead of silently dropping provenance
+        raise ValueError(f"run {run.run_id}: project {project_id!r} not found; result rejected (fail-closed)")
     for art in result.artifacts:
         artifact_id = art.local_ref
         existing_artifact = ArtifactRepo(session).get_by_artifact_id(artifact_id)
-        path = art.path
+        # model outputs are free-form: the path may be written relative to
+        # the cwd's basename ('ws/out/result.json') or absolute inside the
+        # root — normalize to root-relative when the target file really
+        # exists; anything else is left untouched for the registration gate
+        # to accept or reject (no boundary is ever widened)
+        path = normalize_artifact_path(project.workspace_root, art.path)
         if not path:
             raise ValueError(f"artifact {artifact_id!r} has an empty path; rejected")
+        # a REAL model may declare an existing DIRECTORY as an artifact (e.g.
+        # "data/raw/" for a raw corpus). That is a benign declaration mistake,
+        # not a security violation: drop the declaration with a logged warning
+        # instead of rejecting the whole result. Nothing fake is registered —
+        # the audit gate still requires every evidence ref to resolve to a
+        # REGISTERED artifact at REVIEW (verify_evidence), so no provenance
+        # gap can slip through. Path escapes still fall through to the
+        # registration gate below and reject the whole result (fail-hard).
+        from .paths import PathEscapeError, safe_resolve
+
+        try:
+            if safe_resolve(project.workspace_root, path).is_dir():
+                logger.warning("artifact %r path is a directory; declaration skipped: %s", artifact_id, path)
+                continue
+        except PathEscapeError:
+            pass  # not a real dir inside the root; let the gate reject
         if existing_artifact is not None:
             if existing_artifact.project_id != project_id or existing_artifact.path != path:
                 raise ValueError(
@@ -105,9 +132,49 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
                         "re-run `researchd migrate` hash backfill before replay (fail-closed)"
                     )
                 if info.get("sha256") is not None and existing_artifact.sha256 != info["sha256"]:
-                    raise ValueError(
-                        f"artifact {artifact_id!r} content changed since registration; rejected"
+                    # A re-declaration of the SAME task's OWN deliverable with
+                    # CHANGED content SUPERSEDES the provisional row (the same
+                    # supersede pattern evidence candidates use): the model
+                    # edited the file in a later run, and the old row recorded
+                    # a stale hash. Only allowed when (a) the declaring run
+                    # belongs to the SAME task and (b) no VERIFIED evidence
+                    # references the artifact (superseding would break its
+                    # provenance chain). Cross-task re-declaration or a
+                    # verified reference keeps the strict reject.
+                    from ..persistence.models import EvidenceRow
+
+                    if existing_artifact.task_id != run.task_id:
+                        raise ValueError(
+                            f"artifact {artifact_id!r} content changed since registration and "
+                            f"belongs to task {existing_artifact.task_id} (not {run.task_id}); rejected"
+                        )
+                    ev_rows = session.execute(
+                        select(EvidenceRow).where(
+                            EvidenceRow.status == "VERIFIED",
+                            EvidenceRow.project_id == project_id,
+                        )
+                    ).scalars()
+                    referenced_by_verified = any(
+                        existing_artifact.artifact_id in (ev.artifact_refs_json or [])
+                        for ev in ev_rows
                     )
+                    if referenced_by_verified:
+                        raise ValueError(
+                            f"artifact {artifact_id!r} content changed since registration and is "
+                            "referenced by VERIFIED evidence; rejected"
+                        )
+                    logger.warning(
+                        "artifact %r content changed; same-task re-declaration supersedes "
+                        "(hash %s -> %s)", artifact_id,
+                        existing_artifact.sha256[:12], info.get("sha256", "")[:12],
+                    )
+                    existing_artifact.sha256 = info.get("sha256")
+                    existing_artifact.size_bytes = info.get("size_bytes")
+                    existing_artifact.mime_type = info.get("mime_type")
+                    existing_artifact.run_id = run.run_id
+                    existing_artifact.description = art.description or existing_artifact.description
+                    ArtifactRepo(session).save(existing_artifact)
+                    counts["artifacts"] += 1
             continue
         if project is not None:
             # registration gate: project-root boundary + '..' / symlink
@@ -131,30 +198,52 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
                 ),
             )
             path = str(registered.path)
-        ArtifactRepo(session).save(
-            Artifact(
-                artifact_id=artifact_id,
-                project_id=project_id,
-                task_id=run.task_id,
-                run_id=run.run_id,
-                kind=art.kind,
-                path=path,
-                description=art.description,
-            )
-        )
-        counts["artifacts"] += 1
+            counts["artifacts"] += 1
+            continue
 
-    # 2. evidence candidates -> Evidence with the unified verification gate
+    # 2. evidence candidates -> CANDIDATE rows ONLY. VERIFIED is reached
+    #    exclusively through the auditor gate (apply_audit_result) after an
+    #    independent auditor ACCEPTs the run — free-text worker judgment can
+    #    never claim VERIFIED, and provenance is re-checked at audit time.
     for cand in result.evidence_candidates:
         evidence_id = cand.local_ref
-        if EvidenceRepo(session).get_by_evidence_id(evidence_id):
-            continue  # idempotent
         lit = None
         if cand.literature and (cand.literature.get("source_id") or cand.literature.get("doi")):
             lit = LiteratureProvenance(
                 source_id=cand.literature.get("source_id") or cand.literature.get("doi") or "unknown",
                 locator=cand.literature.get("locator") or cand.literature.get("url"),
             )
+        comp = None
+        if cand.computational and cand.artifact_refs:
+            comp = ComputationalProvenance(
+                run_id=run.run_id,
+                artifact_id=cand.artifact_refs[0],
+                code_commit=cand.computational.get("code_commit"),
+                data_snapshot=cand.computational.get("data_snapshot"),
+                statistics=cand.computational.get("statistics") or {},
+                uncertainty=cand.computational.get("uncertainty") or {},
+                interpretation_limits=cand.computational.get("interpretation_limits") or [],
+            )
+        existing_ev = EvidenceRepo(session).get_by_evidence_id(evidence_id)
+        if existing_ev is not None:
+            if existing_ev.status.value == "VERIFIED":
+                continue  # verified evidence is never overwritten
+            if existing_ev.run_id != run.run_id:
+                # a previous (REVISE-cycle) candidate with the same id: this
+                # round's candidate SUPERSEDES it (id stays stable; the
+                # candidate was never verified)
+                existing_ev.statement = cand.statement
+                existing_ev.type = cand.type
+                existing_ev.run_id = run.run_id
+                existing_ev.task_id = run.task_id
+                existing_ev.artifact_refs = cand.artifact_refs
+                existing_ev.literature = lit
+                existing_ev.computational = comp
+                existing_ev.limitations = cand.limitations
+                EvidenceRepo(session).save(existing_ev)
+                counts["evidence"] += 1
+                continue
+            continue  # same run replay (idempotent)
         evidence = Evidence(
             evidence_id=evidence_id,
             project_id=project_id,
@@ -165,19 +254,11 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
             run_id=run.run_id,
             artifact_refs=cand.artifact_refs,
             literature=lit,
+            computational=comp,
             limitations=cand.limitations,
         )
-        # unified verification: only real, type-matching provenance may VERIFY
-        try:
-            from ..application.evidence_validation import verify_evidence
-
-            evidence = verify_evidence(session, evidence)
-        except Exception as exc:  # noqa: BLE001  provenance missing -> stays CANDIDATE
-            logger.debug("evidence %s stays CANDIDATE: %s", evidence_id, exc)
         EvidenceRepo(session).save(evidence)
         counts["evidence"] += 1
-        if evidence.status.value == "VERIFIED":
-            counts["verified_evidence"] += 1
 
     # 3. claim changes (upsert, project-scoped, evidence links persisted)
     for change in result.claim_changes:

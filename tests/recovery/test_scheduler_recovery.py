@@ -24,6 +24,18 @@ def env(tmp_path):
     engine = make_engine(tmp_path / "test.db")
     init_db(engine)
     factory = make_session_factory(engine)
+    # every task needs a persisted project (apply_work_result fails closed
+    # without one); give P-TEST a real workspace dir
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    with UnitOfWork(factory) as uow:
+        from researchd.domain.project import Project
+        from researchd.persistence.repositories import ProjectRepo
+
+        ProjectRepo(uow.session).save(
+            Project(project_id="P-TEST", name="test", description="d", workspace_root=str(ws))
+        )
+        uow.commit()
     yield {"factory": factory, "tmp": tmp_path}
     engine.dispose()
 
@@ -55,6 +67,94 @@ def test_dispatch_decision_gates():
     assert task_dispatch_decision(t2, []).action == "dispatch"
     t3 = make_task(status="RUNNING")
     assert task_dispatch_decision(t3, []).action == "skip"
+
+
+def test_dispatch_decision_gates_dependencies():
+    """A READY task must not run ahead of its depends_on; the completed set
+    is optional (legacy callers keep the old behavior)."""
+    t = make_task(status="READY", depends_on=["T-002"])
+    assert task_dispatch_decision(t, []).action == "dispatch"  # no completed set -> legacy
+    assert task_dispatch_decision(t, [], completed_task_ids=set()).action == "skip"
+    assert task_dispatch_decision(t, [], completed_task_ids={"T-002"}).action == "dispatch"
+    t2 = make_task(status="READY", depends_on=["T-002", "T-003"])
+    assert task_dispatch_decision(t2, [], completed_task_ids={"T-002"}).action == "skip"
+    assert task_dispatch_decision(t2, [], completed_task_ids={"T-002", "T-003"}).action == "dispatch"
+
+
+def test_worker_blocked_requeue_when_dependencies_complete(env):
+    """A worker-BLOCKED task (empty blocked_by) is requeued to READY once its
+    depends_on are COMPLETED; missing upstream work or exhausted retries keep
+    it BLOCKED (bounded re-dispatches, no unbounded model-call burn)."""
+    from researchd.config import DEFAULT_PROFILES
+    from researchd.domain.run import Run
+
+    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 1})(), "profiles": dict(DEFAULT_PROFILES), "data_dir": "t"})()
+    loop = SchedulerLoop(settings, env["factory"], FakeExecutor(), FakeDeliveryPort(), max_parallel=1)
+    with UnitOfWork(env["factory"]) as uow:
+        done = Task(
+            task_id="T-DONE", project_id="P-TEST", status="COMPLETED",
+            contract=TaskContract(
+                task_id="T-DONE", role="analysis_worker", objective="done",
+                success_criteria=[SuccessCriterion(id="SC-1", text="c")],
+            ),
+        )
+        TaskRepo(uow.session).save(done)
+        b1 = make_task(task_id="T-B1", status="READY", depends_on=["T-DONE"])
+        b1.block()
+        TaskRepo(uow.session).save(b1)
+        b2 = make_task(task_id="T-B2", status="READY", depends_on=["T-MISSING"])
+        b2.block()
+        TaskRepo(uow.session).save(b2)
+        b3 = make_task(task_id="T-B3", status="READY")
+        b3.block()
+        TaskRepo(uow.session).save(b3)
+        for i in range(3):  # already hit the retry bound (1 initial + 2 requeues)
+            RunRepo(uow.session).save(
+                Run(run_id=f"R-B3-{i}", task_id="T-B3", project_id="P-TEST",
+                    status="SUCCEEDED", executor="fake")
+            )
+        uow.commit()
+    n = asyncio.run(loop._requeue_worker_blocked())
+    assert n == 1
+    with UnitOfWork(env["factory"]) as uow:
+        assert TaskRepo(uow.session).get_by_task_id("T-B1").status.value == "READY"
+        assert TaskRepo(uow.session).get_by_task_id("T-B2").status.value == "BLOCKED"
+        assert TaskRepo(uow.session).get_by_task_id("T-B3").status.value == "BLOCKED"
+
+
+def test_transport_timeout_requeues_then_fails_bounded(env):
+    """A transport timeout is a retryable interrupt (task back to READY,
+    run INTERRUPTED), but bounded: after MAX_RUN_RETRIES runs the task
+    FAILs permanently instead of burning unbounded model calls."""
+    from researchd.config import DEFAULT_PROFILES
+    from researchd.executors.reasonix.transport import TransportTimeoutError
+
+    class TimeoutExecutor(FakeExecutor):
+        async def run_worker(self, context, *, profile):
+            raise TransportTimeoutError("reasonix acp session/prompt: timeout")
+
+    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 1})(), "profiles": dict(DEFAULT_PROFILES), "data_dir": "t"})()
+    ex = TimeoutExecutor()
+    loop = SchedulerLoop(settings, env["factory"], ex, FakeDeliveryPort(), max_parallel=1)
+    with UnitOfWork(env["factory"]) as uow:
+        t = make_task(status="READY")
+        TaskRepo(uow.session).save(t)
+        uow.commit()
+        run = RunDispatcher(uow.session, ex).dispatch_task(t)
+        uow.commit()
+    for expected in ("READY", "READY"):  # attempts 1-2: retryable interrupt
+        asyncio.run(loop._drive_run(run.run_id, t.task_id))
+        with UnitOfWork(env["factory"]) as uow:
+            task = TaskRepo(uow.session).get_by_task_id(t.task_id)
+            assert task.status.value == expected
+            run = RunDispatcher(uow.session, ex).dispatch_task(task)  # re-dispatch
+            uow.commit()
+    # attempt 3 (total runs == MAX_RUN_RETRIES): permanent failure
+    asyncio.run(loop._drive_run(run.run_id, t.task_id))
+    with UnitOfWork(env["factory"]) as uow:
+        task = TaskRepo(uow.session).get_by_task_id(t.task_id)
+        assert task.status.value == "FAILED"
+        assert "timeout" in (task.error_message or "")
 
 
 def test_dispatcher_full_cycle(env):
@@ -162,15 +262,23 @@ def test_budget_timeout_interrupts_run(env):
 async def _drive_with_timeout(env, ex, run_id, task_id):
     from researchd.config import DEFAULT_PROFILES
 
-    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 1})(), "profiles": dict(DEFAULT_PROFILES)})()
+    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 1})(), "profiles": dict(DEFAULT_PROFILES), "data_dir": "t"})()
     loop = SchedulerLoop(settings, env["factory"], ex, FakeDeliveryPort(), max_parallel=1)
     await loop._drive_run(run_id, task_id)
 
 
 def test_scheduler_dispatch_and_collect(env):
-    """End-to-end through the loop: READY task -> RUNNING -> REVIEW, and the
-    outbox delivers a scheduled message exactly once."""
+    """End-to-end through the loop: READY task -> RUNNING -> REVIEW -> auditor
+    ACCEPT -> COMPLETED, and the outbox delivers a scheduled message exactly once."""
     ex = FakeExecutor()
+    ex.script("worker", {"payload": {
+        "schema": "researchd.work_result.v1",
+        "task_id": "T-001",
+        "outcome": "SUBMIT_FOR_REVIEW",
+        "criteria_results": [{"criterion_id": "SC-1", "status": "PASS"}],
+        "artifacts": [], "evidence_candidates": [], "claim_changes": [],
+        "issues": [], "decision_candidates": [], "next_task_proposals": [],
+    }})
     port = FakeDeliveryPort()
     with UnitOfWork(env["factory"]) as uow:
         t = make_task(status="READY")
@@ -181,11 +289,11 @@ def test_scheduler_dispatch_and_collect(env):
         uow.commit()
     from researchd.config import DEFAULT_PROFILES
 
-    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 4})(), "profiles": dict(DEFAULT_PROFILES)})()
+    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 4})(), "profiles": dict(DEFAULT_PROFILES), "data_dir": "t"})()
     loop = SchedulerLoop(settings, env["factory"], ex, port, max_parallel=4)
 
     async def run_ticks():
-        for _ in range(6):
+        for _ in range(8):
             await loop.tick()
             await asyncio.sleep(0.05)
     asyncio.run(run_ticks())
@@ -193,16 +301,23 @@ def test_scheduler_dispatch_and_collect(env):
     with UnitOfWork(env["factory"]) as uow:
         task = TaskRepo(uow.session).get_by_task_id("T-001")
         runs = RunRepo(uow.session).list_active()
-        assert task.status.value == "REVIEW"
-        assert len(port.deliveries) == 1
-        assert port.deliveries[0]["idempotency_key"] == "out-1"
+        # independent auditor accepted -> task COMPLETED (never RUNNING->COMPLETED)
+        assert task.status.value == "COMPLETED"
+        # out-1 delivered once + the real milestone (first completed task)
+        keys = [d["idempotency_key"] for d in port.deliveries]
+        assert keys.count("out-1") == 1
+        assert any(k.startswith("milestone:") for k in keys)
+        assert any("MILESTONE" in d["payload"].get("body", "") for d in port.deliveries)
         # a second round of ticks does NOT redeliver (idempotent)
     async def run_ticks2():
         for _ in range(3):
             await loop.tick()
             await asyncio.sleep(0.05)
     asyncio.run(run_ticks2())
-    assert len(port.deliveries) == 1
+    # nothing redelivered (out-1 and the milestone each exactly once)
+    keys = [d["idempotency_key"] for d in port.deliveries]
+    assert keys.count("out-1") == 1
+    assert len([k for k in keys if k.startswith("milestone:")]) == 1
 
 
 def test_outbox_crash_recovery_no_duplicate(env):
@@ -215,7 +330,7 @@ def test_outbox_crash_recovery_no_duplicate(env):
         uow.commit()
     from researchd.config import DEFAULT_PROFILES
 
-    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 1})(), "profiles": dict(DEFAULT_PROFILES)})()
+    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 1})(), "profiles": dict(DEFAULT_PROFILES), "data_dir": "t"})()
     loop = SchedulerLoop(settings, env["factory"], ex := FakeExecutor(), port, max_parallel=1)
     asyncio.run(loop.tick())
     assert len(port.deliveries) == 1
@@ -245,6 +360,14 @@ def test_blocked_task_not_dispatched(env):
     from researchd.persistence.repositories import DecisionRepo
 
     ex = FakeExecutor()
+    ex.script("worker", {"payload": {
+        "schema": "researchd.work_result.v1",
+        "task_id": "T-001",
+        "outcome": "SUBMIT_FOR_REVIEW",
+        "criteria_results": [{"criterion_id": "SC-1", "status": "PASS"}],
+        "artifacts": [], "evidence_candidates": [], "claim_changes": [],
+        "issues": [], "decision_candidates": [], "next_task_proposals": [],
+    }})
     with UnitOfWork(env["factory"]) as uow:
         t = make_task(status="READY", blocked_by=["D-002"])
         TaskRepo(uow.session).save(t)
@@ -257,12 +380,12 @@ def test_blocked_task_not_dispatched(env):
         uow.commit()
     from researchd.config import DEFAULT_PROFILES
 
-    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 4})(), "profiles": dict(DEFAULT_PROFILES)})()
+    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 4})(), "profiles": dict(DEFAULT_PROFILES), "data_dir": "t"})()
     loop = SchedulerLoop(settings, env["factory"], ex, FakeDeliveryPort(), max_parallel=4)
     asyncio.run(loop.tick())
     with UnitOfWork(env["factory"]) as uow:
         assert TaskRepo(uow.session).get_by_task_id("T-001").status.value == "READY"  # still READY
-    # close the decision -> next tick dispatches and completes
+    # close the decision -> next tick dispatches, audits, and completes
     with UnitOfWork(env["factory"]) as uow:
         d = DecisionRepo(uow.session).get_by_decision_id("D-002")
         d.apply_answer("A", "pi")
@@ -274,4 +397,4 @@ def test_blocked_task_not_dispatched(env):
             await asyncio.sleep(0.05)
     asyncio.run(wait_ticks())
     with UnitOfWork(env["factory"]) as uow:
-        assert TaskRepo(uow.session).get_by_task_id("T-001").status.value == "REVIEW"
+        assert TaskRepo(uow.session).get_by_task_id("T-001").status.value == "COMPLETED"

@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_DATA_DIR = ".data"
@@ -50,6 +50,59 @@ class SchedulerConfig(BaseModel):
     tick_seconds: float = 2.0
 
 
+class CcConnectConfig(BaseModel):
+    """cc-connect Delivery API target (IMPLEMENTATION.md §19.2). The token is
+    a secret: read from env/config file, used only in the Authorization
+    header, never logged, never persisted to the DB, artifacts, or executor
+    environment."""
+
+    base_url: str = "http://127.0.0.1:9820"
+    uds: str | None = None  # optional unix domain socket (preferred when set)
+    token: SecretStr = SecretStr("")
+    project: str = ""  # cc-connect project name (required, fail-closed)
+    session_key: str = ""  # cc-connect session key for card callbacks
+    chat_id: str = ""  # explicit staging chat override (delivery test only)
+
+    @field_validator("base_url")
+    @classmethod
+    def _base_url_transport(cls, v: str) -> str:
+        """Only loopback HTTP or explicit HTTPS (IMPLEMENTATION.md §19.2).
+        Never allow sending the token over plaintext to a non-loopback host."""
+        url = v.lower()
+        if url.startswith("https://"):
+            return v
+        if url.startswith("http://"):
+            import urllib.parse
+
+            host = urllib.parse.urlparse(v).hostname or ""
+            if host in ("127.0.0.1", "::1", "localhost"):
+                return v
+            raise ValueError(
+                "cc_connect base_url must be loopback HTTP or explicit HTTPS "
+                f"(got {v!r}); refusing plaintext token to non-loopback host"
+            )
+        raise ValueError(
+            "cc_connect base_url must be http:// (loopback) or https:// "
+            f"(got {v!r})"
+        )
+
+
+class FeishuConfig(BaseModel):
+    """Feishu docx projection config (IMPLEMENTATION.md §20). Credentials are
+    secrets: read from env vars (never logged, never persisted to the DB,
+    artifacts, or executor environment). allow_auto_create gates the
+    researchd-initiated document creation (user-authorized for staging)."""
+
+    lark_app_id_env: str = "LARK_APP_ID"
+    lark_app_secret_env: str = "LARK_APP_SECRET"
+    folder_token: str = ""  # optional folder for created documents
+    staging_chat_id: str = ""  # RD测试 group (openchat collaborator target)
+    pi_open_id: str = ""  # real PI open_id (collaborator target, optional)
+    doc_title_template: str = "科研项目报告 - {project_name} - {date}"
+    allow_auto_create: bool = True
+    default_permission: str = "full_access"  # drive permission level for collaborators
+
+
 class ProfileConfig(BaseModel):
     """Named executor profile (IMPLEMENTATION.md §15.1): resolved model and
     reasoning effort. Profile names are referenced by Task contracts and by
@@ -86,10 +139,12 @@ class Settings(BaseSettings):
     data_dir: str = Field(default=DEFAULT_DATA_DIR, validation_alias=AliasChoices("RESEARCHD_DATA_DIR", "data_dir"))
     db_path: str = Field(default=".data/researchd.db", validation_alias=AliasChoices("RESEARCHD_DB", "db_path"))
     log_level: str = "info"
-    doc_platform: str = "none"  # none | feishu (feishu is PENDING/B-01 gated)
+    doc_platform: str = "none"  # none | feishu
+    feishu: FeishuConfig = Field(default_factory=FeishuConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
     interaction: InteractionConfig = Field(default_factory=InteractionConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
+    cc_connect: CcConnectConfig = Field(default_factory=CcConnectConfig)
     profiles: dict[str, ProfileConfig] = Field(default_factory=lambda: dict(DEFAULT_PROFILES))
     service_name: str = "researchd"
 

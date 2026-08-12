@@ -139,6 +139,7 @@ class RunRow(CommonFieldsMixin, Base):
     outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
     result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    usage_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     repair_attempts: Mapped[int] = mapped_column(Integer, default=0)
 
 
@@ -155,6 +156,32 @@ class ExecutorSessionRow(CommonFieldsMixin, Base):
     remote_session_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     last_event_sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="ACTIVE")
+
+
+class InvocationRow(CommonFieldsMixin, Base):
+    """One model-call invocation (planner/worker/auditor), recorded for every
+    executor turn so model usage is traceable even for project-level planner
+    turns that have no task/run row (IMPLEMENTATION.md §13)."""
+
+    __tablename__ = "invocations"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    invocation_id: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)  # planner|worker|auditor
+    project_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    task_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    context_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    profile_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    resolved_model: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    reasoning_effort: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    skills_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    budget_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)  # RUNNING|SUCCEEDED|FAILED|INTERRUPTED
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    usage_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class ArtifactRow(CommonFieldsMixin, Base):
@@ -386,6 +413,7 @@ class ProjectionStateRow(Base):
     section_key: Mapped[str] = mapped_column(String(128), nullable=False)
     block_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    snapshot_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # full previous state snapshot (reporter)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
     UniqueConstraint("project_id", "document_id", "section_key", name="uq_projection_section")
 

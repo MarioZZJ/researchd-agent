@@ -128,6 +128,46 @@ def test_inbound_decision_flow_and_idempotency(api_env):
     assert r3.json()["applied"] is False
 
 
+def test_decision_link_evidence(api_env):
+    """POST /v1/decisions/{id}/evidence links a real project evidence to a
+    decision (idempotent; the card linter requires real refs)."""
+    from researchd.domain.decision import Decision, DecisionOption
+    from researchd.domain.evidence import Evidence
+    from researchd.persistence.repositories import DecisionRepo, EvidenceRepo
+    from researchd.persistence.transaction import UnitOfWork
+
+    c = api_env["client"]
+    c.post("/v1/projects", json={"project_id": "p3", "name": "three", "actor": "ou_pi"})
+    with UnitOfWork(api_env["factory"]) as uow:
+        DecisionRepo(uow.session).save(
+            Decision(
+                decision_id="D-002", project_id="p3", status="OPEN", question="q",
+                options=[DecisionOption(option_id="A", label="A"), DecisionOption(option_id="B", label="B")],
+            )
+        )
+        EvidenceRepo(uow.session).save(
+            Evidence(evidence_id="E-1", project_id="p3", type="computational",
+                     status="VERIFIED", statement="s")
+        )
+        uow.commit()
+    r = c.post("/v1/decisions/D-002/evidence", json={"evidence_id": "E-1"})
+    assert r.status_code == 200, r.text
+    assert r.json()["applied"] is True
+    assert r.json()["evidence_refs"] == ["E-1"]
+    r2 = c.post("/v1/decisions/D-002/evidence", json={"evidence_id": "E-1"})
+    assert r2.json()["applied"] is False  # idempotent
+    # missing evidence -> 404; cross-project evidence -> 400
+    assert c.post("/v1/decisions/D-002/evidence", json={"evidence_id": "E-NOPE"}).status_code == 404
+    c.post("/v1/projects", json={"project_id": "p4", "name": "four", "actor": "ou_pi"})
+    with UnitOfWork(api_env["factory"]) as uow:
+        EvidenceRepo(uow.session).save(
+            Evidence(evidence_id="E-2", project_id="p4", type="computational",
+                     status="VERIFIED", statement="s")
+        )
+        uow.commit()
+    assert c.post("/v1/decisions/D-002/evidence", json={"evidence_id": "E-2"}).status_code == 400
+
+
 def test_commands_route(api_env):
     c = api_env["client"]
     c.post("/v1/projects", json={"project_id": "p3", "name": "three", "actor": "ou_pi"})
@@ -181,7 +221,7 @@ def test_acp_shim_handshake_and_prompt(api_env):
     assert "interaction_profile" in init["result"]["configOptions"]
 
     new = __import__("asyncio").run(
-        server.handle({"jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {"sessionConfig": {"interaction_profile": "fast", "cc_user_id": "ou_pi"}}})
+        server.handle({"jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {"sessionConfig": {"interaction_profile": "fast", "cc_project": "proj", "cc_session_key": "feishu:oc:ou_pi", "cc_user_id": "ou_pi"}}})
     )
     sid = new["result"]["sessionId"]
     session = server.sessions[sid]
@@ -195,20 +235,20 @@ def test_acp_shim_handshake_and_prompt(api_env):
     )
     assert bind.get("error") is None, bind
     assert session.cc_project == "p5"
-    assert "bound" in bind["result"]["message"]["content"][0]["text"]
+    assert "bound" in bind["result"]["message"]["content"]["text"]
 
     # binding an unknown project fails and leaves the session unbound
     bad = __import__("asyncio").run(
         server.handle({"jsonrpc": "2.0", "id": 4, "method": "session/prompt", "params": {"sessionId": sid, "prompt": "/research bind project nope"}})
     )
-    assert "not found" in bad["result"]["message"]["content"][0]["text"]
+    assert "not found" in bad["result"]["message"]["content"]["text"]
 
     # status works through the bound session
     status = __import__("asyncio").run(
         server.handle({"jsonrpc": "2.0", "id": 5, "method": "session/prompt", "params": {"sessionId": sid, "prompt": "/research status"}})
     )
     assert status.get("error") is None, status
-    text = status["result"]["message"]["content"][0]["text"]
+    text = status["result"]["message"]["content"]["text"]
     assert "p5" in text
 
     # model interaction updates the SESSION (never the project policy)
@@ -534,3 +574,71 @@ def test_create_project_rejects_symlinked_anchor(api_env):
     # clean up the planted symlink (fixture tmp dir is discarded anyway)
     if anchor.is_symlink():
         anchor.unlink()
+
+
+def test_acp_prompt_uses_real_platform_message_id(factory, monkeypatch):
+    """session/prompt with messageId -> the inbound payload's message_id is
+    the REAL platform message id (acp-<platform id>), so a later identical
+    message is a NEW message (never merged with the old one)."""
+    from unittest.mock import patch
+
+    import researchd.acp.agent as agent_mod
+    import researchd.acp.inbound as inbound_mod
+
+    sent = {}
+
+    async def fake_post(client, url, json=None, **kw):
+        sent["payload"] = json
+        return type("R", (), {"status_code": 200, "json": lambda self: {}})()
+
+    class FakeAsyncClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *x):
+            return False
+
+        async def post(self, url, json=None, **kw):
+            sent["payload"] = json
+            return type("R", (), {"status_code": 200, "json": lambda self: {}})()
+
+    fake_client = FakeAsyncClient
+
+    with patch.object(inbound_mod.httpx, "AsyncClient", new=fake_client):
+        handler = agent_mod.AcpServer(
+            type("S", (), {"api": type("A", (), {"socket_path": "", "token": "tok"})(), "interaction": type("I", (), {"deterministic_commands": True, "allow_natural_language_intent": False})(), "service_name": "t"})()
+        )
+        import asyncio
+
+        sid = handler._session_new(
+            {"sessionConfig": {"cc_project": "home", "cc_session_key": "oc_test:ou_u1", "cc_user_id": "ou_u1"}}
+        )["sessionId"]
+        resp = asyncio.run(
+            handler._session_prompt(
+                {"sessionId": sid, "prompt": [{"type": "text", "text": "/decision D-1 A --version 1"}], "messageId": "om_real_123"}
+            )
+        )
+        assert sent["payload"]["message_id"] == "acp-om_real_123"
+        assert resp["message"]["content"]["text"] == "ok"
+
+    # WITHOUT messageId the legacy hash-based key is used (back-compat)
+    with patch.object(inbound_mod.httpx, "AsyncClient", new=fake_client):
+        handler2 = agent_mod.AcpServer(
+            type("S", (), {"api": type("A", (), {"socket_path": "", "token": "tok"})(), "interaction": type("I", (), {"deterministic_commands": True, "allow_natural_language_intent": False})(), "service_name": "t"})()
+        )
+        import asyncio as _a
+
+        sid2 = handler2._session_new(
+            {"sessionConfig": {"cc_project": "home", "cc_session_key": "oc_test:ou_u1", "cc_user_id": "ou_u1"}}
+        )["sessionId"]
+        _a.run(
+            handler2._session_prompt(
+                {"sessionId": sid2, "prompt": [{"type": "text", "text": "/decision D-1 A --version 1"}]}
+            )
+        )
+        # no messageId from the gateway -> legacy hash key (acp-<sha256 prefix>)
+        assert sent["payload"]["message_id"].startswith("acp-")
+        assert sent["payload"]["message_id"] != "acp-om_real_123"
