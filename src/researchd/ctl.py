@@ -101,7 +101,7 @@ def task_cmd(action: str, project_id: str) -> None:
 @click.option("--open", "only_open", is_flag=True, default=False)
 @click.option("--evidence-id", default="", help="evidence id to link (action=link)")
 def decision_cmd(action: str, project_id: str, only_open: bool, evidence_id: str) -> None:
-    """decision list <project-id> [--open] | decision link <project-id> <decision-id> --evidence-id E-xxx"""
+    """decision list <project-id> [--open] | decision link <decision-id> --evidence-id E-xxx"""
     if action == "list":
         data = _call("GET", f"/v1/projects/{project_id}/decisions")
         for d in data.get("decisions", []):
