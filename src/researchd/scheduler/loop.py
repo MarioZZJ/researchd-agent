@@ -463,9 +463,19 @@ class SchedulerLoop:
         return self._profile_dict(name, source)
 
     def _default_profile_name(self, role: str) -> str:
-        """Default profile name for a role: <executor>_<role-suffix>."""
+        """Default profile name for a role: <executor>_<role-suffix>.
+
+        The planner schema leaves `role` a free string, so a real model may
+        return any role label; unknown roles fall back to the worker profile
+        (tasks are execution work) instead of crashing the dispatch loop."""
         prefix = {"reasonix": "reasonix", "codex": "codex", "fake": "fake"}.get(self.executor.name, "fake")
-        return f"{prefix}_{ROLE_TO_PROFILE[role]}"
+        suffix = ROLE_TO_PROFILE.get(role)
+        if suffix is None:
+            logger.warning(
+                "unknown task role %r; defaulting to worker profile (task still runs)", role
+            )
+            suffix = "worker"
+        return f"{prefix}_{suffix}"
 
     def _profile_dict(self, name: str, source: str) -> dict:
         profile_cfg = getattr(self.settings, "profiles", {}).get(name)
