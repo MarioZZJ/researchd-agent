@@ -408,6 +408,55 @@ def answer_decision(decision_id: str, req: DecisionAnswerRequest, uow: UnitOfWor
     return {"decision_id": decision_id, "applied": True, "answer": req.option_id}
 
 
+class DecisionEvidenceLinkRequest(BaseModel):
+    evidence_id: str
+
+
+@router.post("/decisions/{decision_id}/evidence", dependencies=[Depends(require_token)])
+def link_decision_evidence(decision_id: str, req: DecisionEvidenceLinkRequest, uow: UnitOfWork = Depends(get_uow)) -> dict:
+    """Append a real evidence id to a decision's evidence_refs (idempotent).
+
+    The reporter's linter requires a decision card's bottom line to cite REAL
+    evidence; a bootstrap-OPEN decision (pilot D-002) needs the pilot's first
+    VERIFIED evidence linked before its card can be sent. Token-gated; the
+    evidence row itself must exist (fail-closed — the linter re-checks at
+    report time anyway).
+    """
+    from ...persistence.repositories import EvidenceRepo
+
+    repo = DecisionRepo(uow.session)
+    decision = repo.get_by_decision_id(decision_id)
+    if decision is None:
+        raise HTTPException(status_code=404, detail=f"decision {decision_id!r} not found")
+    evidence = EvidenceRepo(uow.session).get_by_evidence_id(req.evidence_id)
+    if evidence is None:
+        raise HTTPException(status_code=404, detail=f"evidence {req.evidence_id!r} not found")
+    if evidence.project_id != decision.project_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"evidence {req.evidence_id!r} belongs to project {evidence.project_id}, "
+            f"not {decision.project_id}",
+        )
+    refs = list(decision.evidence_refs or [])
+    if req.evidence_id in refs:
+        uow.commit()
+        return {"decision_id": decision_id, "evidence_refs": refs, "applied": False}
+    refs.append(req.evidence_id)
+    decision.evidence_refs = refs
+    repo.save(decision)
+    EventRepo(uow.session).append(
+        make_event(
+            event_type="decision.evidence_linked",
+            aggregate=AggregateRef(type="decision", id=decision.id, version=decision.version),
+            idempotency_key=f"decision:{decision_id}:evidence:{req.evidence_id}",
+            project_id=decision.project_id,
+            payload={"evidence_id": req.evidence_id},
+        )
+    )
+    uow.commit()
+    return {"decision_id": decision_id, "evidence_refs": refs, "applied": True}
+
+
 @router.post("/projects/{project_id}/commands", dependencies=[Depends(require_token)])
 def run_command(project_id: str, req: CommandRequest, uow: UnitOfWork = Depends(get_uow)) -> dict:
     _get_project(uow, project_id)

@@ -128,6 +128,46 @@ def test_inbound_decision_flow_and_idempotency(api_env):
     assert r3.json()["applied"] is False
 
 
+def test_decision_link_evidence(api_env):
+    """POST /v1/decisions/{id}/evidence links a real project evidence to a
+    decision (idempotent; the card linter requires real refs)."""
+    from researchd.domain.decision import Decision, DecisionOption
+    from researchd.domain.evidence import Evidence
+    from researchd.persistence.repositories import DecisionRepo, EvidenceRepo
+    from researchd.persistence.transaction import UnitOfWork
+
+    c = api_env["client"]
+    c.post("/v1/projects", json={"project_id": "p3", "name": "three", "actor": "ou_pi"})
+    with UnitOfWork(api_env["factory"]) as uow:
+        DecisionRepo(uow.session).save(
+            Decision(
+                decision_id="D-002", project_id="p3", status="OPEN", question="q",
+                options=[DecisionOption(option_id="A", label="A"), DecisionOption(option_id="B", label="B")],
+            )
+        )
+        EvidenceRepo(uow.session).save(
+            Evidence(evidence_id="E-1", project_id="p3", type="computational",
+                     status="VERIFIED", statement="s")
+        )
+        uow.commit()
+    r = c.post("/v1/decisions/D-002/evidence", json={"evidence_id": "E-1"})
+    assert r.status_code == 200, r.text
+    assert r.json()["applied"] is True
+    assert r.json()["evidence_refs"] == ["E-1"]
+    r2 = c.post("/v1/decisions/D-002/evidence", json={"evidence_id": "E-1"})
+    assert r2.json()["applied"] is False  # idempotent
+    # missing evidence -> 404; cross-project evidence -> 400
+    assert c.post("/v1/decisions/D-002/evidence", json={"evidence_id": "E-NOPE"}).status_code == 404
+    c.post("/v1/projects", json={"project_id": "p4", "name": "four", "actor": "ou_pi"})
+    with UnitOfWork(api_env["factory"]) as uow:
+        EvidenceRepo(uow.session).save(
+            Evidence(evidence_id="E-2", project_id="p4", type="computational",
+                     status="VERIFIED", statement="s")
+        )
+        uow.commit()
+    assert c.post("/v1/decisions/D-002/evidence", json={"evidence_id": "E-2"}).status_code == 400
+
+
 def test_commands_route(api_env):
     c = api_env["client"]
     c.post("/v1/projects", json={"project_id": "p3", "name": "three", "actor": "ou_pi"})

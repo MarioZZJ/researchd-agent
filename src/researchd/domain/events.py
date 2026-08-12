@@ -68,6 +68,7 @@ EVENT_TYPES = {
     "decision.closed",
     "decision.withdrawn",
     "decision.duplicate_rejected",
+    "decision.evidence_linked",
     "report.compiled",
     "report.sent",
     "outbox.delivered",

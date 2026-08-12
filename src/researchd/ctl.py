@@ -96,16 +96,27 @@ def task_cmd(action: str, project_id: str) -> None:
 
 
 @main.command("decision")
-@click.argument("action", type=click.Choice(["list"]))
+@click.argument("action", type=click.Choice(["list", "link"]))
 @click.argument("project_id")
 @click.option("--open", "only_open", is_flag=True, default=False)
-def decision_cmd(action: str, project_id: str, only_open: bool) -> None:
-    """decision list <project-id> [--open]"""
-    data = _call("GET", f"/v1/projects/{project_id}/decisions")
-    for d in data.get("decisions", []):
-        if only_open and d["status"] not in ("OPEN", "ANSWERED"):
-            continue
-        click.echo(f"{d['decision_id']}  {d['status']}  v{d['version']}  {d['question'][:80]}")
+@click.option("--evidence-id", default="", help="evidence id to link (action=link)")
+def decision_cmd(action: str, project_id: str, only_open: bool, evidence_id: str) -> None:
+    """decision list <project-id> [--open] | decision link <project-id> <decision-id> --evidence-id E-xxx"""
+    if action == "list":
+        data = _call("GET", f"/v1/projects/{project_id}/decisions")
+        for d in data.get("decisions", []):
+            if only_open and d["status"] not in ("OPEN", "ANSWERED"):
+                continue
+            click.echo(f"{d['decision_id']}  {d['status']}  v{d['version']}  {d['question'][:80]}")
+        return
+    # link: the decision card's linter requires real evidence refs — attach
+    # the project's VERIFIED evidence id so the card can be sent
+    if not evidence_id:
+        raise click.ClickException("decision link requires --evidence-id <E-xxx>")
+    click.echo(json.dumps(
+        _call("POST", f"/v1/decisions/{project_id}/evidence", json={"evidence_id": evidence_id}),
+        ensure_ascii=False,
+    ))
 
 
 @main.command()
