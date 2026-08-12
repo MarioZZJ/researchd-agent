@@ -136,6 +136,72 @@ def test_pilot_create_cli_available():
     result = runner.invoke(main, ["pilot", "create", "--help"])
     assert result.exit_code == 0
     assert "--project-id" in result.output
+    assert "--import-open-decision" in result.output
+
+
+def test_pilot_create_imports_open_decision_and_workspace(tmp_path):
+    """pilot create must derive the service workspace root (A1) and import
+    an OPEN decision D-002 with A/B options idempotently (A2)."""
+    from pathlib import Path
+
+    from click.testing import CliRunner
+    from sqlalchemy import create_engine
+
+    from researchd.cli import main
+    from researchd.persistence.repositories import DecisionRepo, ProjectRepo
+    from researchd.persistence.transaction import make_session_factory
+
+    runner = CliRunner()
+    db = str(tmp_path / "pilot.db")
+    data_dir = str(tmp_path / "data")
+    project_id = "interdisciplinary-citation-pilot"
+    args = [
+        "--data-dir", data_dir,
+        "pilot", "create",
+        "--project-id", project_id,
+        "--owner-open-id", "ou_8c1a4e0a1e9bf230e2dd648b4a97259c",
+        "--import-decision", "D-001=A",
+        "--import-open-decision", "D-002",
+        "--decision-question", "pilot 验证决策 D-002",
+        "--decision-body", "验证用途：真实卡片点击闭环",
+        "--db", db,
+    ]
+    result = runner.invoke(main, args)
+    assert result.exit_code == 0, result.output
+    factory = make_session_factory(create_engine(f"sqlite:///{db}"))
+    with factory() as session:
+        project = ProjectRepo(session).get_by_project_id(project_id)
+        assert project is not None
+        expected_root = str(tmp_path / "data" / "workspaces" / project_id)
+        assert project.workspace_root == expected_root
+        assert Path(expected_root).is_dir()
+        d1 = DecisionRepo(session).get_by_decision_id("D-001")
+        assert d1 is not None and d1.status.value == "APPLIED" and d1.answer == "A"
+        d2 = DecisionRepo(session).get_by_decision_id("D-002")
+        assert d2 is not None and d2.status.value == "OPEN"
+        assert d2.project_id == project_id
+        assert d2.question == "pilot 验证决策 D-002"
+        assert d2.recommendation == "验证用途：真实卡片点击闭环"
+        assert [o.option_id for o in d2.options] == ["A", "B"]
+    # idempotent re-run: no duplicate project/decision/workspace side-effects
+    result2 = runner.invoke(main, args)
+    assert result2.exit_code == 0, result2.output
+    with factory() as session:
+        from sqlalchemy import func, select
+
+        from researchd.persistence.models import DecisionRow, ProjectRow
+
+        assert session.execute(select(func.count()).select_from(ProjectRow)).scalar() == 1
+        assert session.execute(select(func.count()).select_from(DecisionRow)).scalar() == 2
+        assert DecisionRepo(session).get_by_decision_id("D-002").status.value == "OPEN"
+    # fail-closed: open-decision flags without the id
+    result3 = runner.invoke(
+        main,
+        ["--data-dir", str(tmp_path / "data2"), "pilot", "create",
+         "--project-id", "p-x", "--decision-question", "q", "--db", str(tmp_path / "x.db")],
+    )
+    assert result3.exit_code != 0
+    assert "--import-open-decision" in result3.output
 
 
 def test_ctl_tcp_base_url_uses_configured_port(monkeypatch):
