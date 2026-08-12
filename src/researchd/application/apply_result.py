@@ -155,7 +155,7 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
                         )
                     ).scalars()
                     referenced_by_verified = any(
-                        existing_artifact.artifact_id in (ev.artifact_refs or [])
+                        existing_artifact.artifact_id in (ev.artifact_refs_json or [])
                         for ev in ev_rows
                     )
                     if referenced_by_verified:

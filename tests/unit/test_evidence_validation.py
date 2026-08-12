@@ -297,3 +297,23 @@ def test_same_task_artifact_supersede_on_content_change(factory, tmp_path):
         with pytest.raises(ValueError, match="belongs to task"):
             apply_work_result(uow.session, run2, validate_work_result(raw2))
         uow.rollback()
+    # VERIFIED evidence referencing the artifact -> supersede rejected too
+    from researchd.domain.evidence import ComputationalProvenance, Evidence
+
+    with UnitOfWork(factory) as uow:
+        EvidenceRepo = __import__("researchd.persistence.repositories", fromlist=["EvidenceRepo"]).EvidenceRepo
+        EvidenceRepo(uow.session).save(
+            Evidence(
+                evidence_id="E-V1", project_id="P-SUP", type="computational", status="VERIFIED",
+                statement="s", run_id="R-OLD", task_id="T-1",
+                artifact_refs=["art_doc"],
+                computational=ComputationalProvenance(run_id="R-OLD", artifact_id="art_doc"),
+            )
+        )
+        uow.commit()
+    f.write_text("v4")
+    run3, raw3 = result_for("T-1", "R-NEW2", "again")
+    with UnitOfWork(factory) as uow:
+        with pytest.raises(ValueError, match="VERIFIED evidence"):
+            apply_work_result(uow.session, run3, validate_work_result(raw3))
+        uow.rollback()
