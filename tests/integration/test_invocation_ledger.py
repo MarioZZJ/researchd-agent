@@ -78,3 +78,30 @@ def test_planner_failure_recorded_as_failed(env):
     assert len(invs) == 1
     assert invs[0].status == "FAILED"
     assert invs[0].error_message
+
+
+def test_planner_depends_on_materialized(env):
+    """The planner's dependency chain must be persisted on the tasks (was
+    silently dropped, so a real DAG ran fully in parallel)."""
+    from researchd.persistence.repositories import TaskRepo
+
+    ex = FakeExecutor()
+    ex.script("planner", {"payload": {
+        "schema": "researchd.planner_result.v1",
+        "proposed_tasks": [
+            {
+                "task_id": "T-A", "role": "worker", "objective": "a",
+                "success_criteria": [{"id": "c1", "text": "x"}],
+            },
+            {
+                "task_id": "T-B", "role": "analysis_worker", "objective": "b",
+                "depends_on": ["T-A"],
+                "success_criteria": [{"id": "c1", "text": "x"}],
+            },
+        ],
+    }})
+    n = asyncio.run(plan_projects(env["factory"], ex, data_dir="t"))
+    assert n == 1
+    with UnitOfWork(env["factory"]) as uow:
+        assert TaskRepo(uow.session).get_by_task_id("T-A").depends_on == []
+        assert TaskRepo(uow.session).get_by_task_id("T-B").depends_on == ["T-A"]

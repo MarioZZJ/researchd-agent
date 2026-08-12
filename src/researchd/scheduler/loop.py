@@ -27,6 +27,11 @@ logger = logging.getLogger("researchd.scheduler")
 TICK_SECONDS = 2.0
 HEARTBEAT_SECONDS = 10.0
 
+# Bounded re-dispatches for tasks whose worker reported BLOCKED (outcome
+# BLOCKED, no decision blocking): after this many total runs the task stays
+# BLOCKED for human review instead of burning more model calls.
+MAX_WORKER_BLOCKED_RETRIES = 2
+
 # TaskRole -> default profile suffix (IMPLEMENTATION.md §15.1). Every role
 # must map to an existing DEFAULT_PROFILES entry.
 ROLE_TO_PROFILE = {
@@ -115,6 +120,9 @@ class SchedulerLoop:
         # 2e. auditor: REVIEW tasks get an independent auditor run; ACCEPT
         #     completes the task, REVISE sends it back to READY
         stats["audited"] = await self._audit_review_tasks()
+        # 2f. worker-BLOCKED tasks (no decision blocking) whose upstream
+        #     depends_on are COMPLETED get requeued (bounded retries)
+        stats["unblocked"] = await self._requeue_worker_blocked()
         # 3. reporting: emit queued reports for active projects
         stats["reports"] = await self._report_projects()
         # 4. project document projection (incremental, PI Notes protected)
@@ -383,6 +391,10 @@ class SchedulerLoop:
                     if d.status.value == "OPEN"
                 ]
             slots = self.max_parallel - len(self.active)
+            completed = {
+                t.task_id
+                for t in TaskRepo(session).list_by_status(None, [TaskStatus.COMPLETED.value])
+            }
             for task in tasks:
                 if slots <= 0:
                     break
@@ -392,6 +404,7 @@ class SchedulerLoop:
                     task,
                     open_decisions,
                     blocked_task_ids=self._open_blocking_scope(session),
+                    completed_task_ids=completed,
                 )
                 if decision.action != "dispatch":
                     continue
@@ -440,6 +453,53 @@ class SchedulerLoop:
             if d.status.value == "OPEN":
                 blocked.update(d.blocking_scope)
         return blocked
+
+    async def _requeue_worker_blocked(self) -> int:
+        """Requeue tasks a worker marked BLOCKED (outcome BLOCKED, empty
+        blocked_by) once their depends_on are COMPLETED.
+
+        A worker-reported BLOCKED means "upstream work not ready yet" — the
+        design's BLOCKED -> READY transition (IMPLEMENTATION.md §7.1: 阻塞条件
+        解除). Decision-blocked tasks (blocked_by non-empty) are owned by
+        _unblock_resolved instead. Bounded: at most
+        MAX_WORKER_BLOCKED_RETRIES re-dispatches per task (counted by prior
+        runs); tasks past the bound stay BLOCKED for human review instead of
+        burning unbounded model calls.
+        """
+        from ..domain.enums import TaskStatus as TS
+        from ..domain.events import make_event
+        from ..domain.base import Actor, AggregateRef
+        from ..persistence.repositories import EventRepo, RunRepo, TaskRepo
+
+        requeued = 0
+        with self.session_factory() as session:
+            completed = {
+                t.task_id for t in TaskRepo(session).list_by_status(None, [TS.COMPLETED.value])
+            }
+            for task in TaskRepo(session).list_by_status(None, [TS.BLOCKED.value]):
+                if task.blocked_by:
+                    continue  # decision-blocked; _unblock_resolved owns it
+                missing = [d for d in task.depends_on if d not in completed]
+                if missing:
+                    continue  # upstream work still missing
+                if RunRepo(session).count_for_task(task.task_id) > MAX_WORKER_BLOCKED_RETRIES:
+                    continue  # retries exhausted; stays BLOCKED for human review
+                task.requeue(reason="worker reported BLOCKED; dependencies satisfied")
+                TaskRepo(session).save(task)
+                EventRepo(session).append(
+                    make_event(
+                        event_type="task.ready",
+                        aggregate=AggregateRef(type="task", id=task.task_id, version=task.version),
+                        idempotency_key=f"task:{task.task_id}:requeued:{task.current_run_id or 'x'}",
+                        project_id=task.project_id,
+                        actor=Actor(type="system"),
+                        payload={"reason": "worker BLOCKED resolved (dependencies satisfied)"},
+                    )
+                )
+                requeued += 1
+            session.commit()
+        return requeued
+
 
     def _resolve_profile(self, session, task, *, role: str | None = None) -> dict:  # noqa: ANN001
         """Resolve the executor profile for a task (IMPLEMENTATION.md §15.1):

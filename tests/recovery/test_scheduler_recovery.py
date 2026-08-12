@@ -69,6 +69,59 @@ def test_dispatch_decision_gates():
     assert task_dispatch_decision(t3, []).action == "skip"
 
 
+def test_dispatch_decision_gates_dependencies():
+    """A READY task must not run ahead of its depends_on; the completed set
+    is optional (legacy callers keep the old behavior)."""
+    t = make_task(status="READY", depends_on=["T-002"])
+    assert task_dispatch_decision(t, []).action == "dispatch"  # no completed set -> legacy
+    assert task_dispatch_decision(t, [], completed_task_ids=set()).action == "skip"
+    assert task_dispatch_decision(t, [], completed_task_ids={"T-002"}).action == "dispatch"
+    t2 = make_task(status="READY", depends_on=["T-002", "T-003"])
+    assert task_dispatch_decision(t2, [], completed_task_ids={"T-002"}).action == "skip"
+    assert task_dispatch_decision(t2, [], completed_task_ids={"T-002", "T-003"}).action == "dispatch"
+
+
+def test_worker_blocked_requeue_when_dependencies_complete(env):
+    """A worker-BLOCKED task (empty blocked_by) is requeued to READY once its
+    depends_on are COMPLETED; missing upstream work or exhausted retries keep
+    it BLOCKED (bounded re-dispatches, no unbounded model-call burn)."""
+    from researchd.config import DEFAULT_PROFILES
+    from researchd.domain.run import Run
+
+    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 1})(), "profiles": dict(DEFAULT_PROFILES), "data_dir": "t"})()
+    loop = SchedulerLoop(settings, env["factory"], FakeExecutor(), FakeDeliveryPort(), max_parallel=1)
+    with UnitOfWork(env["factory"]) as uow:
+        done = Task(
+            task_id="T-DONE", project_id="P-TEST", status="COMPLETED",
+            contract=TaskContract(
+                task_id="T-DONE", role="analysis_worker", objective="done",
+                success_criteria=[SuccessCriterion(id="SC-1", text="c")],
+            ),
+        )
+        TaskRepo(uow.session).save(done)
+        b1 = make_task(task_id="T-B1", status="READY", depends_on=["T-DONE"])
+        b1.block()
+        TaskRepo(uow.session).save(b1)
+        b2 = make_task(task_id="T-B2", status="READY", depends_on=["T-MISSING"])
+        b2.block()
+        TaskRepo(uow.session).save(b2)
+        b3 = make_task(task_id="T-B3", status="READY")
+        b3.block()
+        TaskRepo(uow.session).save(b3)
+        for i in range(3):  # already hit the retry bound (1 initial + 2 requeues)
+            RunRepo(uow.session).save(
+                Run(run_id=f"R-B3-{i}", task_id="T-B3", project_id="P-TEST",
+                    status="SUCCEEDED", executor="fake")
+            )
+        uow.commit()
+    n = asyncio.run(loop._requeue_worker_blocked())
+    assert n == 1
+    with UnitOfWork(env["factory"]) as uow:
+        assert TaskRepo(uow.session).get_by_task_id("T-B1").status.value == "READY"
+        assert TaskRepo(uow.session).get_by_task_id("T-B2").status.value == "BLOCKED"
+        assert TaskRepo(uow.session).get_by_task_id("T-B3").status.value == "BLOCKED"
+
+
 def test_dispatcher_full_cycle(env):
     ex = FakeExecutor()
     with UnitOfWork(env["factory"]) as uow:

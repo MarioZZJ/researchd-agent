@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from typing import Any, Generic, TypeVar
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from ..domain.base import utcnow
@@ -293,6 +293,15 @@ class RunRepo(BaseRepo[Run]):
             select(RunRow).where(RunRow.status.in_(["QUEUED", "STARTING", "RUNNING"])).order_by(RunRow.created_at)
         ).scalars()
         return [self._to_domain(r) for r in rows]
+
+    def count_for_task(self, task_id: str) -> int:
+        """Total runs ever created for a task (bounds BLOCKED re-dispatches)."""
+        return int(
+            self.session.execute(
+                select(func.count()).select_from(RunRow).where(RunRow.task_id == task_id)
+            ).scalar()
+            or 0
+        )
 
 
 # ---------------------------------------------------------------- Events

@@ -126,6 +126,7 @@ async def plan_projects(session_factory, executor, *, planner_profile: dict | No
                     task_id=pt.task_id,
                     project_id=project.project_id,
                     status=TaskStatus.READY,  # system-approved first batch
+                    depends_on=list(pt.depends_on or []),
                     contract=TaskContract(
                         task_id=pt.task_id,
                         role=pt.role,
