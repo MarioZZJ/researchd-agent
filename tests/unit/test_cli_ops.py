@@ -202,6 +202,37 @@ def test_pilot_create_imports_open_decision_and_workspace(tmp_path):
     )
     assert result3.exit_code != 0
     assert "--import-open-decision" in result3.output
+    # link a decision to evidence (idempotent; the linter validates existence
+    # at report time, so the card cites real pilot evidence once it exists)
+    result4 = runner.invoke(
+        main,
+        ["--data-dir", data_dir, "pilot", "create",
+         "--project-id", project_id,
+         "--link-decision-evidence", "D-002=E-TEST-EVIDENCE", "--db", db],
+    )
+    assert result4.exit_code == 0, result4.output
+    with factory() as session:
+        d2 = DecisionRepo(session).get_by_decision_id("D-002")
+        assert d2.evidence_refs == ["E-TEST-EVIDENCE"]
+    result5 = runner.invoke(
+        main,
+        ["--data-dir", data_dir, "pilot", "create",
+         "--project-id", project_id,
+         "--link-decision-evidence", "D-002=E-TEST-EVIDENCE", "--db", db],
+    )
+    assert result5.exit_code == 0, result5.output
+    with factory() as session:
+        d2 = DecisionRepo(session).get_by_decision_id("D-002")
+        assert d2.evidence_refs == ["E-TEST-EVIDENCE"]  # no duplicate ref
+    # fail-closed: link to a missing decision or empty evidence id
+    result6 = runner.invoke(
+        main,
+        ["--data-dir", data_dir, "pilot", "create",
+         "--project-id", project_id,
+         "--link-decision-evidence", "D-NOPE=E-X", "--db", db],
+    )
+    assert result6.exit_code != 0
+    assert "not found" in result6.output
 
 
 def test_ctl_tcp_base_url_uses_configured_port(monkeypatch):

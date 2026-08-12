@@ -109,9 +109,10 @@ def _derive_workspace_root(data_dir: str, project_id: str) -> str:
 @click.option("--import-open-decision", default="", help="import an OPEN decision <id> (its decision card will be sent to the group)")
 @click.option("--decision-question", default="", help="question/title for --import-open-decision (required with it)")
 @click.option("--decision-body", default="", help="bottom-line for --import-open-decision (optional; shown on the card)")
+@click.option("--link-decision-evidence", default="", help="link a decision to existing evidence as <id>=<evidence_id> (idempotent)")
 @click.option("--db", "db_path", default=None, help="database path (default: settings)")
 @click.pass_context
-def pilot_create(ctx: click.Context, project_id: str, question: str, owner_open_id: str, import_decision: str, import_open_decision: str, decision_question: str, decision_body: str, db_path: str | None) -> None:
+def pilot_create(ctx: click.Context, project_id: str, question: str, owner_open_id: str, import_decision: str, import_open_decision: str, decision_question: str, decision_body: str, link_decision_evidence: str, db_path: str | None) -> None:
     """Bootstrap the pilot project (idempotent). Creates the ACTIVE project
     with a service-derived workspace root and optionally imports decisions
     (APPLIED via --import-decision <id>=<answer>, or OPEN via
@@ -267,6 +268,21 @@ def pilot_create(ctx: click.Context, project_id: str, question: str, owner_open_
                 print(f"decision {import_open_decision} imported (OPEN)")
             else:
                 print(f"decision {import_open_decision} already exists (no-op)")
+        if link_decision_evidence:
+            decision_id, _, evidence_id = link_decision_evidence.partition("=")
+            if not evidence_id:
+                raise click.ClickException("--link-decision-evidence must be <decision_id>=<evidence_id>")
+            decision = DecisionRepo(uow.session).get_by_decision_id(decision_id)
+            if decision is None:
+                raise click.ClickException(f"decision {decision_id!r} not found")
+            refs = list(decision.evidence_refs or [])
+            if evidence_id not in refs:
+                refs.append(evidence_id)
+                decision.evidence_refs = refs
+                DecisionRepo(uow.session).save(decision)
+                print(f"decision {decision_id} evidence linked (+{evidence_id})")
+            else:
+                print(f"decision {decision_id} evidence already linked (no-op)")
         uow.commit()
     lock.release()
 
