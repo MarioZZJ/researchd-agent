@@ -22,8 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..domain.base import new_id
-from ..domain.evidence import (
-    Artifact,
+from ..domain.evidence import (    Artifact,
     Claim,
     ClaimEvidenceLink,
     ComputationalProvenance,
@@ -41,6 +40,7 @@ from ..persistence.repositories import (
     IssueRepo,
     ProjectRepo,
 )
+from .paths import normalize_artifact_path
 
 logger = logging.getLogger("researchd.apply")
 
@@ -80,7 +80,12 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
     for art in result.artifacts:
         artifact_id = art.local_ref
         existing_artifact = ArtifactRepo(session).get_by_artifact_id(artifact_id)
-        path = art.path
+        # model outputs are free-form: the path may be written relative to
+        # the cwd's basename ('ws/out/result.json') or absolute inside the
+        # root — normalize to root-relative when the target file really
+        # exists; anything else is left untouched for the registration gate
+        # to accept or reject (no boundary is ever widened)
+        path = normalize_artifact_path(project.workspace_root, art.path)
         if not path:
             raise ValueError(f"artifact {artifact_id!r} has an empty path; rejected")
         if existing_artifact is not None:

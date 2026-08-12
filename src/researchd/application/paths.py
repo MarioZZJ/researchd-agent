@@ -14,6 +14,30 @@ class PathEscapeError(ValueError):
     pass
 
 
+def normalize_artifact_path(workspace_root: str | Path, path: str) -> str:
+    """Model outputs are free-form, so an artifact path may arrive relative
+    to the cwd's basename ('ws/out/result.json' from cwd '.../ws') or as an
+    absolute path inside the root. Rewrite it to root-relative ONLY when the
+    target file actually exists; otherwise return it untouched so the
+    registration gate accepts or rejects it (no boundary is ever widened)."""
+    root = Path(workspace_root).resolve()
+    p = str(path).replace("\\", "/")
+    if p.startswith("/"):
+        try:
+            rel = Path(p).resolve().relative_to(root)
+        except ValueError:
+            return path  # outside the root: let the gate reject it
+        if (root / rel).is_file():
+            return str(rel)
+        return path
+    parts = p.split("/")
+    if len(parts) >= 2 and parts[0] == root.name:
+        stripped = "/".join(parts[1:])
+        if stripped and (root / stripped).is_file():
+            return stripped
+    return path
+
+
 def safe_resolve(workspace_root: str | Path, rel_path: str) -> Path:
     """Resolve rel_path inside workspace_root with escape/symlink protection."""
     root = Path(workspace_root).resolve()
