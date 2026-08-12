@@ -1,7 +1,9 @@
 # v0.1.1 发布执行报告（2026-08-12，dsh agent 交接执行）
 
 交接分支：`v0.1.1-live-readiness` @ `91fa220`（223 passed + 6 skipped）
-发布结果：master `a29bc13`（最终合并提交），tag `v0.1.1`，**233 passed + 6 skipped**
+发布结果：已测试代码基线 master `a29bc13`（最终合并提交，**233 passed + 6 skipped** 实测）；
+tag `v0.1.1` 固定于发布提交 `b8e7a97`（docs-only，不再移动）。两者分离记录，
+本报告不宣称任何静态哈希等于包含本报告的提交。
 
 状态标注：**IMPLEMENTED** / **LIVE VERIFIED** / **GATED** / **FAILED**。
 
@@ -67,9 +69,10 @@
 - `git checkout master && git merge --no-ff v0.1.1-live-readiness`（67 commits 合并）
 - `git tag -a v0.1.1`；`git push origin master v0.1.1`
 - 验收：
-  - ✅ tag 指向合并提交（`v0.1.1^{commit}` == master == `a29bc13`，含报告 HEAD 修正提交与执行报告）
+  - ✅ tag `v0.1.1` 固定于发布提交 `b8e7a97`（docs-only，不再移动）；已测试代码基线 `a29bc13`
+    （最终合并提交，233+6 实测）——两者分离记录，不宣称报告内静态哈希等于包含本报告的提交
   - ✅ `git diff --check` 干净
-  - ✅ completion-report §1-5 与 tag 一致（HEAD a29bc13；基线 233 passed + 6 skipped，master 树实测）
+  - ✅ completion-report §1-5 基线数字与实测一致（233 passed + 6 skipped）
 - 分支与 origin 同步（`v0.1.1-live-readiness` = `eac0b16`，与 master 仅差发布修正提交）。
 
 ---
