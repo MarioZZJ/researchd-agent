@@ -1,7 +1,7 @@
 # researchd v0.1.1 完成报告（live-readiness）
 
 分支：`v0.1.1-live-readiness`（自 master 创建）
-HEAD：`234ba15`；测试基线：**210 passed + 6 skipped**
+HEAD：`9c65028`；测试基线：**215 passed + 6 skipped**
 
 状态标注：**IMPLEMENTED**（代码+本地测试完成）/ **LIVE VERIFIED**（真实环境
 验证通过）/ **GATED**（已实现，等待宿主授权/权限后即可验证）/ **FAILED**（未达标）。
@@ -24,7 +24,7 @@ HEAD：`234ba15`；测试基线：**210 passed + 6 skipped**
 | 四 | ContextPackageBuilder：planner/worker/auditor 独立包；保存 objects、hash、时间、token 估计；data_dir 规范化注入 | **IMPLEMENTED** | application/context_package.py + ContextPackageRepo |
 | 五 | Reasonix overlay：workspace cwd、配置白名单、skills 白名单、resolved 记录；bwrap 文件系统隔离 + fail-closed | **LIVE VERIFIED**（隔离探针） | overlay.py/transport.py/adapter.py；`tests/integration/test_sandbox_isolation.py`（真实 bwrap 探针：DB/凭据不可见、workspace 可写） |
 | 六/十 | Auditor 调度闭环：REVIEW→auditor→ACCEPT→VERIFIED→criteria PASS→COMPLETED；REVISE→READY；幂等+崩溃恢复；receipt 恢复不重复调用 | **IMPLEMENTED** | audit_gate.py + receipt 恢复测试 |
-| 六 | deterministic live smoke（含重启恢复不重复模型调用/Evidence） | **IMPLEMENTED**（FakeExecutor 常跑版本）；**GATED**（真实 reasonix，`RESEARCHD_RUN_REAL_SMOKE=1`） | `tests/e2e/test_live_smoke.py` |
+| 六 | deterministic live smoke（含重启恢复不重复模型调用/Evidence） | **LIVE VERIFIED**（真实 reasonix，`RESEARCHD_RUN_REAL_SMOKE=1` 全绿：直接链路 74s + service 重启链路 135s） | `tests/e2e/test_live_smoke.py`（语义等待真实 planner 输出、六维重启快照零重复） |
 | 七 | Reporter：移除阈值 milestone；报告仅基于真实状态；结论引用证据、动作引用真实 Task | **IMPLEMENTED** | extensions.py `check_milestones` + reporter.py |
 | 八 | ACP 身份：缺失 fail-closed+诊断；Decision answer 保留真实 platform user id/version/幂等键；真实 message_id 幂等 | **LIVE VERIFIED**（群消息闭环；按钮点击端到端 GATED） | agent.py + cc-connect inbound-messageid.patch；testbot→researchd 群回复实测 |
 | 九 | 飞书接入两应用职责分离 + 白名单 + 防循环 | **LIVE VERIFIED** | researchd=cli_aaf007476338dd2c（被测）、testbot=cli_aaf9998d25f89bcf（PI 测试驱动）；allow_chat/allow_from 白名单；`scripts/testbot-smoke.sh` 真实 SMOKE PASS |
@@ -44,7 +44,7 @@ HEAD：`234ba15`；测试基线：**210 passed + 6 skipped**
 ## 3. 测试命令与结果
 
 ```bash
-uv run pytest -q        # 207 passed, 6 skipped（真实平台 conformance/真实 smoke 门控项）
+uv run pytest -q        # 215 passed, 6 skipped（真实平台 conformance 门控项；真实 smoke 需 RESEARCHD_RUN_REAL_SMOKE=1）
 go build -tags no_web ./cmd/cc-connect && go test ./core/ ./agent/acp/   # cc-connect 双 patch
 uv run researchctl doctor            # 只读健康检查
 ```
@@ -59,18 +59,18 @@ uv run researchctl doctor            # 只读健康检查
 - cc-connect 双 patch 干净克隆编译 + go test 全通过；patch 版实例（9820）承载 researchd project（acp）运行正常。
 
 **GATED（代码就绪，等待宿主授权后执行）**：
-1. **真实 Reasonix 模型 smoke**（planner/worker/auditor 真实调用 + workspace artifact + audit gate + service 重启零重复）——沙箱内凭据被 /dev/null 屏蔽（overlay fail-closed），**须在沙箱外运行**：`RESEARCHD_RUN_REAL_SMOKE=1 uv run pytest tests/e2e/test_live_smoke.py -q`（费用已授权）。
+1. ~~真实 Reasonix 模型 smoke~~ → **LIVE VERIFIED**（2026-08-12，本机直接运行）：`RESEARCHD_RUN_REAL_SMOKE=1 uv run pytest tests/e2e/test_live_smoke.py` **4/4 PASSED**（148s）——真实 planner（gpt-5.6-sol）产出唯一任务 → worker（deepseek-v4-flash）在 workspace 创建 `out/result.json`（完整 sha256 与磁盘一致）→ 独立 auditor run → audit gate（review_submitted → audit.accepted → completed 事件链）→ service 真实重启后 task/invocation/run/artifact/evidence/outbox 六维快照**完全一致**（零重复模型调用/artifact/evidence）；无 bwrap/acp 子进程残留。真实链路修复链：bwrap 挂载顺序（nvm 在 home mask 之上）→ `REASONIX_HOME/.cache` 可写 lease → 未知 planner role fallback worker → 安全加固（namespace-local `/proc`、去宿主 `~/.cache` bind、transcript O_NOFOLLOW）后重跑仍全绿。
 2. ~~Decision 按钮点击端到端~~ → **LIVE VERIFIED**（2026-08-12）：手工构造验证决策 D-E31E7247E0D447988EA8E90B（标注验证用途）→ 报告流程自动发决策卡（按钮 value=cmd:/decision ...）→ 真实点击（ou_8c1a4e0a...）→ cc-connect 保留点击者身份 dispatch → service cmd_decision（成员/approval/version 校验）→ decision ANSWERED → 原卡 PATCH 为「✅ 已记录你的选择」→ 重复点击幂等 no-op。
-3. interdisciplinary-citation-pilot 项目与真实 D-002 决策（必须等 smoke 通过）。
+3. interdisciplinary-citation-pilot 项目与真实 D-002 决策（必须等 smoke 通过）→ smoke 已通过，pilot 项目待执行。
 
 ## 5. 发布 v0.1.1 的剩余判据（未满足即不发布）
 
 - [x] researchd 应用开通 `docs:doc` 并发布/审批（共享 Docx 到测试群/PI 已 LIVE VERIFIED）
-- [ ] Reasonix 真实 Worker 在项目 workspace 创建 Artifact（真实 smoke GATED）
-- [ ] 独立 Auditor 真实运行（同上）
-- [ ] Evidence provenance 可追溯（代码已验证；真实链路 GATED）
-- [ ] Decision 按钮点击端到端（卡片已真实发送；点击 GATED）
+- [x] Reasonix 真实 Worker 在项目 workspace 创建 Artifact（真实 smoke LIVE VERIFIED：`out/result.json` sha256 与磁盘一致）
+- [x] 独立 Auditor 真实运行（真实 smoke：独立 auditor run + review_submitted → audit.accepted 事件链）
+- [x] Evidence provenance 可追溯（真实链路：evidence VERIFIED/CANDIDATE + invocations/runs/context packages 持久化）
+- [x] Decision 按钮点击端到端（LIVE VERIFIED：真实点击 → ANSWERED → 卡片 PATCH → 重复点击幂等）
 - [x] Feishu Docx 真实增量同步 + 人工修改保护 conformance（LIVE VERIFIED）
-- [ ] 服务重启无重复模型调用/Evidence/消息（Fake 链路已验证；真实链路 GATED）
+- [x] 服务重启无重复模型调用/Evidence/消息（真实 service 重启六维快照完全一致；Fake 链路常跑）
 - [x] 原始 Executor 输出无直达飞书路径（代码审计通过：outbox 仅 ReportSpec body）
-- [x] 全部单元、集成、恢复、e2e 与本地 conformance 测试通过（207+6）
+- [x] 全部单元、集成、恢复、e2e 与本地 conformance 测试通过（215+6；真实 smoke 4/4）
