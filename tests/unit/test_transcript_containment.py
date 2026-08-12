@@ -86,6 +86,7 @@ def test_repeated_missing_nested_path_does_not_leak_fds(tmp_path):
 
     sessions = tmp_path / "overlay" / "sessions"
     sessions.mkdir(parents=True)
+    (sessions / "sub").mkdir()  # intermediate dir opens, THEN the walk fails
 
     def _open_fds():
         return len(os.listdir("/proc/self/fd"))

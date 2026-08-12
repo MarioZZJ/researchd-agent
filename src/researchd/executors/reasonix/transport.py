@@ -465,9 +465,11 @@ class StdioReasonixTransport(ReasonixTransport):
                 return ""
             if st.st_size == 0 or st.st_size > max_bytes:
                 return ""
-            with _os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
+            fh = _os.fdopen(fd, "r", encoding="utf-8", errors="replace")
+            fd = -1  # ownership transferred BEFORE reading: if read raises,
+            # the file object closes the fd and finally must not double-close
+            with fh:
                 data = fh.read(max_bytes + 1)
-            fd = -1  # owned by fdopen now
         except OSError:
             return ""
         finally:
