@@ -194,3 +194,44 @@ def test_apply_reuses_artifact_without_rewriting_provenance(factory, tmp_path):
         ).scalars().first()
         assert row.run_id == "R-OLD" and row.task_id == "T-OLD"  # provenance immutable
         assert row.description == "original"
+
+
+def test_directory_artifact_declaration_skipped_not_rejected(factory, tmp_path):
+    """A real model may declare an existing DIRECTORY as an artifact (e.g.
+    'data/raw/' for a raw corpus). That benign declaration mistake must drop
+    the declaration (logged), NOT reject the whole result — the audit gate
+    still requires evidence refs to resolve to registered artifacts."""
+    from researchd.application.apply_result import apply_work_result
+    from researchd.domain.project import Project
+    from researchd.domain.run import Run
+    from researchd.executors.base import validate_work_result
+    from researchd.persistence.repositories import ArtifactRepo, ProjectRepo
+    from researchd.persistence.transaction import UnitOfWork
+
+    ws = tmp_path / "ws"
+    (ws / "data" / "raw").mkdir(parents=True)
+    (ws / "data" / "raw" / "refs_batch_00001.json").write_text("{}")
+    (ws / "data" / "corpus.csv").write_text("a,b\n1,2\n")
+    with UnitOfWork(factory) as uow:
+        ProjectRepo(uow.session).save(Project(project_id="P-DIR", name="dir", workspace_root=str(ws)))
+        uow.commit()
+    raw = {
+        "schema": "researchd.work_result.v1",
+        "task_id": "T-DIR",
+        "outcome": "SUBMIT_FOR_REVIEW",
+        "criteria_results": [{"criterion_id": "c-1", "status": "PASS", "refs": []}],
+        "artifacts": [
+            {"local_ref": "A-DIR", "kind": "dataset", "path": "data/raw/", "description": "raw corpus"},
+            {"local_ref": "A-CSV", "kind": "dataset", "path": "data/corpus.csv", "description": "corpus"},
+        ],
+        "evidence_candidates": [], "claim_changes": [], "issues": [], "decision_candidates": [],
+        "next_task_proposals": [],
+    }
+    run = Run(run_id="R-DIR", task_id="T-DIR", project_id="P-DIR")
+    with UnitOfWork(factory) as uow:
+        counts = apply_work_result(uow.session, run, validate_work_result(raw))
+        uow.commit()
+    assert counts["artifacts"] == 1  # only the real file was registered
+    with UnitOfWork(factory) as uow:
+        assert ArtifactRepo(uow.session).get_by_artifact_id("A-CSV") is not None
+        assert ArtifactRepo(uow.session).get_by_artifact_id("A-DIR") is None

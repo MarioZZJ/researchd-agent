@@ -88,6 +88,22 @@ def apply_work_result(session: Session, run, result: WorkResult) -> dict:  # noq
         path = normalize_artifact_path(project.workspace_root, art.path)
         if not path:
             raise ValueError(f"artifact {artifact_id!r} has an empty path; rejected")
+        # a REAL model may declare an existing DIRECTORY as an artifact (e.g.
+        # "data/raw/" for a raw corpus). That is a benign declaration mistake,
+        # not a security violation: drop the declaration with a logged warning
+        # instead of rejecting the whole result. Nothing fake is registered —
+        # the audit gate still requires every evidence ref to resolve to a
+        # REGISTERED artifact at REVIEW (verify_evidence), so no provenance
+        # gap can slip through. Path escapes still fall through to the
+        # registration gate below and reject the whole result (fail-hard).
+        from .paths import PathEscapeError, safe_resolve
+
+        try:
+            if safe_resolve(project.workspace_root, path).is_dir():
+                logger.warning("artifact %r path is a directory; declaration skipped: %s", artifact_id, path)
+                continue
+        except PathEscapeError:
+            pass  # not a real dir inside the root; let the gate reject
         if existing_artifact is not None:
             if existing_artifact.project_id != project_id or existing_artifact.path != path:
                 raise ValueError(
