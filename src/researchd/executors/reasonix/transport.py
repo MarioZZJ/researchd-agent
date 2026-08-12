@@ -87,7 +87,9 @@ def _bwrap_command(binary: str, overlay: Path, cwd: Path) -> list[str] | None:
         "--ro-bind", "/sbin", "/sbin",
         "--ro-bind", "/etc", "/etc",
         "--ro-bind", "/opt", "/opt",
-        "--ro-bind", "/proc", "/proc",
+        "--proc", "/proc",  # namespace-local procfs (--unshare-pid): the
+        #  host's /proc/<pid>/{environ,fd,root} must NOT be reachable from
+        #  inside the sandbox (same-uid service secrets live in environ)
         "--dev", "/dev",
         "--tmpfs", "/tmp",
         "--share-net",  # model calls need the provider gateway
@@ -97,14 +99,15 @@ def _bwrap_command(binary: str, overlay: Path, cwd: Path) -> list[str] | None:
     for libdir in ("/lib", "/lib64"):
         if Path(libdir).is_dir():
             cmd += ["--ro-bind", libdir, libdir]
-    # the native binary lives under ~/.nvm (and may need ~/.cache at runtime).
-    # bwrap mounts are STACKED — the LAST mount wins — so the whole-home
-    # tmpfs must come FIRST, and the keep-binds (nvm/cache) are re-mounted
-    # ON TOP of the mask afterwards.
+    # the native binary lives under ~/.nvm. bwrap mounts are STACKED — the
+    # LAST mount wins — so the whole-home tmpfs must come FIRST, and the
+    # nvm keep-bind is re-mounted ON TOP of the mask afterwards.
+    # NOTE: host ~/.cache is deliberately NOT bound (it may hold cached
+    # credentials, e.g. RESEARCHD_API__TOKEN under ~/.cache/cc-connect-live);
+    # reasonix gets a fresh writable overlay/.cache instead.
     cmd += ["--tmpfs", str(home)]
-    for keep in (home / ".nvm", home / ".cache"):
-        if keep.is_dir():
-            cmd += ["--ro-bind", str(keep), str(keep)]
+    if (home / ".nvm").is_dir():
+        cmd += ["--ro-bind", str(home / ".nvm"), str(home / ".nvm")]
     # whole user home masked (empty tmpfs): ~/.ssh ~/.aws ~/.reasonix
     # ~/.cc-connect, repository .env, everything — then re-mount ONLY the
     # overlay (config/.env READ-ONLY; sessions writable) and the workspace
@@ -415,31 +418,44 @@ class StdioReasonixTransport(ReasonixTransport):
         (the sandbox can only write there); it must be a REGULAR file, not a
         symlink, not a device, and bounded in size — a sandbox-controlled
         path is never trusted blindly (a hostile/compromised reasonix could
-        otherwise point us at /dev/zero or any readable host file)."""
-        from pathlib import Path
+        otherwise point us at /dev/zero or any readable host file).
 
-        path = Path(transcript_path)
+        The file is opened ONCE with O_NOFOLLOW relative to the resolved
+        sessions dir and read from the same fd (no stat-then-open race, no
+        symlink swap after the containment check)."""
+        import os as _os
+
+        from pathlib import Path as _Path
+
+        path = _Path(transcript_path)
+        sessions_dir: _Path | None = None
         if overlay_root is not None:
             sessions_dir = (overlay_root / "sessions").resolve()
-            resolved = path.resolve()
             try:
-                resolved.relative_to(sessions_dir)
+                path.resolve().relative_to(sessions_dir)
             except ValueError:
                 return ""  # outside the sessions dir: not ours, refuse
         try:
-            st = path.stat()  # follows symlinks; the resolve() above already
-            #  pinned the target inside sessions_dir
+            # O_NOFOLLOW on the final component; fd stays pinned after the
+            # containment resolution above
+            fd = _os.open(path, _os.O_RDONLY | _os.O_NOFOLLOW)
         except OSError:
-            return ""
-        if not Path(path).is_file() or not st.st_mode & 0o100000:  # S_IFREG
-            return ""
-        if st.st_size > max_bytes:
             return ""
         try:
-            lines = Path(transcript_path).read_text(encoding="utf-8").splitlines()
+            st = _os.fstat(fd)
+            if not st.st_mode & 0o100000:  # S_IFREG
+                return ""
+            if st.st_size > max_bytes:
+                return ""
+            if st.st_size == 0:
+                return ""
+            with _os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
+                data = fh.read(max_bytes + 1)
         except OSError:
             return ""
-        for line in reversed(lines):
+        if len(data) > max_bytes:
+            return ""
+        for line in reversed(data.splitlines()):
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError:

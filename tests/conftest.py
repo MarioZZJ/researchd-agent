@@ -8,11 +8,15 @@ from researchd.persistence.transaction import init_db, make_engine, make_session
 
 
 def pytest_configure(config):
-    """Pin a SHORT basetemp: callers may run under a long TMPDIR (e.g. a
-    reasonix session tmp), which pushes tmp_path past the 108-byte AF_UNIX
-    sun_path limit for UDS-backed API tests. pytest recreates basetemp each
-    run, so a fixed short path stays isolated per invocation."""
-    config.option.basetemp = "/tmp/rd-pytest"
+    """Pin a SHORT, per-run basetemp: callers may run under a long TMPDIR
+    (e.g. a reasonix session tmp), which pushes tmp_path past the 108-byte
+    AF_UNIX sun_path limit for UDS-backed API tests. tempfile.mkdtemp keeps
+    each run isolated (0700) even when two pytest processes overlap, and
+    pytest removes the basetemp directory after the session."""
+    import tempfile
+
+    if not getattr(config.option, "basetemp", None):
+        config.option.basetemp = tempfile.mkdtemp(dir="/tmp", prefix="rdp-")
 
 
 @pytest.fixture()

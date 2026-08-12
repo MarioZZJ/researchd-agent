@@ -183,8 +183,12 @@ def test_bwrap_command_masks_secrets_and_mounts_workspace(tmp_path, monkeypatch)
     assert cmd[0] == "bwrap"
     # NEVER --ro-bind / / : the sandbox is a minimal read-only allowlist
     assert not has(["--ro-bind", "/", "/"], 0, 3)
-    for allow in ("/usr", "/bin", "/etc", "/opt", "/proc"):
+    for allow in ("/usr", "/bin", "/etc", "/opt"):
         assert has(["--ro-bind", allow, allow], 0, 3), allow
+    # namespace-local procfs (never --ro-bind /proc: host /proc/<pid>/environ
+    # would leak same-uid service secrets)
+    assert has(["--proc", "/proc"], 0, 2)
+    assert not has(["--ro-bind", "/proc", "/proc"], 0, 3)
     # whole home masked FIRST, then the keep-binds (nvm/cache) re-mounted ON
     # TOP of the mask (bwrap mounts are stacked — last mount wins — so the
     # native binary under ~/.nvm must be visible INSIDE the sandbox), then
@@ -192,6 +196,7 @@ def test_bwrap_command_masks_secrets_and_mounts_workspace(tmp_path, monkeypatch)
     home = Path.home()
     assert has(["--tmpfs", str(home)], 0, 2)
     t_idx = next(k for k in range(len(cmd) - 1) if cmd[k:k + 2] == ["--tmpfs", str(home)])
+    assert not has(["--ro-bind", str(home / ".cache"), str(home / ".cache")], 0, 3), "host ~/.cache must NOT be bound"
     if (home / ".nvm").is_dir():
         n_idx = next(k for k in range(len(cmd) - 2) if cmd[k:k + 3] == ["--ro-bind", str(home / ".nvm"), str(home / ".nvm")])
         assert n_idx > t_idx, "nvm keep-bind must come AFTER the home mask"

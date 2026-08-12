@@ -14,6 +14,13 @@ from researchd.executors.reasonix.transport import _bwrap_command
 pytestmark = pytest.mark.integration
 
 
+def _host_pid() -> int:
+    """A host PID that must be INVISIBLE inside the pid-namespace sandbox."""
+    import os
+
+    return os.getpid()
+
+
 def _has_bwrap() -> bool:
     import shutil
 
@@ -42,7 +49,9 @@ def test_bwrap_masks_researchd_secrets_keeps_workspace(tmp_path):
         "echo DOCS=$(ls %s 2>&1 | head -1); "
         "echo ETC=$(ls /etc 2>&1 | head -1); "
         "echo WS=$(cat %s/marker.txt 2>&1); "
-        "echo OV=$(ls %s 2>&1 | wc -l)" % (data, home / ".reasonix", home / ".ssh", home / "Documents", ws, overlay),
+        "echo OV=$(ls %s 2>&1 | wc -l); "
+        "echo CACHE=$(ls %s 2>&1 | head -1); "
+        "echo PROC_PID=$(ls /proc/%d 2>&1 | head -1)" % (data, home / ".reasonix", home / ".ssh", home / "Documents", ws, overlay, home / ".cache", _host_pid()),
     ]
     r = subprocess.run(probe, capture_output=True, text=True, timeout=60)
     out = r.stdout
@@ -54,6 +63,13 @@ def test_bwrap_masks_researchd_secrets_keeps_workspace(tmp_path):
     for prefix in ("HOME_RX=", "HOME_SSH=", "DOCS="):
         line = [ln for ln in out.splitlines() if ln.startswith(prefix)][0]
         assert "No such file" in line, f"{prefix} mask failed: {out}"
+    # host ~/.cache is NOT bound (cached credentials) — must be invisible
+    cache_line = [ln for ln in out.splitlines() if ln.startswith("CACHE=")][0]
+    assert "No such file" in cache_line, f"~/.cache not masked: {out}"
+    # namespace-local procfs: the host PID of the caller must NOT be visible
+    # inside the sandbox (same-uid /proc/<pid>/environ would leak secrets)
+    proc_line = [ln for ln in out.splitlines() if ln.startswith("PROC_PID=")][0]
+    assert "No such file" in proc_line, f"host /proc leaked into namespace: {out}"
     # the minimal runtime allowlist IS readable (tools can run)
     etc_line = [ln for ln in out.splitlines() if ln.startswith("ETC=")][0]
     assert etc_line != "ETC=", f"/etc not readable: {out}"
