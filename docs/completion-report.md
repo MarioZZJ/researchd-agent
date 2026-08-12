@@ -1,7 +1,7 @@
 # researchd v0.1.1 完成报告（live-readiness）
 
 分支：`v0.1.1-live-readiness`（自 master 创建）
-HEAD：`8356fd3`；测试基线：**233 passed + 6 skipped**（v0.1.1 tag 同源）
+HEAD：`d31e15e`（v0.1.1 tag，合并提交）；测试基线：**233 passed + 6 skipped**（tag 同源）
 
 状态标注：**IMPLEMENTED**（代码+本地测试完成）/ **LIVE VERIFIED**（真实环境
 验证通过）/ **GATED**（已实现，等待宿主授权/权限后即可验证）/ **FAILED**（未达标）。
