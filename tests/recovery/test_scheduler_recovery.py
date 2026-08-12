@@ -122,6 +122,41 @@ def test_worker_blocked_requeue_when_dependencies_complete(env):
         assert TaskRepo(uow.session).get_by_task_id("T-B3").status.value == "BLOCKED"
 
 
+def test_transport_timeout_requeues_then_fails_bounded(env):
+    """A transport timeout is a retryable interrupt (task back to READY,
+    run INTERRUPTED), but bounded: after MAX_RUN_RETRIES runs the task
+    FAILs permanently instead of burning unbounded model calls."""
+    from researchd.config import DEFAULT_PROFILES
+    from researchd.executors.reasonix.transport import TransportTimeoutError
+
+    class TimeoutExecutor(FakeExecutor):
+        async def run_worker(self, context, *, profile):
+            raise TransportTimeoutError("reasonix acp session/prompt: timeout")
+
+    settings = type("S", (), {"scheduler": type("SC", (), {"max_parallel": 1})(), "profiles": dict(DEFAULT_PROFILES), "data_dir": "t"})()
+    ex = TimeoutExecutor()
+    loop = SchedulerLoop(settings, env["factory"], ex, FakeDeliveryPort(), max_parallel=1)
+    with UnitOfWork(env["factory"]) as uow:
+        t = make_task(status="READY")
+        TaskRepo(uow.session).save(t)
+        uow.commit()
+        run = RunDispatcher(uow.session, ex).dispatch_task(t)
+        uow.commit()
+    for expected in ("READY", "READY"):  # attempts 1-2: retryable interrupt
+        asyncio.run(loop._drive_run(run.run_id, t.task_id))
+        with UnitOfWork(env["factory"]) as uow:
+            task = TaskRepo(uow.session).get_by_task_id(t.task_id)
+            assert task.status.value == expected
+            run = RunDispatcher(uow.session, ex).dispatch_task(task)  # re-dispatch
+            uow.commit()
+    # attempt 3 (total runs == MAX_RUN_RETRIES): permanent failure
+    asyncio.run(loop._drive_run(run.run_id, t.task_id))
+    with UnitOfWork(env["factory"]) as uow:
+        task = TaskRepo(uow.session).get_by_task_id(t.task_id)
+        assert task.status.value == "FAILED"
+        assert "timeout" in (task.error_message or "")
+
+
 def test_dispatcher_full_cycle(env):
     ex = FakeExecutor()
     with UnitOfWork(env["factory"]) as uow:

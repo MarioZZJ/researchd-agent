@@ -129,6 +129,15 @@ class TransportError(RuntimeError):
     pass
 
 
+class TransportTimeoutError(TransportError):
+    """The transport RPC did not answer within its timeout.
+
+    Transient infrastructure (the model turn was still in flight): the
+    scheduler treats it as a bounded retryable interrupt, never as a
+    permanent task failure.
+    """
+
+
 def resolve_native_binary() -> str:
     """Resolve the native reasonix binary, bypassing the npm shim."""
     import subprocess
@@ -307,7 +316,7 @@ class StdioReasonixTransport(ReasonixTransport):
             self._generation += 1
             self.capabilities = None  # force re-initialize after restart
 
-    async def _call(self, method: str, params: dict | None = None, *, timeout: float = 600.0) -> dict:
+    async def _call(self, method: str, params: dict | None = None, *, timeout: float = 3600.0) -> dict:
         await self._start()
         self._id += 1
         mid = self._id
@@ -323,7 +332,7 @@ class StdioReasonixTransport(ReasonixTransport):
             resp = await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError as exc:
             self._pending.pop(mid, None)
-            raise TransportError(f"reasonix acp {method}: timeout") from exc
+            raise TransportTimeoutError(f"reasonix acp {method}: timeout") from exc
         except asyncio.CancelledError:
             self._pending.pop(mid, None)
             raise

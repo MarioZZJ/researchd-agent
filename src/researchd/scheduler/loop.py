@@ -32,6 +32,10 @@ HEARTBEAT_SECONDS = 10.0
 # BLOCKED for human review instead of burning more model calls.
 MAX_WORKER_BLOCKED_RETRIES = 2
 
+# Bounded total runs per task before a retryable transport timeout becomes a
+# permanent failure (1 initial + 2 retries).
+MAX_RUN_RETRIES = 3
+
 # TaskRole -> default profile suffix (IMPLEMENTATION.md §15.1). Every role
 # must map to an existing DEFAULT_PROFILES entry.
 ROLE_TO_PROFILE = {
@@ -590,6 +594,19 @@ class SchedulerLoop:
             except asyncio.CancelledError:
                 await self._collect_interrupt(run_id, "cancelled")
             except Exception as exc:  # noqa: BLE001
+                # transient executor infrastructure: a transport timeout means
+                # the model turn was still in flight (work may be partial but
+                # the workspace persists) — retryable like a budget interrupt,
+                # but BOUNDED so a persistently slow turn cannot burn unbounded
+                # model calls (past MAX_RUN_RETRIES it becomes a real failure)
+                from ..executors.reasonix.transport import TransportTimeoutError
+
+                if isinstance(exc, TransportTimeoutError):
+                    with self.session_factory() as session:
+                        attempts = RunRepo(session).count_for_task(task_id)
+                    if attempts < MAX_RUN_RETRIES:
+                        await self._collect_interrupt(run_id, "executor transport timeout (retryable)")
+                        return
                 await self._collect_failure(run_id, str(exc))
 
     async def _run_profile(self, run_id: str) -> dict:
